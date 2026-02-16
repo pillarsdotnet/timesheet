@@ -1,0 +1,20 @@
+# Copyright (c) 2025 Robert August Vincent II <pillarsdotnet@gmail.com>
+# Co-author: Cursor-AI.
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.bak
+
+# Local data (if ever kept in repo)
+timesheet.log
+*.log
+
+# Node (if commitlint/prettier run locally via npm)
+node_modules/
