@@ -1,0 +1,78 @@
+#!/bin/ksh
+# Copyright (c) 2025 Robert August Vincent II <pillarsdotnet@gmail.com>
+# Co-author: Cursor-AI.
+# Display the stop-work time that would yield an average of 8 hours per day worked.
+
+TIMESHEET=~/Documents/timesheet.log
+script_dir=$(dirname "$0")
+
+# If work has stopped (last entry is STOP), call start before calculating.
+if [ -f "$TIMESHEET" ]; then
+  last_line=$(tail -n 1 "$TIMESHEET" 2>/dev/null)
+  case "$last_line" in
+    'STOP|'*) "$script_dir/start" >/dev/null 2>&1 ;;
+  esac
+fi
+
+if [ ! -f "$TIMESHEET" ]; then
+  echo "No timesheet data."
+  exit 0
+fi
+
+# If work has started today but not stopped, include that session in the calculation.
+TMP_LOG=/tmp/timeoff_log_$$
+last_line=$(tail -n 1 "$TIMESHEET" 2>/dev/null)
+case "$last_line" in
+  'START|'*)
+    { cat "$TIMESHEET"; echo "STOP|$(date +%s)"; } > "$TMP_LOG"
+    ;;
+  *)
+    cat "$TIMESHEET" > "$TMP_LOG"
+    ;;
+esac
+
+awk -F'|' '
+  function push(e, a) { stack_epoch[++n] = e; stack_act[n] = a }
+  function pop(e) {
+    if (n < 1) return
+    start_epoch = stack_epoch[n]; n--
+    dur = e - start_epoch
+    if (dur <= 0) return
+    total_sec += dur
+    days = int(start_epoch / 86400)
+    day_seen[days] = 1
+  }
+  /^START\|/ {
+    if (n >= 1) pop($2)
+    push($2, $3)
+    next
+  }
+  /^STOP\|/  { pop($2); next }
+  END {
+    for (d in day_seen) num_days++
+    total_hr = total_sec / 3600
+    need_hr = 8 * num_days - total_hr
+    printf "%d %.4f %.4f\n", num_days, total_hr, need_hr
+  }
+' "$TMP_LOG" | read num_days total_hr need_hr
+rm -f "$TMP_LOG"
+
+if [ -z "$num_days" ] || [ "$num_days" -eq 0 ]; then
+  echo "No work recorded."
+  exit 0
+fi
+
+# need_hr = hours left to work for 8h average
+if awk "BEGIN { exit ($need_hr > 0) ? 0 : 1 }" 2>/dev/null; then
+  :
+else
+  echo "Average already at least 8 hours per day worked. You may stop now."
+  date
+  exit 0
+fi
+
+# Stop time = now + need_hr hours
+now=$(date +%s)
+stop_epoch=$(awk "BEGIN { printf \"%.0f\", $now + $need_hr * 3600 }")
+echo "Stop at: $(date -r "$stop_epoch" 2>/dev/null || date -d "@$stop_epoch" 2>/dev/null || echo "$stop_epoch")"
+echo "($need_hr hours remaining for 8h/day average over $num_days day(s))"

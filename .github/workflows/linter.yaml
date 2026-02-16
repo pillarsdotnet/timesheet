@@ -1,0 +1,45 @@
+# Copyright (c) 2025 Robert August Vincent II <pillarsdotnet@gmail.com>
+# Co-author: Cursor-AI.
+name: Lint
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install markdownlint-cli and prettier
+        run: npm install -g markdownlint-cli prettier
+
+      - name: Commitlint
+        uses: wagoid/commitlint-github-action@v6
+        with:
+          configFile: .commitlintrc.json
+          failOnWarnings: true
+
+      - name: Markdownlint
+        run: markdownlint "**/*.md"
+
+      - name: Prettier (check)
+        run: prettier --check "**/*.md" "**/*.yaml" "**/*.yml"
+
+      - name: ShellCheck
+        run: shellcheck --shell=sh start started stop timesheet timeoff install
