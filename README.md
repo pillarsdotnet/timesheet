@@ -73,9 +73,19 @@ Shows the **stop-work time** that would give an average of 8 hours per day worke
   - If the last entry is STOP (work not in progress), runs `start` (from the same directory as the script) before doing the calculation, so the 8-hour average includes “work starting now.”
   - Computes total hours and number of distinct days with work. If the average is already ≥ 8 hours, prints a message and the current time. Otherwise prints the clock time at which stopping would make the average exactly 8 hours, and how many hours remain.
 
+### workalias
+
+Interactively replace activity text in START entries from the **current week** (Sunday 00:00:00 through Saturday 23:59:59).
+
+- **Arguments:** Two required. `workalias <pattern> <replacement>`.
+  - **pattern:** A string or regular expression that must match at least one activity previously logged for this week. Matching is against the activity field of START lines (e.g. `coding`, `misc/.*`).
+  - **replacement:** The string to substitute for the matched activity.
+- **Behavior:** Searches the timesheet log for START entries from the current week whose activity matches the pattern. For each match, the script echoes the original line and the replaced form, then prompts `Replace (y/n)`. If the user responds with `y` or `Y`, the replacement is written to the log; any other response skips that replacement.
+- **Constraint:** Exits with an error if no activities match the pattern for this week.
+
 ### install
 
-Copies the five scripts (`start`, `started`, `stop`, `timesheet`, `timeoff`) into a directory and makes them executable.
+Copies the six scripts (`start`, `started`, `stop`, `timesheet`, `timeoff`, `workalias`) into a directory and makes them executable.
 
 - **Usage:** `./install [install_dir] [repo_path]`. Both arguments are optional.
 - **Arguments:**
@@ -83,7 +93,7 @@ Copies the five scripts (`start`, `started`, `stop`, `timesheet`, `timeoff`) int
   - **repo_path:** If given, path to the repository containing the scripts (default: directory of `install`).
 - **Behavior when install_dir is omitted:** Iterates over directories in `PATH` in order and installs into the **first directory that is writable** by the current user. If none are writable, prints an error and exits without installing.
 - **Behavior when install_dir is given:** Uses that directory (creates it with `mkdir -p` if it does not exist). Exits with an error if the directory cannot be created or is not writable.
-- Exits with an error if any of the five scripts is missing in the repo directory.
+- Exits with an error if any of the six scripts is missing in the repo directory.
 
 ## Install
 
@@ -102,8 +112,8 @@ This installs into the first writable directory on your `PATH`. To install into 
 Or copy and chmod manually:
 
 ```sh
-cp start started stop timesheet timeoff ~/bin/
-chmod +x ~/bin/start ~/bin/started ~/bin/stop ~/bin/timesheet ~/bin/timeoff
+cp start started stop timesheet timeoff workalias ~/bin/
+chmod +x ~/bin/start ~/bin/started ~/bin/stop ~/bin/timesheet ~/bin/timeoff ~/bin/workalias
 ```
 
 Ensure `TIMESHEET` in each script points to your log file (default: `~/Documents/timesheet.log`). For `timeoff` to invoke `start` when work is stopped, the scripts should be in the same directory (e.g. all in `~/bin`).

@@ -9,7 +9,7 @@ set -e
 SCRIPT_DIR=$(dirname "$0")
 [ -n "$2" ] && SCRIPT_DIR=$2
 
-SCRIPTS="start started stop timesheet timeoff"
+SCRIPTS="start started stop timesheet timeoff workalias"
 
 # Determine installation directory.
 if [ -n "$1" ]; then
