@@ -15,8 +15,10 @@ fi
 
 # Build effective log: if last line is START, append STOP|now so the report includes current session
 last=$(tail -n 1 "$TIMESHEET" 2>/dev/null)
+work_in_progress=false
 case "$last" in
   'START|'*)
+    work_in_progress=true
     { cat "$TIMESHEET"; echo "STOP|$(date +%s)"; } > "$TMP_LOG"
     ;;
   *)
@@ -82,6 +84,25 @@ fi
 # Part 2: hours per day of week
 if [ -s "${TMP_ACT}.dow" ]; then
   awk -F'\t' '{ printf "%s  %.2f\n", $1, $2 }' "${TMP_ACT}.dow"
+fi
+
+# If work is in progress, append start time, current duration, and description
+if [ "$work_in_progress" = true ]; then
+  start_epoch=$(echo "$last" | cut -d'|' -f2)
+  activity=$(echo "$last" | cut -d'|' -f3-)
+  start_time=$(date -r "$start_epoch" 2>/dev/null) || start_time=$(date -d "@$start_epoch" 2>/dev/null) || start_time="?"
+  now=$(date +%s)
+  duration_sec=$((now - start_epoch))
+  duration_min=$((duration_sec / 60))
+  duration_hr=$((duration_min / 60))
+  duration_rem=$((duration_min % 60))
+  if [ "$duration_hr" -gt 0 ]; then
+    duration_fmt="${duration_hr}h ${duration_rem}m"
+  else
+    duration_fmt="${duration_min}m"
+  fi
+  echo ""
+  echo "$start_time + ${duration_fmt}: $activity"
 fi
 
 rm -f "$TMP_ACT" "${TMP_ACT}.dow" "$TMP_LOG"
