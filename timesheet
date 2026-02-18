@@ -101,8 +101,7 @@ if [ "$work_in_progress" = true ]; then
   else
     duration_fmt="${duration_min}m"
   fi
-  echo ""
-  echo "$start_time + ${duration_fmt}: $activity"
+  echo "Current Task: $activity, started $start_time, worked $duration_fmt"
 fi
 
 rm -f "$TMP_ACT" "${TMP_ACT}.dow" "$TMP_LOG"
