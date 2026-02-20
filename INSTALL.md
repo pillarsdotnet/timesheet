@@ -2,17 +2,7 @@
 
 This document describes how to build and install the **ts** timesheet CLI from the repository.
 
-You can install either the **Korn shell script** (`ts.ksh`) or the **Rust binary** (`ts`). Both provide the same subcommands and use the same log file by default.
-
 ## Prerequisites
-
-### For the Korn shell script
-
-- **ksh** (Korn shell)
-- **awk**
-- A directory on your `PATH` (e.g. `~/bin`)
-
-### For the Rust binary
 
 - **Rust** toolchain (install from [rustup.rs](https://rustup.rs))
 - A directory on your `PATH` (e.g. `~/bin`)
@@ -26,28 +16,7 @@ git clone https://github.com/pillarsdotnet/timesheet.git
 cd timesheet
 ```
 
-## Option A: Install the Korn shell script
-
-The script is `ts.ksh`. Install it so the command is **ts** (recommended).
-
-**Using the script’s install subcommand** (installs into the first writable directory on `PATH`, or a directory you give):
-
-```sh
-./ts.ksh install
-# or into a specific directory:
-./ts.ksh install ~/bin
-```
-
-**Or copy and make executable manually:**
-
-```sh
-cp ts.ksh ~/bin/ts
-chmod +x ~/bin/ts
-```
-
-Ensure `~/bin` (or your chosen directory) is on your `PATH`.
-
-## Option B: Build and install the Rust binary
+## Build and install
 
 **1. Build the release binary:**
 
@@ -59,7 +28,7 @@ The binary is written to `target/release/ts` (or `target/debug/ts` if you use `c
 
 **2. Install the binary**
 
-**Using the binary’s install subcommand** (run from the repo so it can find itself):
+**Using the binary's install subcommand** (run from the repo so it can find itself):
 
 ```sh
 ./target/release/ts install
@@ -78,13 +47,7 @@ Ensure `~/bin` (or your chosen directory) is on your `PATH`.
 
 ## Configuration
 
-Both the script and the binary use the same default log file:
-
-- **Path:** `$HOME/Documents/timesheet.log`
-
-**Script:** Edit the `TIMESHEET` variable at the top of `ts.ksh` to use a different path before installing.
-
-**Rust binary:** The path is compiled in; to change it you must edit `DEFAULT_TIMESHEET` in `src/main.rs` and rebuild.
+The default log file is **`$HOME/Documents/timesheet.log`**. To change it, edit `DEFAULT_TIMESHEET` in `src/main.rs` and rebuild.
 
 ## Verifying the installation
 
@@ -94,7 +57,7 @@ From any directory (with the install directory on your `PATH`):
 ts list
 ```
 
-If the log file does not exist yet, you should see “No timesheet data found.” Otherwise you’ll see the report. You can also run:
+If the log file does not exist yet, you should see "No timesheet data found." Otherwise you'll see the report. You can also run:
 
 ```sh
 ts start "test activity"

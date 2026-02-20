@@ -3,13 +3,11 @@
 Copyright (c) 2025 Robert August Vincent II <pillarsdotnet@gmail.com>  
 Co-author: Cursor-AI.
 
-Korn shell scripts for tracking work start/stop and reporting time by activity and by day of week.
+CLI for tracking work start/stop and reporting time by activity and by day of week.
 
 ## Requirements
 
-- `ksh` (Korn shell)
-- `awk`
-- Timesheet data file: `~/Documents/timesheet.log` (edit `TIMESHEET` in the `ts.ksh` script to change)
+- Timesheet data file: `~/Documents/timesheet.log` (edit `DEFAULT_TIMESHEET` in `src/main.rs` and rebuild to change)
 
 ## Data format
 
@@ -18,21 +16,21 @@ The log file contains one entry per line:
 - `START|unix_epoch|activity`
 - `STOP|unix_epoch`
 
-Start/stop pairs are matched in **LIFO order** (each STOP pairs with the most recent START). The report scripts use these pairs to compute duration and attribute time to activity and day of week.
+Start/stop pairs are matched in **LIFO order** (each STOP pairs with the most recent START). The report uses these pairs to compute duration and attribute time to activity and day of week.
 
 ## ts command
 
-You can run the legacy Korn shell script **`ts.ksh`** or the Rust binary **`ts`**. The first argument is a required subcommand:
+The **`ts`** command takes a required subcommand as its first argument:
 
 | Subcommand   | Description |
 |-------------|-------------|
 | `start`     | Record work start **now**. Optional args = activity (default: misc/unspecified). |
-| `stop`      | Record work stop **now**. Same behavior as legacy stop script. |
+| `stop`      | Record work stop **now**. |
 | `list`      | Plaintext report: % time per activity, hours per day of week; if work in progress, show current task/duration. |
-| `started`   | Record a work start at a **past time**. Args: `ts started <start_time> [activity...]`. Same behavior as legacy started. |
+| `started`   | Record a work start at a **past time**. Args: `ts started <start_time> [activity...]`. |
 | `timeoff`   | Show stop-work time for 8h/day average; if last entry is STOP, starts work for the calculation. |
 | `workalias` | Interactively replace activity text in START entries from the current week. Args: `ts workalias <pattern> <replacement>`. |
-| `install`   | Copy the binary (or `ts.ksh`) to a directory on PATH. Args: `ts install [install_dir] [repo_path]`. |
+| `install`   | Copy the binary to a directory on PATH. Args: `ts install [install_dir] [repo_path]`. |
 | `rotate`    | Rename `timesheet.log` to `timesheet.YYMMDDHHMM` where the timestamp is the date/time of its most recent entry. |
 
 ### start
@@ -77,8 +75,8 @@ Searches for START entries from the current week whose activity matches the patt
 
 ### install
 
-- **install_dir omitted:** Installs the binary (or `ts.ksh`) into the first writable directory on `PATH`.
-- **install_dir given:** Installs into that directory (created if needed). Exits with an error if the binary or `ts.ksh` is missing in the repo path. Usage: `ts install [install_dir] [repo_path]`.
+- **install_dir omitted:** Installs the binary into the first writable directory on `PATH`.
+- **install_dir given:** Installs into that directory (created if needed). Exits with an error if the binary is missing in the repo path. Usage: `ts install [install_dir] [repo_path]`.
 
 ### rotate
 
@@ -86,41 +84,31 @@ Renames the timesheet log to `timesheet.YYMMDDHHMM` using the timestamp of the l
 
 ## Install
 
-From the repository directory (using the Rust binary):
+From the repository directory:
 
 ```sh
 cargo build --release && ./target/release/ts install
 ```
 
-Or using the legacy script:
+
+To install into a specific directory (e.g. `~/bin`): `ts install ~/bin`. Or copy manually:
 
 ```sh
-./ts.ksh install ~/bin
-```
-
-To install into a specific directory (e.g. `~/bin`): `ts install ~/bin` or `./ts.ksh install ~/bin`. Or copy manually:
-
-```sh
-cp ts.ksh ~/bin/ts
+cp target/release/ts ~/bin/ts
 chmod +x ~/bin/ts
 ```
 
-Ensure `TIMESHEET` in `ts.ksh` (or the binary’s default) points to your log file (default: `~/Documents/timesheet.log`).
+The binary uses `$HOME/Documents/timesheet.log` by default.
 
-## Build from source (Rust)
+## Build from source
 
-The `ts` command is also implemented in Rust. Build with [Rust](https://rustup.rs) installed:
+Build with [Rust](https://rustup.rs) installed:
 
 ```sh
 cargo build --release
 ```
 
-The binary is produced at `target/release/ts` (or `target/debug/ts` for `cargo build`). It uses the same log path: `$HOME/Documents/timesheet.log`. Install it with:
-
-```sh
-cargo build --release
-cp target/release/ts ~/bin/ts   # or ts install after copying binary to repo dir
-```
+The binary is produced at `target/release/ts` (or `target/debug/ts` for `cargo build`). See [INSTALL.md](INSTALL.md) for full instructions.
 
 ### Documentation
 

@@ -2,7 +2,7 @@
 name = "ts"
 version = "0.1.0"
 edition = "2021"
-description = "Timesheet CLI: start, stop, list, started, timeoff, workalias, install, rotate"
+description = "Timesheet CLI: start, stop, list, started, timeoff, workalias, install, rotate, manpage"
 authors = ["Robert August Vincent II <pillarsdotnet@gmail.com>"]
 license = "MIT"
 
