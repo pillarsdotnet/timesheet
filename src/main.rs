@@ -37,6 +37,8 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 /// Default path segment under `$HOME` for the timesheet log file.
 const DEFAULT_TIMESHEET: &str = "Documents/timesheet.log";
@@ -52,6 +54,52 @@ fn timesheet_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(DEFAULT_TIMESHEET)
+}
+
+/// Path for the reminder daemon PID file (under $HOME/.cache or $XDG_CACHE_HOME).
+fn reminder_pid_path() -> PathBuf {
+    let cache = env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")));
+    cache
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("ts-reminder.pid")
+}
+
+/// Activities from the current week's START entries, most-recently logged first (by last occurrence).
+fn activities_this_week_most_recent_first(timesheet: &Path) -> Vec<String> {
+    let now = Local::now().timestamp();
+    let week_start = week_start_epoch(now);
+    let week_end = week_start + 7 * 86400 - 1;
+    let content = match fs::read_to_string(timesheet) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut by_activity: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for line in content.lines() {
+        if let Some(LogLine::Start(epoch, activity)) = parse_line(line) {
+            if epoch >= week_start && epoch <= week_end {
+                by_activity.insert(activity.clone(), epoch);
+            }
+        }
+    }
+    let mut order: Vec<(String, i64)> = by_activity.into_iter().collect();
+    order.sort_by(|a, b| b.1.cmp(&a.1));
+    order.into_iter().map(|(a, _)| a).collect()
+}
+
+/// Append a START log entry for the given activity (used by reminder daemon). Calls maybe_rotate first.
+fn append_start_entry(timesheet: &Path, activity: &str) -> Result<(), String> {
+    maybe_rotate_if_previous_week(timesheet)?;
+    let now = Local::now().timestamp();
+    let line = format!("START|{}|{}\n", now, activity);
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(timesheet)
+        .map_err(|e| e.to_string())?;
+    f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Epoch of Sunday 00:00:00 for the week containing the given Unix timestamp (local time).
@@ -270,6 +318,7 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
     let mut f = fs::OpenOptions::new().create(true).append(true).open(timesheet).map_err(|e| e.to_string())?;
     f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
     println!("Started: {} at {}", activity, Local::now().format("%a %b %d %H:%M:%S %Z %Y"));
+    start_reminder_daemon_if_needed(timesheet);
     Ok(())
 }
 
@@ -493,6 +542,7 @@ fn cmd_started(args: &[String], timesheet: &Path) -> Result<(), String> {
                 fs::write(timesheet, new_content).map_err(|e| e.to_string())?;
                 let dt = Local.timestamp_opt(epoch, 0).single().unwrap_or_else(Local::now);
                 println!("Started: {} at {}", activity, dt.format("%a %b %d %H:%M:%S %Z %Y"));
+                start_reminder_daemon_if_needed(timesheet);
                 return Ok(());
             }
         }
@@ -508,6 +558,7 @@ fn cmd_started(args: &[String], timesheet: &Path) -> Result<(), String> {
                 fs::write(timesheet, new_content).map_err(|e| e.to_string())?;
                 let dt = Local.timestamp_opt(epoch, 0).single().unwrap_or_else(Local::now);
                 println!("Started: {} at {}", activity, dt.format("%a %b %d %H:%M:%S %Z %Y"));
+                start_reminder_daemon_if_needed(timesheet);
                 return Ok(());
             }
         }
@@ -518,6 +569,7 @@ fn cmd_started(args: &[String], timesheet: &Path) -> Result<(), String> {
     f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
     let dt = Local.timestamp_opt(epoch, 0).single().unwrap_or_else(Local::now);
     println!("Started: {} at {}", activity, dt.format("%a %b %d %H:%M:%S %Z %Y"));
+    start_reminder_daemon_if_needed(timesheet);
     Ok(())
 }
 
@@ -960,11 +1012,228 @@ fn cmd_help() -> Result<(), String> {
     Ok(())
 }
 
+const REMINDER_SLEEP_SECS: u64 = 300; // 5 minutes
+const REMINDER_PROMPT_TIMEOUT_SECS: u64 = 300; // 5 minutes
+
+/// Returns true if a process with the given PID is running (Unix: kill -0).
+fn is_pid_running(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let status = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status();
+        status.map(|s| s.success()).unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Start the reminder daemon in the background if not already running. No-op on non-Unix or if daemon already running.
+fn start_reminder_daemon_if_needed(_timesheet: &Path) {
+    #[cfg(not(unix))]
+    return;
+
+    #[cfg(unix)]
+    {
+        let pid_path = reminder_pid_path();
+        if let Ok(data) = fs::read_to_string(&pid_path) {
+            if let Ok(pid) = data.trim().parse::<u32>() {
+                if is_pid_running(pid) {
+                    return;
+                }
+            }
+        }
+        if let Ok(exe) = env::current_exe() {
+            let _ = Command::new(&exe)
+                .arg("--reminder-daemon")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+    }
+}
+
+/// Run the reminder daemon loop: sleep 5 min, show "What are you working on?" prompt, handle response or timeout.
+fn run_reminder_daemon(timesheet: &Path) {
+    let pid_path = reminder_pid_path();
+    if let Some(parent) = pid_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if fs::write(&pid_path, process::id().to_string()).is_err() {
+        return;
+    }
+    let pid_path_guard = pid_path.clone();
+    let _cleanup = defer(move || {
+        let _ = fs::remove_file(&pid_path_guard);
+    });
+
+    loop {
+        thread::sleep(Duration::from_secs(REMINDER_SLEEP_SECS));
+
+        let activities = activities_this_week_most_recent_first(timesheet);
+        match show_reminder_prompt(&activities) {
+            ReminderResult::DontBugMe => break,
+            ReminderResult::Activity(activity) => {
+                let _ = append_start_entry(timesheet, &activity);
+            }
+            ReminderResult::Timeout => {
+                let _ = cmd_stop(timesheet);
+                break;
+            }
+        }
+    }
+}
+
+/// Defer a closure to run when the guard is dropped (e.g. for PID file cleanup).
+struct Defer<F: FnOnce()>(Option<F>);
+fn defer<F: FnOnce()>(f: F) -> Defer<F> {
+    Defer(Some(f))
+}
+impl<F: FnOnce()> Drop for Defer<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ReminderResult {
+    DontBugMe,
+    Activity(String),
+    Timeout,
+}
+
+/// Show "What are you working on?" prompt; returns user choice or timeout. Platform-specific (macOS: osascript).
+fn show_reminder_prompt(activities: &[String]) -> ReminderResult {
+    #[cfg(target_os = "macos")]
+    return show_reminder_prompt_macos(activities);
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = activities;
+        ReminderResult::Timeout
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn show_reminder_prompt_macos(activities: &[String]) -> ReminderResult {
+    let mut choices = vec!["Don't Bug Me".to_string()];
+    for a in activities {
+        if !a.is_empty() && !choices.contains(a) {
+            choices.push(a.clone());
+        }
+    }
+    choices.push("Enter new activity...".to_string());
+
+    let list_script = choices
+        .iter()
+        .map(|s| escape_applescript_string(s))
+        .map(|s| format!("\"{}\"", s))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let script = format!(
+        "choose from list {{{}}} with title \"ts\" with prompt \"What are you working on?\" default items {{item 1 of {{{}}}}}",
+        list_script,
+        list_script
+    );
+    let child = match Command::new("osascript")
+        .args(["-e", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return ReminderResult::Timeout,
+    };
+
+    let timeout = Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS);
+    let result = match wait_with_timeout(child, timeout) {
+        WaitOutcome::Finished(Some(stdout)) => {
+            let s = String::from_utf8_lossy(&stdout).trim().to_string();
+            if s == "false" {
+                return ReminderResult::Timeout;
+            }
+            if s == *"Don't Bug Me" {
+                return ReminderResult::DontBugMe;
+            }
+            if s == "Enter new activity..." {
+                let prompt_script = "display dialog \"Enter activity:\" with title \"ts\" default answer \"\"";
+                let child2 = match Command::new("osascript").args(["-e", prompt_script]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+                    Ok(c) => c,
+                    Err(_) => return ReminderResult::Timeout,
+                };
+                if let WaitOutcome::Finished(Some(out)) = wait_with_timeout(child2, Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS)) {
+                    let text = String::from_utf8_lossy(&out);
+                    if let Some(line) = text.lines().next() {
+                        if let Some(rest) = line.strip_prefix("text returned:") {
+                            let activity = rest.trim().trim_matches('"');
+                            if !activity.is_empty() {
+                                return ReminderResult::Activity(activity.to_string());
+                            }
+                        }
+                    }
+                }
+                return ReminderResult::Timeout;
+            }
+            ReminderResult::Activity(s)
+        }
+        WaitOutcome::Finished(None) => ReminderResult::Timeout,
+        WaitOutcome::TimedOut => ReminderResult::Timeout,
+    };
+    result
+}
+
+fn escape_applescript_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Wait for process to finish, or until timeout. Returns stdout if process exited normally.
+enum WaitOutcome {
+    Finished(Option<Vec<u8>>),
+    TimedOut,
+}
+
+fn wait_with_timeout(mut child: process::Child, timeout: Duration) -> WaitOutcome {
+    let start = std::time::Instant::now();
+    let check_interval = Duration::from_millis(100);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let stdout = child.stdout.take().and_then(|mut s| {
+                    let mut v = Vec::new();
+                    let _ = io::copy(&mut s, &mut v);
+                    Some(v)
+                });
+                return WaitOutcome::Finished(stdout);
+            }
+            Ok(None) => {}
+            Err(_) => return WaitOutcome::Finished(None),
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            return WaitOutcome::TimedOut;
+        }
+        thread::sleep(check_interval);
+    }
+}
+
 fn main() {
     let mut args: Vec<String> = env::args().skip(1).collect();
     let cmd = args.first().cloned();
     let rest: Vec<String> = args.drain(1..).collect();
     let timesheet = timesheet_path();
+
+    if cmd.as_deref() == Some("--reminder-daemon") {
+        run_reminder_daemon(&timesheet);
+        process::exit(0);
+    }
+
     let result = match cmd.as_deref() {
         None => cmd_help(),
         Some("start") => cmd_start(&rest, &timesheet),
