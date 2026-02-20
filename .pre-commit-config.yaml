@@ -26,4 +26,12 @@ repos:
     hooks:
       - id: shellcheck
         args: [--shell=sh]
-        files: ^(start|started|stop|timesheet|timeoff|install)$
+        files: ^ts\.ksh$
+  - repo: local
+    hooks:
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets -- -D warnings
+        language: system
+        files: \.(rs|toml)$
+        pass_filenames: false

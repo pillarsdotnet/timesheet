@@ -471,11 +471,11 @@ case "$cmd" in
         exit 1
       fi
     fi
-    if [ ! -f "$SCRIPT_DIR/ts" ]; then
-      echo "ts install: missing $SCRIPT_DIR/ts" >&2
+    if [ ! -f "$SCRIPT_DIR/ts.ksh" ]; then
+      echo "ts install: missing $SCRIPT_DIR/ts.ksh" >&2
       exit 1
     fi
-    cp "$SCRIPT_DIR/ts" "$DEST/ts"
+    cp "$SCRIPT_DIR/ts.ksh" "$DEST/ts"
     chmod +x "$DEST/ts"
     echo "Installed $DEST/ts"
     echo "Done. ts is in $DEST and executable."

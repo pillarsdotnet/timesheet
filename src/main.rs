@@ -1,0 +1,1183 @@
+// Copyright (c) 2025 Robert August Vincent II <pillarsdotnet@gmail.com>
+// Co-author: Cursor-AI.
+
+//! # ts — Timesheet CLI
+//!
+//! Tracks work start/stop and reports time by activity and by day of week.
+//! The log file lives at `$HOME/Documents/timesheet.log` by default.
+//!
+//! ## Log format
+//!
+//! One entry per line:
+//!
+//! - `START|unix_epoch|activity`
+//! - `STOP|unix_epoch`
+//!
+//! Start/stop pairs are matched in LIFO order (each STOP pairs with the most recent START).
+//!
+//! ## Subcommands
+//!
+//! | Command    | Description |
+//! |------------|-------------|
+//! | `start`    | Record work start now; optional activity (default: misc/unspecified). |
+//! | `stop`     | Record work stop now; inserts a 1s gap if last entry was STOP today. |
+//! | `list`     | Report % per activity and hours per weekday; optional file/extension arg. |
+//! | `started`  | Record a past start time; adjusts today's last START or inserts before today's STOP. |
+//! | `timeoff`  | Show stop time for 8 h/day average; starts work if last was STOP. |
+//! | `workalias`| Interactively replace activity text in this week's START entries (regex). |
+//! | `install`  | Copy binary to a directory on PATH. |
+//! | `rotate`   | Rename log to `timesheet.YYMMDD`; append if same-day file exists. |
+
+use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
+use regex::Regex;
+use std::env;
+use std::fs;
+use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
+use std::process;
+
+/// Default path segment under `$HOME` for the timesheet log file.
+const DEFAULT_TIMESHEET: &str = "Documents/timesheet.log";
+
+/// Weekday names for the list report (Sunday first).
+const DAY_NAMES: [&str; 7] = [
+    "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+];
+
+/// Returns the default timesheet path: `$HOME/Documents/timesheet.log`, or `./Documents/timesheet.log` if `HOME` is unset.
+fn timesheet_path() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(DEFAULT_TIMESHEET)
+}
+
+/// Epoch of Sunday 00:00:00 for the week containing the given Unix timestamp (local time).
+fn week_start_epoch(now: i64) -> i64 {
+    let dt = Local
+        .timestamp_opt(now, 0)
+        .single()
+        .unwrap_or_else(Local::now);
+    let today = dt.date_naive();
+    let dow = today.weekday().num_days_from_sunday() as i64;
+    let today_start = today
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_local_timezone(Local)
+        .unwrap()
+        .timestamp();
+    today_start - dow * 86400
+}
+
+/// A single parsed line from the timesheet log.
+#[derive(Clone, Debug)]
+enum LogLine {
+    /// `START|epoch|activity`
+    Start(i64, String),
+    /// `STOP|epoch`
+    Stop(i64),
+}
+
+/// Parses a log line into `LogLine::Start(epoch, activity)` or `LogLine::Stop(epoch)`; returns `None` if not a valid START/STOP line.
+fn parse_line(s: &str) -> Option<LogLine> {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix("START|") {
+        let mut parts = rest.splitn(2, '|');
+        let epoch: i64 = parts.next()?.trim().parse().ok()?;
+        let activity = parts.next().unwrap_or("").to_string();
+        return Some(LogLine::Start(epoch, activity));
+    }
+    if let Some(rest) = s.strip_prefix("STOP|") {
+        let epoch: i64 = rest.trim().parse().ok()?;
+        return Some(LogLine::Stop(epoch));
+    }
+    None
+}
+
+/// Epoch from the last START or STOP line in the file, or `None` if empty/unreadable.
+fn last_line_epoch(path: &Path) -> Option<i64> {
+    let content = fs::read_to_string(path).ok()?;
+    let line = content.lines().rev().find(|l| !l.trim().is_empty())?;
+    match parse_line(line) {
+        Some(LogLine::Start(e, _)) | Some(LogLine::Stop(e)) => Some(e),
+        None => None,
+    }
+}
+
+/// Maximum epoch among all START/STOP lines in the log; `None` if no valid entries.
+fn max_epoch_in_log(path: &Path) -> Option<i64> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut max = 0i64;
+    for line in content.lines() {
+        match parse_line(line) {
+            Some(LogLine::Start(e, _)) | Some(LogLine::Stop(e)) => {
+                if e > max {
+                    max = e;
+                }
+            }
+            None => {}
+        }
+    }
+    if max == 0 {
+        None
+    } else {
+        Some(max)
+    }
+}
+
+/// Rotates the log: renames it to `timesheet.YYMMDD` using the most recent entry's date.
+/// If that file already exists (same day), appends the current log to it and removes the source.
+fn do_rotate(timesheet: &Path) -> Result<(), String> {
+    if !timesheet.exists() {
+        return Err("ts rotate: no timesheet data found.".to_string());
+    }
+    let max_epoch = max_epoch_in_log(timesheet).ok_or("ts rotate: no valid entries in timesheet.")?;
+    let dt = Local
+        .timestamp_opt(max_epoch, 0)
+        .single()
+        .ok_or("ts rotate: could not format timestamp.")?;
+    let stamp = dt.format("%y%m%d").to_string();
+    let parent = timesheet.parent().ok_or("ts rotate: no parent dir")?;
+    let stem = timesheet.file_stem().and_then(|s| s.to_str()).unwrap_or("timesheet");
+    let dest = parent.join(format!("{}.{}", stem, stamp));
+    let content = fs::read_to_string(timesheet).map_err(|e| e.to_string())?;
+    if dest.exists() {
+        let mut f = fs::OpenOptions::new().append(true).open(&dest).map_err(|e| e.to_string())?;
+        f.write_all(content.as_bytes()).map_err(|e| e.to_string())?;
+        fs::remove_file(timesheet).map_err(|e| e.to_string())?;
+        println!("Appended to {}", dest.display());
+    } else {
+        fs::rename(timesheet, &dest).map_err(|e| e.to_string())?;
+        println!("Rotated {} to {}", timesheet.display(), dest.display());
+    }
+    Ok(())
+}
+
+/// If the last log entry is from the previous week (before this week's Sunday 00:00), runs [`do_rotate`].
+fn maybe_rotate_if_previous_week(timesheet: &Path) -> Result<(), String> {
+    if !timesheet.exists() {
+        return Ok(());
+    }
+    let last_epoch = match last_line_epoch(timesheet) {
+        Some(e) => e,
+        None => return Ok(()),
+    };
+    let now = Local::now().timestamp();
+    let week_start = week_start_epoch(now);
+    if last_epoch < week_start {
+        do_rotate(timesheet)?;
+    }
+    Ok(())
+}
+
+/// Resolves the optional list argument to a single timesheet file path.
+///
+/// - Empty / `None` → current timesheet.
+/// - `"log"` → current timesheet.
+/// - Existing path → that path.
+/// - Otherwise: match by extension in the timesheet directory (e.g. `260220`, `20260220`, `0220`, `2/20`).
+///   Returns an error if zero or multiple files match.
+fn resolve_list_input(arg: Option<&str>, timesheet: &Path) -> Result<PathBuf, String> {
+    let list_arg = match arg {
+        Some(a) => a,
+        None => {
+            return Ok(timesheet.to_path_buf());
+        }
+    };
+    if list_arg.is_empty() {
+        return Ok(timesheet.to_path_buf());
+    }
+    if Path::new(list_arg).exists() {
+        return Ok(PathBuf::from(list_arg));
+    }
+    if list_arg == "log" {
+        return Ok(timesheet.to_path_buf());
+    }
+    let ts_dir = timesheet.parent().ok_or("no parent")?;
+    let base = ts_dir.join("timesheet");
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if base.with_extension("log").exists() {
+        candidates.push(base.with_extension("log"));
+    }
+    if let Ok(entries) = fs::read_dir(ts_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("timesheet.") && name != "timesheet.log"
+                    && name.as_bytes().get(10).map(|&b| b.is_ascii_digit()).unwrap_or(false)
+                {
+                    candidates.push(p);
+                }
+            }
+        }
+    }
+    let norm = if list_arg.len() == 8 && list_arg.chars().all(|c| c.is_ascii_digit()) {
+        Some(list_arg[2..].to_string())
+    } else if list_arg.contains('/') {
+        let parts: Vec<&str> = list_arg.splitn(2, '/').collect();
+        if parts.len() == 2 {
+            if let (Ok(m), Ok(d)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                let y = Local::now().format("%y").to_string();
+                Some(format!("{}{:02}{:02}", y, m, d))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let mut matches = Vec::new();
+    for f in &candidates {
+        let suffix = f
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("log")
+            .to_string();
+        if list_arg == suffix
+            || suffix.contains(list_arg)
+            || list_arg.contains(&suffix)
+            || norm.as_ref().map(|n| n == &suffix).unwrap_or(false)
+        {
+            matches.push(f.clone());
+        }
+    }
+    if matches.len() == 1 {
+        Ok(matches.into_iter().next().unwrap())
+    } else if matches.len() > 1 {
+        Err(format!(
+            "ts list: multiple timesheets match \"{}\".",
+            list_arg
+        ))
+    } else {
+        Err(format!("ts list: no timesheet matches \"{}\".", list_arg))
+    }
+}
+
+/// Records work start now; activity is optional (default: misc/unspecified).
+fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
+    maybe_rotate_if_previous_week(timesheet)?;
+    let activity = if args.is_empty() {
+        "misc/unspecified".to_string()
+    } else {
+        args.join(" ")
+    };
+    let now = Local::now().timestamp();
+    let line = format!("START|{}|{}\n", now, activity);
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(timesheet).map_err(|e| e.to_string())?;
+    f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    println!("Started: {} at {}", activity, Local::now().format("%a %b %d %H:%M:%S %Z %Y"));
+    Ok(())
+}
+
+/// Records work stop now; if last entry was STOP today, inserts a 1s gap START then STOP.
+fn cmd_stop(timesheet: &Path) -> Result<(), String> {
+    maybe_rotate_if_previous_week(timesheet)?;
+    let now = Local::now().timestamp();
+    let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
+    let content = fs::read_to_string(timesheet).unwrap_or_default();
+    let last = content.lines().rev().find(|l| !l.trim().is_empty());
+    match last {
+        Some(l) if l.starts_with("STOP|") => {
+            let rest = l.strip_prefix("STOP|").unwrap_or("");
+            let prev_epoch: i64 = rest.trim().parse().unwrap_or(0);
+            let prev_dt = Local.timestamp_opt(prev_epoch, 0).single().unwrap_or_else(Local::now);
+            let prev_date = prev_dt.format("%Y-%m-%d").to_string();
+            if prev_date == today {
+                let insert_start = prev_epoch + 1;
+                let lines: Vec<&str> = content.lines().collect();
+                let without_last = if lines.is_empty() {
+                    String::new()
+                } else {
+                    lines[..lines.len() - 1].join("\n") + "\n"
+                };
+                let new_content = format!(
+                    "{}START|{}|misc/unspecified\nSTOP|{}\n",
+                    without_last, insert_start, now
+                );
+                fs::write(timesheet, &new_content).map_err(|e| e.to_string())?;
+            } else {
+                let line = format!("STOP|{}\n", now);
+                let mut f = fs::OpenOptions::new().append(true).open(timesheet).map_err(|e| e.to_string())?;
+                f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+            }
+        }
+        _ => {
+            let line = format!("STOP|{}\n", now);
+            let mut f = fs::OpenOptions::new().create(true).append(true).open(timesheet).map_err(|e| e.to_string())?;
+            f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+        }
+    }
+    println!("Stopped at {}", Local::now().format("%a %b %d %H:%M:%S %Z %Y"));
+    Ok(())
+}
+
+fn process_log_for_report(lines: &[(usize, LogLine)], virtual_stop: Option<i64>) -> (Vec<(String, f64)>, Vec<f64>, bool) {
+    let mut stack: Vec<(i64, String)> = Vec::new();
+    let mut act_sec: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut dow_sec: [f64; 7] = [0.0; 7];
+    for x in lines.iter() {
+        let (epoch, _line) = (x.1.clone(), x);
+        match &epoch {
+            LogLine::Start(e, a) => {
+                if let Some((start_epoch, start_act)) = stack.pop() {
+                    let dur = *e - start_epoch;
+                    if dur > 0 {
+                        *act_sec.entry(start_act).or_insert(0) += dur;
+                        let days = (start_epoch / 86400) as i32;
+                        let dow = ((days + 4).rem_euclid(7)) as usize;
+                        dow_sec[dow] += dur as f64;
+                    }
+                }
+                stack.push((*e, a.clone()));
+            }
+            LogLine::Stop(e) => {
+                if let Some((start_epoch, start_act)) = stack.pop() {
+                    let dur = *e - start_epoch;
+                    if dur > 0 {
+                        *act_sec.entry(start_act).or_insert(0) += dur;
+                        let days = (start_epoch / 86400) as i32;
+                        let dow = ((days + 4).rem_euclid(7)) as usize;
+                        dow_sec[dow] += dur as f64;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(vstop) = virtual_stop {
+        if let Some((start_epoch, start_act)) = stack.pop() {
+            let dur = vstop - start_epoch;
+            if dur > 0 {
+                *act_sec.entry(start_act).or_insert(0) += dur;
+                let days = (start_epoch / 86400) as i32;
+                let dow = ((days + 4).rem_euclid(7)) as usize;
+                dow_sec[dow] += dur as f64;
+            }
+        }
+    }
+    let total: i64 = act_sec.values().sum();
+    let work_in_progress = !stack.is_empty();
+    let mut by_act: Vec<(String, f64)> = act_sec
+        .into_iter()
+        .map(|(a, s)| (a, 100.0 * s as f64 / total as f64))
+        .collect();
+    by_act.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let dow_hr: Vec<f64> = dow_sec.iter().map(|s| s / 3600.0).collect();
+    (by_act, dow_hr, work_in_progress)
+}
+
+/// Prints report: % per activity and hours per weekday; optional arg selects file (e.g. `log`, `0220`, path).
+fn cmd_list(list_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
+    let list_input = resolve_list_input(list_arg, timesheet)?;
+    if !list_input.exists() {
+        println!("No timesheet data found.");
+        return Ok(());
+    }
+    let content = fs::read_to_string(&list_input).map_err(|e| e.to_string())?;
+    let mut lines: Vec<(usize, LogLine)> = Vec::new();
+    for (i, line) in content.lines().enumerate() {
+        if let Some(ll) = parse_line(line) {
+            lines.push((i + 1, ll));
+        }
+    }
+    let is_current = list_arg.is_none() || list_arg == Some("log");
+    let last_start = lines.iter().rev().find(|(_, l)| matches!(l, LogLine::Start(_, _)));
+    let virtual_stop = if is_current && last_start.is_some() {
+        Some(Local::now().timestamp())
+    } else {
+        None
+    };
+    let (by_act, dow_hr, work_in_progress) = process_log_for_report(&lines, virtual_stop);
+    if by_act.is_empty() {
+        println!("No work recorded.");
+        return Ok(());
+    }
+    for (act, pct) in &by_act {
+        println!("{:.1}%  {}", pct, act);
+    }
+    for (i, name) in DAY_NAMES.iter().enumerate() {
+        println!("{}  {:.2}", name, dow_hr.get(i).copied().unwrap_or(0.0));
+    }
+    if is_current && work_in_progress {
+        if let Some((_, LogLine::Start(epoch, activity))) = last_start {
+            let start_dt = Local.timestamp_opt(*epoch, 0).single().unwrap_or_else(Local::now);
+            let now = Local::now().timestamp();
+            let dur_sec = now - epoch;
+            let dur_min = dur_sec / 60;
+            let dur_hr = dur_min / 60;
+            let dur_rem = dur_min % 60;
+            let duration_fmt = if dur_hr > 0 {
+                format!("{}h {}m", dur_hr, dur_rem)
+            } else {
+                format!("{}m", dur_min)
+            };
+            println!(
+                "\nCurrent Task: {}, started {}, worked {}",
+                activity,
+                start_dt.format("%a %b %d %H:%M:%S %Z %Y"),
+                duration_fmt
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Parses a start-time string into a Unix epoch; tries several formats (e.g. `%Y-%m-%d %H:%M`, `%H:%M`, `%I:%M %p`).
+fn parse_start_time(s: &str) -> Option<i64> {
+    let now = Local::now();
+    let today = now.date_naive();
+    let formats = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%H:%M",
+        "%H:%M:%S",
+        "%m/%d/%Y %H:%M",
+        "%m/%d %H:%M",
+        "%I:%M %p",
+        "%I:%M%p",
+    ];
+    for fmt in formats {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(dt.and_local_timezone(Local).unwrap().timestamp());
+        }
+    }
+    if let Ok(t) = NaiveTime::parse_from_str(s, "%H:%M") {
+        let dt = today.and_time(t).and_local_timezone(Local).unwrap();
+        return Some(dt.timestamp());
+    }
+    if let Ok(t) = NaiveTime::parse_from_str(s, "%I:%M %p") {
+        let dt = today.and_time(t).and_local_timezone(Local).unwrap();
+        return Some(dt.timestamp());
+    }
+    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        let dt = d.and_hms_opt(0, 0, 0).unwrap().and_local_timezone(Local).unwrap();
+        return Some(dt.timestamp());
+    }
+    None
+}
+
+/// Records a past start time; replaces today's last START or inserts before today's STOP if applicable.
+fn cmd_started(args: &[String], timesheet: &Path) -> Result<(), String> {
+    let (start_time, activity) = match args.split_first() {
+        Some((st, rest)) => (st.as_str(), rest.join(" ")),
+        None => {
+            eprintln!("Usage: ts started <start_time> [activity...]");
+            eprintln!("  start_time is required (e.g. \"2025-02-16 09:00\" or \"9:00 AM\").");
+            return Err("missing start_time".to_string());
+        }
+    };
+    let activity = if activity.is_empty() {
+        "misc/unspecified".to_string()
+    } else {
+        activity
+    };
+    let epoch = parse_start_time(start_time).ok_or_else(|| format!("ts started: could not parse start time: {}", start_time))?;
+    maybe_rotate_if_previous_week(timesheet)?;
+    let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
+    let content = fs::read_to_string(timesheet).unwrap_or_default();
+    let last = content.lines().rev().find(|l| !l.trim().is_empty());
+    match last {
+        Some(l) if l.starts_with("START|") => {
+            let rest = l.strip_prefix("START|").unwrap_or("");
+            let mut parts = rest.splitn(2, '|');
+            let start_epoch: i64 = parts.next().and_then(|p| p.trim().parse().ok()).unwrap_or(0);
+            let start_dt = Local.timestamp_opt(start_epoch, 0).single().unwrap_or_else(Local::now);
+            let start_date = start_dt.format("%Y-%m-%d").to_string();
+            if start_date == today {
+                let lines: Vec<&str> = content.lines().collect();
+                let without_last = if lines.is_empty() { String::new() } else { lines[..lines.len() - 1].join("\n") + "\n" };
+                let new_content = format!("{}START|{}|{}\n", without_last, epoch, activity);
+                fs::write(timesheet, new_content).map_err(|e| e.to_string())?;
+                let dt = Local.timestamp_opt(epoch, 0).single().unwrap_or_else(Local::now);
+                println!("Started: {} at {}", activity, dt.format("%a %b %d %H:%M:%S %Z %Y"));
+                return Ok(());
+            }
+        }
+        Some(l) if l.starts_with("STOP|") => {
+            let rest = l.strip_prefix("STOP|").unwrap_or("");
+            let stop_epoch: i64 = rest.trim().parse().unwrap_or(0);
+            let stop_dt = Local.timestamp_opt(stop_epoch, 0).single().unwrap_or_else(Local::now);
+            let stop_date = stop_dt.format("%Y-%m-%d").to_string();
+            if epoch < stop_epoch && stop_date == today {
+                let lines: Vec<&str> = content.lines().collect();
+                let without_last = if lines.is_empty() { String::new() } else { lines[..lines.len() - 1].join("\n") + "\n" };
+                let new_content = format!("{}START|{}|{}\n{}\n", without_last, epoch, activity, l);
+                fs::write(timesheet, new_content).map_err(|e| e.to_string())?;
+                let dt = Local.timestamp_opt(epoch, 0).single().unwrap_or_else(Local::now);
+                println!("Started: {} at {}", activity, dt.format("%a %b %d %H:%M:%S %Z %Y"));
+                return Ok(());
+            }
+        }
+        _ => {}
+    }
+    let line = format!("START|{}|{}\n", epoch, activity);
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(timesheet).map_err(|e| e.to_string())?;
+    f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    let dt = Local.timestamp_opt(epoch, 0).single().unwrap_or_else(Local::now);
+    println!("Started: {} at {}", activity, dt.format("%a %b %d %H:%M:%S %Z %Y"));
+    Ok(())
+}
+
+/// Shows stop time for 8 h/day average; starts work (appends START) if last entry was STOP.
+fn cmd_timeoff(timesheet: &Path) -> Result<(), String> {
+    maybe_rotate_if_previous_week(timesheet)?;
+    if timesheet.exists() {
+        let content = fs::read_to_string(timesheet).unwrap_or_default();
+        let last = content.lines().rev().find(|l| !l.trim().is_empty());
+        if last.map(|l| l.starts_with("STOP|")).unwrap_or(false) {
+            let now = Local::now().timestamp();
+            let line = format!("START|{}|misc/unspecified\n", now);
+            let mut f = fs::OpenOptions::new().append(true).open(timesheet).map_err(|e| e.to_string())?;
+            f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+        }
+    }
+    if !timesheet.exists() {
+        println!("No timesheet data.");
+        return Ok(());
+    }
+    let content = fs::read_to_string(timesheet).unwrap_or_default();
+    let mut stack: Vec<(i64, String)> = Vec::new();
+    let mut total_sec: i64 = 0;
+    let mut day_seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut lines: Vec<LogLine> = Vec::new();
+    for line in content.lines() {
+        if let Some(ll) = parse_line(line) {
+            lines.push(ll);
+        }
+    }
+    let now = Local::now().timestamp();
+    let mut effective = lines.clone();
+    if let Some(LogLine::Start(_, _)) = lines.last() {
+        effective.push(LogLine::Stop(now));
+    }
+    for line in &effective {
+        match line {
+            LogLine::Start(e, a) => {
+                if let Some((start_epoch, _)) = stack.pop() {
+                    let dur = *e - start_epoch;
+                    if dur > 0 {
+                        total_sec += dur;
+                        day_seen.insert(start_epoch / 86400);
+                    }
+                }
+                stack.push((*e, a.clone()));
+            }
+            LogLine::Stop(e) => {
+                if let Some((start_epoch, _)) = stack.pop() {
+                    let dur = *e - start_epoch;
+                    if dur > 0 {
+                        total_sec += dur;
+                        day_seen.insert(start_epoch / 86400);
+                    }
+                }
+            }
+        }
+    }
+    let num_days = day_seen.len() as f64;
+    if num_days == 0.0 {
+        println!("No work recorded.");
+        return Ok(());
+    }
+    let total_hr = total_sec as f64 / 3600.0;
+    let need_hr = 8.0 * num_days - total_hr;
+    if need_hr <= 0.0 {
+        println!("Average already at least 8 hours per day worked. You may stop now.");
+        println!("{}", Local::now().format("%a %b %d %H:%M:%S %Z %Y"));
+        return Ok(());
+    }
+    let stop_epoch = (now as f64 + need_hr * 3600.0) as i64;
+    let stop_dt = Local.timestamp_opt(stop_epoch, 0).single().unwrap_or_else(Local::now);
+    println!("Stop at: {}", stop_dt.format("%a %b %d %H:%M:%S %Z %Y"));
+    println!(
+        "({:.2} hours remaining for 8h/day average over {} day(s))",
+        need_hr, num_days
+    );
+    Ok(())
+}
+
+/// Interactively replace activity text in this week's START entries; pattern is a regex, prompt Replace (y/n) per match.
+fn cmd_workalias(args: &[String], timesheet: &Path) -> Result<(), String> {
+    let (pattern, replacement) = match args {
+        [p, r, ..] => (p.as_str(), r.to_string()),
+        _ => {
+            eprintln!("Usage: ts workalias <pattern> <replacement>");
+            return Err("missing args".to_string());
+        }
+    };
+    if !timesheet.exists() {
+        return Err("ts workalias: no timesheet data found.".to_string());
+    }
+    let now = Local::now().timestamp();
+    let week_start = week_start_epoch(now);
+    let week_end = week_start + 7 * 86400 - 1;
+    let re = Regex::new(pattern).map_err(|e| format!("invalid pattern: {}", e))?;
+    let content = fs::read_to_string(timesheet).map_err(|e| e.to_string())?;
+    let mut matches_vec: Vec<(usize, i64, String)> = Vec::new();
+    for (i, line) in content.lines().enumerate() {
+        if let Some(LogLine::Start(epoch, activity)) = parse_line(line) {
+            if epoch >= week_start && epoch <= week_end && re.is_match(&activity) {
+                matches_vec.push((i + 1, epoch, replacement.clone()));
+            }
+        }
+    }
+    if matches_vec.is_empty() {
+        return Err(format!(
+            "ts workalias: no activities matching \"{}\" found for this week.",
+            pattern
+        ));
+    }
+    let mut replace_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    for (line_num, epoch, new_repl) in &matches_vec {
+        let orig_line = content.lines().nth(*line_num - 1).unwrap_or("");
+        let new_line = format!("START|{}|{}", epoch, new_repl);
+        println!("Original: {}", orig_line);
+        println!("Replaced: {}", new_line);
+        print!("Replace (y/n) ");
+        stdout.flush().map_err(|e| e.to_string())?;
+        let mut buf = String::new();
+        if stdin.lock().read_line(&mut buf).is_ok()
+            && buf.trim().eq_ignore_ascii_case("y")
+        {
+            replace_lines.insert(*line_num);
+        }
+    }
+    if replace_lines.is_empty() {
+        return Ok(());
+    }
+    let mut out = String::new();
+    for (i, line) in content.lines().enumerate() {
+        let line_no = i + 1;
+        let should_replace = replace_lines.contains(&line_no);
+        if should_replace {
+            if let Some(LogLine::Start(epoch, activity)) = parse_line(line) {
+                if epoch >= week_start && epoch <= week_end && re.is_match(&activity) {
+                    out.push_str(&format!("START|{}|{}\n", epoch, replacement));
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    fs::write(timesheet, out).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Copies the binary to a directory on PATH (first writable) or the given directory.
+fn cmd_install(args: &[String]) -> Result<(), String> {
+    let dest_dir = args.first().map(String::as_str);
+    let repo_path = args.get(1).map(String::as_str);
+    let exe = env::current_exe().map_err(|e| e.to_string())?;
+    let script_dir = repo_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| exe.parent().unwrap_or(Path::new(".")).to_path_buf());
+    let dest = if let Some(d) = dest_dir {
+        let p = PathBuf::from(d);
+        if !p.exists() {
+            fs::create_dir_all(&p).map_err(|e| format!("ts install: cannot create directory {}: {}", d, e))?;
+        }
+        if !p.is_dir() || !is_writable(&p) {
+            return Err(format!("ts install: directory is not writable: {}", d));
+        }
+        p
+    } else {
+        let path_env = env::var_os("PATH").unwrap_or_default();
+        let mut found = None;
+        for dir in env::split_paths(&path_env) {
+            let d = if dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                &dir
+            };
+            if d.is_dir() && is_writable(d) {
+                found = Some(d.to_path_buf());
+                break;
+            }
+        }
+        found.ok_or("ts install: no writable directory on PATH. Specify an installation directory.")?
+    };
+    let src = script_dir.join("ts");
+    let src_exe = if script_dir == exe.parent().unwrap_or(Path::new(".")) {
+        exe.clone()
+    } else {
+        script_dir.join(if cfg!(windows) { "ts.exe" } else { "ts" })
+    };
+    let src_to_use = if src.exists() {
+        &src
+    } else if src_exe.exists() {
+        &src_exe
+    } else {
+        &exe
+    };
+    if !src_to_use.exists() {
+        return Err(format!("ts install: missing {}", src_to_use.display()));
+    }
+    let dest_file = dest.join(if cfg!(windows) { "ts.exe" } else { "ts" });
+    fs::copy(src_to_use, &dest_file).map_err(|e| format!("ts install: copy failed: {}", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&dest_file).map_err(|e| e.to_string())?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&dest_file, perms).map_err(|e| e.to_string())?;
+    }
+    println!("Installed {}", dest_file.display());
+    println!("Done. ts is in {} and executable.", dest.display());
+    Ok(())
+}
+
+fn is_writable(p: &Path) -> bool {
+    fs::metadata(p).map(|m| !m.permissions().readonly()).unwrap_or(false)
+}
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let cmd = match args.first() {
+        Some(c) => c.clone(),
+        None => {
+            eprintln!("Usage: ts <command> [args...]");
+            eprintln!("  start | stop | list | started | timeoff | workalias | install | rotate");
+            process::exit(1);
+        }
+    };
+    let rest: Vec<String> = args.into_iter().skip(1).collect();
+    let cmd = cmd.as_str();
+    let timesheet = timesheet_path();
+    let result = match cmd {
+        "start" => cmd_start(&rest, &timesheet),
+        "stop" => cmd_stop(&timesheet),
+        "list" => cmd_list(rest.first().map(String::as_str), &timesheet),
+        "started" => cmd_started(&rest, &timesheet),
+        "timeoff" => cmd_timeoff(&timesheet),
+        "workalias" => cmd_workalias(&rest, &timesheet),
+        "install" => cmd_install(&rest),
+        "rotate" => do_rotate(&timesheet),
+        _ => {
+            eprintln!("Usage: ts <command> [args...]");
+            eprintln!("  start | stop | list | started | timeoff | workalias | install | rotate");
+            process::exit(1);
+        }
+    };
+    if let Err(e) = result {
+        eprintln!("{}", e);
+        process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Timelike;
+
+    #[test]
+    fn test_parse_line_start() {
+        let line = "START|1700000000|coding";
+        let parsed = parse_line(line);
+        assert!(matches!(parsed, Some(LogLine::Start(1700000000, a)) if a == "coding"));
+    }
+
+    #[test]
+    fn test_parse_line_start_empty_activity() {
+        let line = "START|1700000000|";
+        let parsed = parse_line(line);
+        assert!(matches!(parsed, Some(LogLine::Start(1700000000, a)) if a.is_empty()));
+    }
+
+    #[test]
+    fn test_parse_line_start_activity_with_pipe() {
+        let line = "START|1700000000|misc|unspecified";
+        let parsed = parse_line(line);
+        assert!(matches!(parsed, Some(LogLine::Start(1700000000, a)) if a == "misc|unspecified"));
+    }
+
+    #[test]
+    fn test_parse_line_stop() {
+        let line = "STOP|1700003600";
+        let parsed = parse_line(line);
+        assert!(matches!(parsed, Some(LogLine::Stop(1700003600))));
+    }
+
+    #[test]
+    fn test_parse_line_invalid() {
+        assert!(parse_line("").is_none());
+        assert!(parse_line("  \n  ").is_none());
+        assert!(parse_line("START").is_none());
+        assert!(parse_line("STOP").is_none());
+        assert!(parse_line("START|abc|act").is_none());
+        assert!(parse_line("STOP|abc").is_none());
+        assert!(parse_line("OTHER|123").is_none());
+    }
+
+    #[test]
+    fn test_parse_line_whitespace_trimmed() {
+        let line = "  START|1700000000|  x  ";
+        let parsed = parse_line(line);
+        if let Some(LogLine::Start(epoch, activity)) = parsed {
+            assert_eq!(epoch, 1700000000);
+            assert_eq!(activity, "  x");
+        } else {
+            panic!("expected Some(Start)");
+        }
+    }
+
+    #[test]
+    fn test_week_start_epoch() {
+        // 2023-11-14 12:00:00 UTC-ish Tuesday -> week start is Sunday 2023-11-12 00:00:00 local
+        let tuesday = 1700000000i64; // use a known epoch
+        let week_start = week_start_epoch(tuesday);
+        let dt = chrono::Local.timestamp_opt(week_start, 0).single().unwrap();
+        assert_eq!(dt.weekday(), chrono::Weekday::Sun);
+        assert_eq!(dt.hour(), 0);
+        assert_eq!(dt.minute(), 0);
+    }
+
+    #[test]
+    fn test_timesheet_path_uses_home() {
+        let path = timesheet_path();
+        assert!(path.ends_with("Documents/timesheet.log") || path.ends_with("Documents\\timesheet.log"));
+    }
+
+    #[test]
+    fn test_last_line_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        fs::write(&path, "START|100|a\nSTOP|200\n").unwrap();
+        assert_eq!(last_line_epoch(&path), Some(200));
+        fs::write(&path, "START|100|a\n").unwrap();
+        assert_eq!(last_line_epoch(&path), Some(100));
+        fs::write(&path, "").unwrap();
+        assert!(last_line_epoch(&path).is_none());
+    }
+
+    #[test]
+    fn test_max_epoch_in_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        fs::write(&path, "START|100|a\nSTOP|200\nSTART|150|b\n").unwrap();
+        assert_eq!(max_epoch_in_log(&path), Some(200));
+        fs::write(&path, "").unwrap();
+        assert!(max_epoch_in_log(&path).is_none());
+        fs::write(&path, "comment\n").unwrap();
+        assert!(max_epoch_in_log(&path).is_none());
+    }
+
+    #[test]
+    fn test_do_rotate_renames_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        fs::write(&log_path, "START|1730000000|coding\nSTOP|1730003600\n").unwrap();
+        let result = do_rotate(&log_path);
+        assert!(result.is_ok());
+        assert!(!log_path.exists());
+        let stamp = chrono::Local
+            .timestamp_opt(1730003600, 0)
+            .single()
+            .unwrap()
+            .format("%y%m%d")
+            .to_string();
+        let rotated = dir.path().join(format!("timesheet.{}", stamp));
+        assert!(rotated.exists(), "expected timesheet.{} to exist", stamp);
+        let content = fs::read_to_string(&rotated).unwrap();
+        assert!(content.contains("START|1730000000|coding"));
+    }
+
+    #[test]
+    fn test_do_rotate_appends_when_same_day_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        fs::write(&log_path, "START|1730000000|first\nSTOP|1730001000\n").unwrap();
+        let stamp = chrono::Local
+            .timestamp_opt(1730000000, 0)
+            .single()
+            .unwrap()
+            .format("%y%m%d")
+            .to_string();
+        let dest = dir.path().join(format!("timesheet.{}", stamp));
+        fs::write(&dest, "START|1729900000|old\nSTOP|1729901000\n").unwrap();
+        let result = do_rotate(&log_path);
+        assert!(result.is_ok());
+        assert!(!log_path.exists());
+        let content = fs::read_to_string(&dest).unwrap();
+        assert!(content.contains("old"));
+        assert!(content.contains("first"));
+    }
+
+    #[test]
+    fn test_do_rotate_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        let result = do_rotate(&log_path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no timesheet data"));
+    }
+
+    #[test]
+    fn test_do_rotate_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        fs::write(&log_path, "").unwrap();
+        let result = do_rotate(&log_path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no valid entries"));
+    }
+
+    #[test]
+    fn test_maybe_rotate_does_nothing_when_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        let result = maybe_rotate_if_previous_week(&log_path);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_resolve_list_input_none_returns_timesheet() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        fs::File::create(&ts).unwrap();
+        let out = resolve_list_input(None, &ts).unwrap();
+        assert_eq!(out, ts);
+    }
+
+    #[test]
+    fn test_resolve_list_input_log_returns_timesheet() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        fs::File::create(&ts).unwrap();
+        let out = resolve_list_input(Some("log"), &ts).unwrap();
+        assert_eq!(out, ts);
+    }
+
+    #[test]
+    fn test_resolve_list_input_exact_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        fs::File::create(&ts).unwrap();
+        let rotated = dir.path().join("timesheet.260220");
+        fs::File::create(&rotated).unwrap();
+        let out = resolve_list_input(Some("260220"), &ts).unwrap();
+        assert_eq!(out, rotated);
+    }
+
+    #[test]
+    fn test_resolve_list_input_substring_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        fs::File::create(&ts).unwrap();
+        let rotated = dir.path().join("timesheet.260220");
+        fs::File::create(&rotated).unwrap();
+        let out = resolve_list_input(Some("0220"), &ts).unwrap();
+        assert_eq!(out, rotated);
+    }
+
+    #[test]
+    fn test_resolve_list_input_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        fs::File::create(&ts).unwrap();
+        let result = resolve_list_input(Some("999999"), &ts);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no timesheet matches"));
+    }
+
+    #[test]
+    fn test_process_log_for_report_one_pair() {
+        let lines = vec![
+            (1, LogLine::Start(1000, "coding".to_string())),
+            (2, LogLine::Stop(4600)),
+        ];
+        let (by_act, dow_hr, wip) = process_log_for_report(&lines, None);
+        assert!(!wip);
+        assert_eq!(by_act.len(), 1);
+        assert_eq!(by_act[0].0, "coding");
+        assert!((by_act[0].1 - 100.0).abs() < 0.01);
+        assert!((dow_hr.iter().sum::<f64>() - 3600.0 / 3600.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_process_log_for_report_virtual_stop() {
+        let lines = vec![(1, LogLine::Start(1000, "x".to_string()))];
+        let (by_act, _, wip) = process_log_for_report(&lines, Some(2000));
+        assert!(!wip);
+        assert_eq!(by_act.len(), 1);
+        assert_eq!(by_act[0].0, "x");
+        assert!((by_act[0].1 - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parse_start_time_ymd_hm() {
+        let epoch = parse_start_time("2025-02-20 09:00");
+        assert!(epoch.is_some());
+        let dt = chrono::Local.timestamp_opt(epoch.unwrap(), 0).single().unwrap();
+        assert_eq!(dt.year(), 2025);
+        assert_eq!(dt.month(), 2);
+        assert_eq!(dt.day(), 20);
+        assert_eq!(dt.hour(), 9);
+        assert_eq!(dt.minute(), 0);
+    }
+
+    #[test]
+    fn test_parse_start_time_hm() {
+        let epoch = parse_start_time("14:30");
+        assert!(epoch.is_some());
+        let dt = chrono::Local.timestamp_opt(epoch.unwrap(), 0).single().unwrap();
+        assert_eq!(dt.hour(), 14);
+        assert_eq!(dt.minute(), 30);
+    }
+
+    #[test]
+    fn test_parse_start_time_invalid() {
+        assert!(parse_start_time("").is_none());
+        assert!(parse_start_time("not-a-date").is_none());
+    }
+
+    #[test]
+    fn test_cmd_start_appends_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        let result = cmd_start(&["my-activity".to_string()], &ts);
+        assert!(result.is_ok());
+        let content = fs::read_to_string(&ts).unwrap();
+        assert!(content.starts_with("START|"));
+        assert!(content.contains("my-activity"));
+    }
+
+    #[test]
+    fn test_cmd_start_default_activity() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        let result = cmd_start(&[], &ts);
+        assert!(result.is_ok());
+        let content = fs::read_to_string(&ts).unwrap();
+        assert!(content.contains("misc/unspecified"));
+    }
+
+    #[test]
+    fn test_cmd_stop_appends_when_last_is_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        let now = chrono::Local::now().timestamp();
+        let week_start = week_start_epoch(now);
+        let start_epoch = week_start + 3600;
+        fs::write(&ts, format!("START|{}|coding\n", start_epoch)).unwrap();
+        let result = cmd_stop(&ts);
+        assert!(result.is_ok());
+        let content = fs::read_to_string(&ts).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "expected START and STOP lines, got: {:?}", lines);
+        assert!(lines[0].starts_with("START|"));
+        assert!(lines[1].starts_with("STOP|"));
+    }
+
+    #[test]
+    fn test_cmd_list_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        let result = cmd_list(None, &ts);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_cmd_list_with_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        fs::write(&ts, "START|1730000000|coding\nSTOP|1730003600\n").unwrap();
+        let result = cmd_list(None, &ts);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_cmd_started_missing_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        let result = cmd_started(&[], &ts);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("missing start_time") || err.contains("parse"));
+    }
+
+    #[test]
+    fn test_cmd_started_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        let result = cmd_started(
+            &["2025-02-20 10:00".to_string(), "manual".to_string()],
+            &ts,
+        );
+        assert!(result.is_ok());
+        let content = fs::read_to_string(&ts).unwrap();
+        assert!(content.contains("START|"));
+        assert!(content.contains("manual"));
+    }
+
+    #[test]
+    fn test_cmd_timeoff_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        let result = cmd_timeoff(&ts);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_cmd_workalias_missing_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        fs::File::create(&ts).unwrap();
+        let result = cmd_workalias(&[], &ts);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cmd_workalias_one_arg() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        fs::File::create(&ts).unwrap();
+        let result = cmd_workalias(&["pattern".to_string()], &ts);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cmd_workalias_no_timesheet() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        let result = cmd_workalias(
+            &["coding".to_string(), "dev".to_string()],
+            &ts,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no timesheet data"));
+    }
+
+    #[test]
+    fn test_cmd_workalias_no_match_this_week() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        // Entry from this week (use current week_start..week_end)
+        let now = chrono::Local::now().timestamp();
+        let week_start = week_start_epoch(now);
+        fs::write(
+            &ts,
+            format!("START|{}|other\nSTOP|{}\n", week_start, week_start + 100),
+        )
+        .unwrap();
+        let result = cmd_workalias(
+            &["nonexistent".to_string(), "repl".to_string()],
+            &ts,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no activities matching"));
+    }
+
+    #[test]
+    fn test_cmd_install_to_dir() {
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest_path = dest_dir.path().to_path_buf();
+        let result = cmd_install(&[dest_path.to_string_lossy().to_string()]);
+        assert!(result.is_ok());
+        let exe_name = if cfg!(windows) { "ts.exe" } else { "ts" };
+        let installed = dest_path.join(exe_name);
+        assert!(installed.exists());
+    }
+}
