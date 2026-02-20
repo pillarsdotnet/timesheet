@@ -1043,6 +1043,7 @@ fn is_pid_running(pid: u32) -> bool {
 }
 
 /// Kill the reminder daemon if running (read PID from file, send SIGTERM, remove PID file). No-op on non-Unix.
+/// Never kills the current process (avoids PID-reuse bug where stale PID file could point at us).
 fn kill_reminder_daemon_if_running() {
     #[cfg(not(unix))]
     return;
@@ -1052,6 +1053,10 @@ fn kill_reminder_daemon_if_running() {
         let pid_path = reminder_pid_path();
         if let Ok(data) = fs::read_to_string(&pid_path) {
             if let Ok(pid) = data.trim().parse::<u32>() {
+                if pid == process::id() {
+                    let _ = fs::remove_file(&pid_path);
+                    return;
+                }
                 if is_pid_running(pid) {
                     let _ = Command::new("kill").arg(pid.to_string()).status();
                     thread::sleep(Duration::from_millis(150));
