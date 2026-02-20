@@ -9,7 +9,7 @@ Korn shell scripts for tracking work start/stop and reporting time by activity a
 
 - `ksh` (Korn shell)
 - `awk`
-- Timesheet data file: `~/Documents/timesheet.log` (edit `TIMESHEET` in the `ts` script to change)
+- Timesheet data file: `~/Documents/timesheet.log` (edit `TIMESHEET` in the `ts.ksh` script to change)
 
 ## Data format
 
@@ -22,7 +22,7 @@ Start/stop pairs are matched in **LIFO order** (each STOP pairs with the most re
 
 ## ts command
 
-All functionality is in a single script **`ts`**. The first argument is a required subcommand:
+You can run the legacy Korn shell script **`ts.ksh`** or the Rust binary **`ts`**. The first argument is a required subcommand:
 
 | Subcommand   | Description |
 |-------------|-------------|
@@ -32,7 +32,7 @@ All functionality is in a single script **`ts`**. The first argument is a requir
 | `started`   | Record a work start at a **past time**. Args: `ts started <start_time> [activity...]`. Same behavior as legacy started. |
 | `timeoff`   | Show stop-work time for 8h/day average; if last entry is STOP, starts work for the calculation. |
 | `workalias` | Interactively replace activity text in START entries from the current week. Args: `ts workalias <pattern> <replacement>`. |
-| `install`   | Copy `ts` to a directory on PATH. Args: `ts install [install_dir] [repo_path]`. |
+| `install`   | Copy the binary (or `ts.ksh`) to a directory on PATH. Args: `ts install [install_dir] [repo_path]`. |
 | `rotate`    | Rename `timesheet.log` to `timesheet.YYMMDDHHMM` where the timestamp is the date/time of its most recent entry. |
 
 ### start
@@ -77,8 +77,8 @@ Searches for START entries from the current week whose activity matches the patt
 
 ### install
 
-- **install_dir omitted:** Installs `ts` into the first writable directory on `PATH`.
-- **install_dir given:** Installs `ts` into that directory (created if needed). Exits with an error if `ts` is missing in the repo path. Usage: `ts install [install_dir] [repo_path]`.
+- **install_dir omitted:** Installs the binary (or `ts.ksh`) into the first writable directory on `PATH`.
+- **install_dir given:** Installs into that directory (created if needed). Exits with an error if the binary or `ts.ksh` is missing in the repo path. Usage: `ts install [install_dir] [repo_path]`.
 
 ### rotate
 
@@ -86,23 +86,48 @@ Renames the timesheet log to `timesheet.YYMMDDHHMM` using the timestamp of the l
 
 ## Install
 
-From the repository directory:
+From the repository directory (using the Rust binary):
 
 ```sh
-./ts install
+cargo build --release && ./target/release/ts install
 ```
 
-This installs `ts` into the first writable directory on your `PATH`. To install into a specific directory (e.g. `~/bin`):
+Or using the legacy script:
 
 ```sh
-./ts install ~/bin
+./ts.ksh install ~/bin
 ```
 
-Or copy and chmod manually:
+To install into a specific directory (e.g. `~/bin`): `ts install ~/bin` or `./ts.ksh install ~/bin`. Or copy manually:
 
 ```sh
-cp ts ~/bin/
+cp ts.ksh ~/bin/ts
 chmod +x ~/bin/ts
 ```
 
-Ensure `TIMESHEET` in the `ts` script points to your log file (default: `~/Documents/timesheet.log`).
+Ensure `TIMESHEET` in `ts.ksh` (or the binary’s default) points to your log file (default: `~/Documents/timesheet.log`).
+
+## Build from source (Rust)
+
+The `ts` command is also implemented in Rust. Build with [Rust](https://rustup.rs) installed:
+
+```sh
+cargo build --release
+```
+
+The binary is produced at `target/release/ts` (or `target/debug/ts` for `cargo build`). It uses the same log path: `$HOME/Documents/timesheet.log`. Install it with:
+
+```sh
+cargo build --release
+cp target/release/ts ~/bin/ts   # or ts install after copying binary to repo dir
+```
+
+### Documentation
+
+[Rustdoc](https://doc.rust-lang.org/rustdoc/)-compatible comments are in the Rust source. Generate and open the docs with:
+
+```sh
+cargo doc --no-deps --open
+```
+
+Output is under `target/doc/ts/`.
