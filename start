@@ -1,9 +1,0 @@
-#!/bin/ksh
-# Copyright (c) 2025 Robert August Vincent II <pillarsdotnet@gmail.com>
-# Co-author: Cursor-AI.
-# Record work start time. Optional args = activity description (default: misc/unspecified).
-
-TIMESHEET=~/Documents/timesheet.log
-activity="${*:-misc/unspecified}"
-echo "START|$(date +%s)|${activity}" >> "$TIMESHEET"
-echo "Started: ${activity} at $(date)"
