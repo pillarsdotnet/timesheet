@@ -20,17 +20,18 @@
 //! | Command    | Description |
 //! |------------|-------------|
 //! | `start`    | Record work start now; optional activity (default: misc/unspecified). |
-//! | `stop`     | Record work stop now; inserts a 1s gap if last entry was STOP today. |
+//! | `stop`     | Record work stop (optional time); amends previous STOP if work already stopped. |
 //! | `list`     | Report % per activity and hours per weekday; optional file/extension arg. |
 //! | `started`  | Record a past start time; adjusts today's last START or inserts before today's STOP. |
 //! | `timeoff`  | Show stop time for 8 h/day average; starts work if last was STOP. |
 //! | `alias`    | Interactively replace activity text in this week's START entries (regex). |
 //! | `rename`   | Same as `alias`. |
 //! | `install`  | Copy binary to a directory on PATH. |
-//! | `rotate`   | Rename log to `timesheet.YYMMDD`; append if same-day file exists. |
+//! | `rebuild`  | Build from local dir or clone; then install to current binary's directory. |
+//! | `rotate`   | Rename log to `timesheet.YYMMDD`; add STOP first if last entry is START; append if same-day exists. |
 //! | `restart`  | Kill and restart the reminder daemon. |
 //! | `manpage`  | Output Unix manual page in groff format to stdout. |
-//! | `help`     | Show the man page in a pager (equivalent to `ts manpage | man -l -`). |
+//! | `help`     | Show the man page in a pager (groff -man -Tascii \| less). |
 
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 use regex::Regex;
@@ -186,9 +187,18 @@ fn max_epoch_in_log(path: &Path) -> Option<i64> {
 
 /// Rotates the log: renames it to `timesheet.YYMMDD` using the most recent entry's date.
 /// If that file already exists (same day), appends the current log to it and removes the source.
+/// If the last entry is START (work in progress), appends a STOP at current time before rotating.
 fn do_rotate(timesheet: &Path) -> Result<(), String> {
     if !timesheet.exists() {
         return Err("ts rotate: no timesheet data found.".to_string());
+    }
+    let content = fs::read_to_string(timesheet).map_err(|e| e.to_string())?;
+    let last = content.lines().rev().find(|l| !l.trim().is_empty());
+    if last.map(|l| l.starts_with("START|")).unwrap_or(false) {
+        let now = Local::now().timestamp();
+        let mut f = fs::OpenOptions::new().append(true).open(timesheet).map_err(|e| e.to_string())?;
+        f.write_all(format!("STOP|{}\n", now).as_bytes())
+            .map_err(|e| e.to_string())?;
     }
     let max_epoch = max_epoch_in_log(timesheet).ok_or("ts rotate: no valid entries in timesheet.")?;
     let dt = Local
@@ -331,45 +341,35 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Records work stop now; if last entry was STOP today, inserts a 1s gap START then STOP.
-fn cmd_stop(timesheet: &Path) -> Result<(), String> {
+/// Records work stop at the given time (or now if no time given). Same time formats as `ts started`.
+/// If the last entry is already STOP, amends that stop time instead of inserting an intervening START.
+fn cmd_stop(args: &[String], timesheet: &Path) -> Result<(), String> {
     maybe_rotate_if_previous_week(timesheet)?;
-    let now = Local::now().timestamp();
-    let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
+    let stop_epoch = match args.first().map(String::as_str) {
+        Some(t) => parse_start_time(t).ok_or_else(|| format!("ts stop: could not parse stop time: {}", t))?,
+        None => Local::now().timestamp(),
+    };
     let content = fs::read_to_string(timesheet).unwrap_or_default();
     let last = content.lines().rev().find(|l| !l.trim().is_empty());
     match last {
         Some(l) if l.starts_with("STOP|") => {
-            let rest = l.strip_prefix("STOP|").unwrap_or("");
-            let prev_epoch: i64 = rest.trim().parse().unwrap_or(0);
-            let prev_dt = Local.timestamp_opt(prev_epoch, 0).single().unwrap_or_else(Local::now);
-            let prev_date = prev_dt.format("%Y-%m-%d").to_string();
-            if prev_date == today {
-                let insert_start = prev_epoch + 1;
-                let lines: Vec<&str> = content.lines().collect();
-                let without_last = if lines.is_empty() {
-                    String::new()
-                } else {
-                    lines[..lines.len() - 1].join("\n") + "\n"
-                };
-                let new_content = format!(
-                    "{}START|{}|misc/unspecified\nSTOP|{}\n",
-                    without_last, insert_start, now
-                );
-                fs::write(timesheet, &new_content).map_err(|e| e.to_string())?;
+            let lines: Vec<&str> = content.lines().collect();
+            let without_last = if lines.is_empty() {
+                String::new()
             } else {
-                let line = format!("STOP|{}\n", now);
-                let mut f = fs::OpenOptions::new().append(true).open(timesheet).map_err(|e| e.to_string())?;
-                f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
-            }
+                lines[..lines.len() - 1].join("\n") + "\n"
+            };
+            let new_content = format!("{}STOP|{}\n", without_last, stop_epoch);
+            fs::write(timesheet, &new_content).map_err(|e| e.to_string())?;
         }
         _ => {
-            let line = format!("STOP|{}\n", now);
+            let line = format!("STOP|{}\n", stop_epoch);
             let mut f = fs::OpenOptions::new().create(true).append(true).open(timesheet).map_err(|e| e.to_string())?;
             f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
         }
     }
-    println!("Stopped at {}", Local::now().format("%a %b %d %H:%M:%S %Z %Y"));
+    let stop_dt = Local.timestamp_opt(stop_epoch, 0).single().unwrap_or_else(Local::now);
+    println!("Stopped at {}", stop_dt.format("%a %b %d %H:%M:%S %Z %Y"));
     Ok(())
 }
 
@@ -822,6 +822,85 @@ fn is_writable(p: &Path) -> bool {
     fs::metadata(p).map(|m| !m.permissions().readonly()).unwrap_or(false)
 }
 
+/// Rebuild from a local directory or clone: run `cargo build --release` then install to current binary's dir.
+/// If arg is a directory with Cargo.toml, build there. If arg is missing and current dir has Cargo.toml, build there.
+/// If arg is missing and current dir has no Cargo.toml, clone the timesheet repo and build from the clone.
+fn cmd_rebuild(args: &[String]) -> Result<(), String> {
+    let install_dir = env::current_exe()
+        .map_err(|e| e.to_string())?
+        .parent()
+        .ok_or("ts rebuild: could not determine install directory")?
+        .to_path_buf();
+
+    let build_dir_arg = args.first().map(String::as_str).unwrap_or(".");
+    let build_dir = if build_dir_arg == "." {
+        env::current_dir().map_err(|e| format!("ts rebuild: {}", e))?
+    } else {
+        let p = PathBuf::from(build_dir_arg);
+        if !p.exists() {
+            return Err(format!("ts rebuild: no such directory: {}", p.display()));
+        }
+        if !p.is_dir() {
+            return Err(format!("ts rebuild: not a directory: {}", p.display()));
+        }
+        p.canonicalize().map_err(|e| format!("ts rebuild: {}: {}", p.display(), e))?
+    };
+
+    let cargo_toml = build_dir.join("Cargo.toml");
+    let build_dir = if cargo_toml.exists() {
+        build_dir
+    } else if args.is_empty() {
+        // No arg and no Cargo.toml in current dir: clone repo
+        let clone_parent = env::temp_dir().join(format!("ts-rebuild-{}", process::id()));
+        if clone_parent.exists() {
+            fs::remove_dir_all(&clone_parent).map_err(|e| e.to_string())?;
+        }
+        fs::create_dir_all(&clone_parent).map_err(|e| e.to_string())?;
+        let status = Command::new("git")
+            .args(["clone", "https://github.com/pillarsdotnet/timesheet"])
+            .current_dir(&clone_parent)
+            .status()
+            .map_err(|e| format!("ts rebuild: git clone failed: {}", e))?;
+        if !status.success() {
+            return Err("ts rebuild: git clone failed.".to_string());
+        }
+        clone_parent.join("timesheet")
+    } else {
+        return Err(format!(
+            "ts rebuild: no Cargo.toml in {}",
+            build_dir.display()
+        ));
+    };
+
+    let status = Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(&build_dir)
+        .status()
+        .map_err(|e| format!("ts rebuild: cargo build failed: {}", e))?;
+    if !status.success() {
+        return Err("ts rebuild: cargo build failed.".to_string());
+    }
+
+    let exe = build_dir.join("target/release/ts");
+    #[cfg(windows)]
+    let exe = build_dir.join("target/release/ts.exe");
+    if !exe.exists() {
+        return Err(format!("ts rebuild: binary not found after build: {}", exe.display()));
+    }
+
+    let status = Command::new(&exe)
+        .arg("install")
+        .arg(&install_dir)
+        .status()
+        .map_err(|e| format!("ts rebuild: install failed: {}", e))?;
+    if !status.success() {
+        return Err("ts rebuild: install failed.".to_string());
+    }
+
+    println!("Rebuilt and installed to {}", install_dir.display());
+    Ok(())
+}
+
 /// Groff man page source (shared by manpage and help).
 fn manpage_content() -> &'static str {
     r#".TH TS 1 "February 2025" "" "ts"
@@ -836,6 +915,10 @@ ts \- timesheet CLI (start, stop, list, report by activity and weekday)
 .RI [ activity ]
 .PP
 .B ts stop
+.RI [ stop_time ]
+.PP
+.B ts stopped
+.RI [ stop_time ]
 .PP
 .B ts list
 .RI [ file_or_extension ]
@@ -856,6 +939,9 @@ ts \- timesheet CLI (start, stop, list, report by activity and weekday)
 .PP
 .B ts install
 .RI [ install_dir " [" repo_path ]]
+.PP
+.B ts rebuild
+.RI [ directory ]
 .PP
 .B ts rotate
 .PP
@@ -893,12 +979,18 @@ Optional
 (default: misc/unspecified). Appends a START line; does not modify existing entries.
 .TP
 .B stop
-Record work stop
-.IR now .
-If the last entry is STOP and was recorded today, does not simply append another STOP:
-inserts a START one second after that stop, then appends the new STOP (continuous session).
-If the last entry is STOP from a previous day, only appends the new STOP.
+Record work stop at
+.IR now
+or at optional
+.I stop_time
+(same formats as
+.BR started ).
+If the last entry is already STOP, amends that stop time to the new time instead of appending.
 If the last entry is START, appends the new STOP (normal pairing).
+.TP
+.B stopped
+Alias for
+.BR stop .
 .TP
 .B list
 Plaintext report: percentage of time per activity (high to low), and hours per day of week (Sun\-Sat).
@@ -961,22 +1053,47 @@ Optional
 .I repo_path
 is the directory containing the binary (default: current executable's directory).
 .TP
+.B rebuild
+Build from source and install into the directory of the currently running binary.
+Optional
+.I directory
+(default: current directory): path to a directory containing
+.BR Cargo.toml .
+Runs
+.B "cargo build \-\-release"
+there, then
+.B "target/release/ts install"
+.I install_dir
+where
+.I install_dir
+is the directory of the running
+.B ts
+binary.
+If
+.I directory
+is omitted and the current directory has no
+.BR Cargo.toml ,
+clones
+.B https://github.com/pillarsdotnet/timesheet
+and builds from the clone.
+.TP
 .B rotate
+If the last entry is START (work in progress), appends a STOP at current time first.
 Rename the timesheet log to
-.B timesheet.YYMMDDHHMM
+.B timesheet.YYMMDD
 using the timestamp of the log's most recent entry (START or STOP).
 Errors if the log is missing or has no valid entries.
 .TP
 .B restart
-Kill the reminder daemon (if running) and start a fresh one. Use this to restart the 5\-minute \"What are you working on?\" prompts.
+Kill the reminder daemon (if running) and start a fresh one. Use this to restart the 5\-minute timer before the next reminder.
 .TP
 .B manpage
 Write this manual page in groff format to stdout. Example:
-.B "ts manpage | man \-l \-"
+.B "ts manpage | groff \-man \-Tascii | less"
 .TP
 .B help
 Run the equivalent of
-.B "ts manpage | man \-l \-"
+.B "ts manpage | groff \-man \-Tascii | less"
 to show this manual page in the system pager.
 .SH ENVIRONMENT
 .TP
@@ -1014,28 +1131,13 @@ fn cmd_manpage() -> Result<(), String> {
     Ok(())
 }
 
-/// Run the equivalent of "ts manpage | man -l -" to show the man page in a pager.
-/// If `man -l -` is not available (e.g. macOS), falls back to `groff -man -Tascii | less`.
+/// Show the man page in a pager using groff (ts manpage | groff -man -Tascii | less).
+/// If groff is not available, pages the raw groff source with less.
 fn cmd_help() -> Result<(), String> {
     let man = manpage_content();
 
-    let mut child = Command::new("man")
-        .args(["-l", "-"])
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to run man: {}. Try: ts manpage | man -l -", e))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(man.as_bytes());
-    }
-    let status = child.wait().map_err(|e| e.to_string())?;
-
-    if status.success() {
-        return Ok(());
-    }
-
-    // Fallback: groff -man -Tascii | less (e.g. macOS where man -l - is not supported)
     let child = Command::new("sh")
-        .args(["-c", "groff -man -Tascii 2>/dev/null | less"])
+        .args(["-c", "groff -man -Tascii 2>/dev/null | less -R"])
         .stdin(Stdio::piped())
         .spawn();
 
@@ -1048,13 +1150,14 @@ fn cmd_help() -> Result<(), String> {
         }
     }
 
-    // Last resort: page the raw groff source with less
+    // Fallback: page the raw groff source with less
     let mut child = Command::new("less")
+        .arg("-R")
         .stdin(Stdio::piped())
         .spawn()
         .map_err(|e| {
             format!(
-                "no pager available (man -l -, groff, less): {}. Try: ts manpage | man -l -",
+                "no pager available (groff, less): {}. Try: ts manpage | groff -man -Tascii | less",
                 e
             )
         })?;
@@ -1222,7 +1325,7 @@ fn run_reminder_daemon(timesheet: &Path) {
                 let _ = append_start_entry(timesheet, &activity);
             }
             ReminderResult::Timeout => {
-                let _ = cmd_stop(timesheet);
+                let _ = cmd_stop(&[], timesheet);
                 break;
             }
         }
@@ -1271,6 +1374,12 @@ fn show_reminder_prompt_macos(activities: &[String]) -> ReminderResult {
     }
     choices.push("Enter new activity...".to_string());
 
+    // Prefer Python tkinter dialog: single-click to choose (no OK button)
+    if let Ok(r) = show_reminder_prompt_macos_python(&choices) {
+        return r;
+    }
+
+    // Fallback: osascript choose from list (requires click then OK)
     let list_script = choices
         .iter()
         .map(|s| escape_applescript_string(s))
@@ -1330,6 +1439,84 @@ fn show_reminder_prompt_macos(activities: &[String]) -> ReminderResult {
     result
 }
 
+/// Single-click list dialog via Python tkinter (no OK button). Returns Err to fall back to osascript.
+#[cfg(target_os = "macos")]
+fn show_reminder_prompt_macos_python(choices: &[String]) -> Result<ReminderResult, ()> {
+    let python_script = r#"
+import sys
+import tkinter as tk
+from tkinter import simpledialog
+
+items = sys.argv[1:]
+if not items:
+    sys.exit(1)
+
+root = tk.Tk()
+root.title("ts")
+root.withdraw()
+root.attributes("-topmost", True)
+
+win = tk.Toplevel(root)
+win.title("ts")
+win.attributes("-topmost", True)
+win.protocol("WM_DELETE_WINDOW", lambda: (win.destroy(), root.quit()))
+
+tk.Label(win, text="What are you working on?", font=("", 11)).pack(pady=(8, 4))
+lb = tk.Listbox(win, height=min(14, len(items)), font=("", 12), selectmode=tk.SINGLE, exportselection=False)
+for i in items:
+    lb.insert(tk.END, i)
+lb.pack(padx=8, pady=(0, 8))
+lb.selection_set(0)
+lb.see(0)
+
+def on_click(event):
+    sel = lb.curselection()
+    if not sel:
+        return
+    idx = int(sel[0])
+    choice = items[idx]
+    if choice == "Enter new activity...":
+        win.destroy()
+        root.update()
+        s = simpledialog.askstring("ts", "Enter activity:", parent=root)
+        if s and s.strip():
+            print(s.strip())
+    else:
+        print(choice)
+    root.quit()
+    sys.stdout.flush()
+
+lb.bind("<ButtonRelease-1>", on_click)
+lb.focus_set()
+
+win.update_idletasks()
+win.geometry("+%d+%d" % (win.winfo_screenwidth()//2 - win.winfo_reqwidth()//2, win.winfo_screenheight()//2 - win.winfo_reqheight()//2))
+win.deiconify()
+root.mainloop()
+"#;
+    let mut cmd = Command::new("python3");
+    cmd.arg("-c")
+        .arg(python_script)
+        .args(choices.iter().map(String::as_str))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let child = cmd.spawn().map_err(|_| ())?;
+    let timeout = Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS);
+    let stdout = match wait_with_timeout(child, timeout) {
+        WaitOutcome::Finished(Some(s)) => s,
+        _ => return Err(()),
+    };
+    let s = String::from_utf8_lossy(&stdout).trim().to_string();
+    if s.is_empty() {
+        return Ok(ReminderResult::Timeout);
+    }
+    if s == "Don't Bug Me" {
+        return Ok(ReminderResult::DontBugMe);
+    }
+    Ok(ReminderResult::Activity(s))
+}
+
 fn escape_applescript_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -1374,7 +1561,11 @@ fn main() {
     }
     let mut args: Vec<String> = env::args().skip(1).collect();
     let cmd = args.first().cloned();
-    let rest: Vec<String> = args.drain(1..).collect();
+    let rest: Vec<String> = if args.len() > 1 {
+        args.drain(1..).collect()
+    } else {
+        Vec::new()
+    };
     let timesheet = timesheet_path();
 
     if cmd.as_deref() == Some("--reminder-daemon") {
@@ -1390,13 +1581,15 @@ fn main() {
     let result = match cmd.as_deref() {
         None => cmd_help(),
         Some("start") => cmd_start(&rest, &timesheet),
-        Some("stop") => cmd_stop(&timesheet),
+        Some("stop") => cmd_stop(&rest, &timesheet),
+        Some("stopped") => cmd_stop(&rest, &timesheet),
         Some("list") => cmd_list(rest.first().map(String::as_str), &timesheet),
         Some("started") => cmd_started(&rest, &timesheet),
         Some("timeoff") => cmd_timeoff(&timesheet),
         Some("alias") => cmd_workalias(&rest, &timesheet),
         Some("rename") => cmd_workalias(&rest, &timesheet),
         Some("install") => cmd_install(&rest),
+        Some("rebuild") => cmd_rebuild(&rest),
         Some("rotate") => do_rotate(&timesheet),
         Some("restart") => cmd_restart(&timesheet),
         Some("manpage") => cmd_manpage(),
@@ -1704,7 +1897,7 @@ mod tests {
         let week_start = week_start_epoch(now);
         let start_epoch = week_start + 3600;
         fs::write(&ts, format!("START|{}|coding\n", start_epoch)).unwrap();
-        let result = cmd_stop(&ts);
+        let result = cmd_stop(&[], &ts);
         assert!(result.is_ok());
         let content = fs::read_to_string(&ts).unwrap();
         let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
