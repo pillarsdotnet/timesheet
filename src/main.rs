@@ -425,19 +425,52 @@ fn resolve_list_input(arg: Option<&str>, timesheet: &Path) -> Result<PathBuf, St
         }
     });
     if let Some(want) = requested_date {
-        let mut containing: Vec<(PathBuf, NaiveDate)> = Vec::new();
+        // Try requested date and same month/day in adjacent years (e.g. 2/19 in current year and ±1).
+        let (mm, dd) = (want.month(), want.day());
+        let want_prev = NaiveDate::from_ymd_opt(want.year() - 1, mm, dd);
+        let want_next = NaiveDate::from_ymd_opt(want.year() + 1, mm, dd);
+        let dates_to_try: Vec<NaiveDate> = [Some(want), want_prev, want_next]
+            .into_iter()
+            .flatten()
+            .collect();
+        let mut containing: Vec<(PathBuf, NaiveDate, u8)> = Vec::new(); // (path, max_d, priority: 0=want, 1=next, 2=prev)
         for path in &candidates {
             if let Some((min_d, max_d)) = date_range_in_log(path) {
-                if want >= min_d && want <= max_d {
-                    containing.push((path.clone(), max_d));
+                for (priority, &d) in dates_to_try.iter().enumerate() {
+                    if d >= min_d && d <= max_d {
+                        containing.push((path.clone(), max_d, priority as u8));
+                        break;
+                    }
                 }
             }
         }
-        // Prefer the log with the smallest max_date that still includes the date (the "current" log as of that day).
-        if let Some((path, _)) = containing
+        // Prefer match for requested year, then smallest max_date (the "current" log as of that day).
+        if let Some((path, _, _)) = containing
             .into_iter()
-            .min_by_key(|(_, max_d)| *max_d)
+            .min_by_key(|(_, max_d, priority)| (*priority, *max_d))
         {
+            return Ok(path);
+        }
+        // Content-based found nothing (e.g. empty rotated file). Fall back to extension-as-date:
+        // use a file whose extension is YYMMDD on or after the requested date (the log that was current then).
+        let mut by_ext_date: Vec<(PathBuf, NaiveDate)> = Vec::new();
+        for path in &candidates {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext.len() == 6 && ext.chars().all(|c| c.is_ascii_digit()) {
+                if let (Ok(yy), Ok(mm), Ok(dd)) = (
+                    ext[0..2].parse::<i32>(),
+                    ext[2..4].parse::<u32>(),
+                    ext[4..6].parse::<u32>(),
+                ) {
+                    if let Some(ext_date) = NaiveDate::from_ymd_opt(2000 + yy, mm, dd) {
+                        if ext_date >= want {
+                            by_ext_date.push((path.clone(), ext_date));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((path, _)) = by_ext_date.into_iter().min_by_key(|(_, d)| *d) {
             return Ok(path);
         }
     }
@@ -2225,6 +2258,18 @@ mod tests {
             .unwrap(); // 2025-02-19 12:00 UTC, 2025-03-02 00:00 UTC
         let out = resolve_list_input(Some("250219"), &ts).unwrap();
         assert_eq!(out, later, "ts list 250219 should use log that contains that date");
+    }
+
+    #[test]
+    fn test_resolve_list_input_date_fallback_by_extension() {
+        // No timesheet.250219; timesheet.260220 exists (extension 2026-02-20 >= 2025-02-19). Use it for 2/19.
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        fs::File::create(&ts).unwrap();
+        let later = dir.path().join("timesheet.260220");
+        fs::File::create(&later).unwrap(); // empty or no 2025-02-19 in content
+        let out = resolve_list_input(Some("2/19"), &ts).unwrap();
+        assert_eq!(out, later, "ts list 2/19 should fall back to file with extension date on or after that day");
     }
 
     #[test]
