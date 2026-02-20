@@ -27,6 +27,8 @@
 //! | `workalias`| Interactively replace activity text in this week's START entries (regex). |
 //! | `install`  | Copy binary to a directory on PATH. |
 //! | `rotate`   | Rename log to `timesheet.YYMMDD`; append if same-day file exists. |
+//! | `manpage`  | Output Unix manual page in groff format to stdout. |
+//! | `help`     | Show the man page in a pager (equivalent to `ts manpage | man -l -`). |
 
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 use regex::Regex;
@@ -34,7 +36,7 @@ use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Command, Stdio};
 
 /// Default path segment under `$HOME` for the timesheet log file.
 const DEFAULT_TIMESHEET: &str = "Documents/timesheet.log";
@@ -733,33 +735,249 @@ fn is_writable(p: &Path) -> bool {
     fs::metadata(p).map(|m| !m.permissions().readonly()).unwrap_or(false)
 }
 
+/// Groff man page source (shared by manpage and help).
+fn manpage_content() -> &'static str {
+    r#".TH TS 1 "February 2025" "" "ts"
+.SH NAME
+ts \- timesheet CLI (start, stop, list, report by activity and weekday)
+.SH SYNOPSIS
+.B ts
+.I command
+.RI [ args... ]
+.PP
+.B ts start
+.RI [ activity ]
+.PP
+.B ts stop
+.PP
+.B ts list
+.RI [ file_or_extension ]
+.PP
+.B ts started
+.I start_time
+.RI [ activity... ]
+.PP
+.B ts timeoff
+.PP
+.B ts workalias
+.I pattern
+.I replacement
+.PP
+.B ts install
+.RI [ install_dir " [" repo_path ]]
+.PP
+.B ts rotate
+.PP
+.B ts manpage
+.PP
+.B ts help
+.SH DESCRIPTION
+.B ts
+tracks work start/stop and reports time by activity and by day of week.
+The log file is
+.BR $HOME /Documents/timesheet.log
+by default (compile-time constant
+.BR DEFAULT_TIMESHEET
+in source).
+.SH "LOG FORMAT"
+One entry per line:
+.TP
+.B START|unix_epoch|activity
+Record the start of a work session at the given Unix time with the given activity name.
+.TP
+.B STOP|unix_epoch
+Record the end of a work session at the given Unix time.
+.PP
+Start/stop pairs are matched in LIFO order (each STOP pairs with the most recent START).
+The report uses these pairs to compute duration and attribute time to activity and weekday.
+.SH COMMANDS
+.TP
+.B start
+Record work start
+.IR now .
+Optional
+.I activity
+(default: misc/unspecified). Appends a START line; does not modify existing entries.
+.TP
+.B stop
+Record work stop
+.IR now .
+If the last entry is STOP and was recorded today, does not simply append another STOP:
+inserts a START one second after that stop, then appends the new STOP (continuous session).
+If the last entry is STOP from a previous day, only appends the new STOP.
+If the last entry is START, appends the new STOP (normal pairing).
+.TP
+.B list
+Plaintext report: percentage of time per activity (high to low), and hours per day of week (Sun\-Sat).
+If work is in progress (last entry is START), uses a virtual STOP at current time for the report
+and shows current task, start time, and duration.
+Optional
+.I file_or_extension
+selects an alternate log path or extension filter.
+.TP
+.B started
+Record a work start at a
+.IR "past time" .
+.I start_time
+accepts GNU
+.B date \-d
+style, or
+.B YYYY\-MM\-DD\ HH:MM[:SS],
+or
+.B HH:MM
+(today).
+If the last entry is START recorded today, replaces that START with the new time and activity.
+If the last entry is STOP recorded today and start time < stop time, inserts the new START before that STOP.
+Otherwise appends the new START; only adjusts entries made on the current day.
+.TP
+.B timeoff
+Show the stop-work time that would give an average of 8 hours per day worked
+(over every day that has at least one completed session).
+If the last entry is STOP, runs
+.B start
+before the calculation so the average includes work starting now.
+.TP
+.B workalias
+Interactively replace activity text in START entries from the current week.
+.I pattern
+is a regex;
+.I replacement
+is the replacement string.
+For each match, prompts
+.B Replace\ (y/n);
+.B y
+or
+.B Y
+applies the replacement. Errors if no matches this week.
+.TP
+.B install
+Copy the binary to a directory on
+.BR PATH .
+If
+.I install_dir
+is omitted, uses the first writable directory on
+.BR PATH .
+If
+.I install_dir
+is given, installs there (directory created if needed).
+Optional
+.I repo_path
+is the directory containing the binary (default: current executable's directory).
+.TP
+.B rotate
+Rename the timesheet log to
+.B timesheet.YYMMDDHHMM
+using the timestamp of the log's most recent entry (START or STOP).
+Errors if the log is missing or has no valid entries.
+.TP
+.B manpage
+Write this manual page in groff format to stdout. Example:
+.B "ts manpage | man \-l \-"
+.TP
+.B help
+Run the equivalent of
+.B "ts manpage | man \-l \-"
+to show this manual page in the system pager.
+.SH FILES
+.B $HOME/Documents/timesheet.log
+Default timesheet log (path is compile-time in
+.BR DEFAULT_TIMESHEET ).
+.SH "SEE ALSO"
+Full documentation and install instructions: see
+.BR INSTALL.md
+and
+.BR README.md
+in the source repository.
+.SH AUTHORS
+Robert August Vincent II <pillarsdotnet@gmail.com>
+Co-author: Cursor-AI.
+"#
+}
+
+/// Output a Unix manual page in groff format to stdout.
+fn cmd_manpage() -> Result<(), String> {
+    let man = manpage_content();
+    let mut out = io::stdout();
+    if let Err(e) = out.write_all(man.as_bytes()) {
+        if e.kind() != io::ErrorKind::BrokenPipe {
+            return Err(e.to_string());
+        }
+    }
+    let _ = out.flush();
+    Ok(())
+}
+
+/// Run the equivalent of "ts manpage | man -l -" to show the man page in a pager.
+/// If `man -l -` is not available (e.g. macOS), falls back to `groff -man -Tascii | less`.
+fn cmd_help() -> Result<(), String> {
+    let man = manpage_content();
+
+    let mut child = Command::new("man")
+        .args(["-l", "-"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to run man: {}. Try: ts manpage | man -l -", e))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(man.as_bytes());
+    }
+    let status = child.wait().map_err(|e| e.to_string())?;
+
+    if status.success() {
+        return Ok(());
+    }
+
+    // Fallback: groff -man -Tascii | less (e.g. macOS where man -l - is not supported)
+    let child = Command::new("sh")
+        .args(["-c", "groff -man -Tascii 2>/dev/null | less"])
+        .stdin(Stdio::piped())
+        .spawn();
+
+    if let Ok(mut child) = child {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(man.as_bytes());
+        }
+        if child.wait().map(|s| s.success()).unwrap_or(false) {
+            return Ok(());
+        }
+    }
+
+    // Last resort: page the raw groff source with less
+    let mut child = Command::new("less")
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            format!(
+                "no pager available (man -l -, groff, less): {}. Try: ts manpage | man -l -",
+                e
+            )
+        })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(man.as_bytes())
+            .map_err(|e| e.to_string())?;
+    }
+    let _ = child.wait();
+    Ok(())
+}
+
 fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
-    let cmd = match args.first() {
-        Some(c) => c.clone(),
-        None => {
-            eprintln!("Usage: ts <command> [args...]");
-            eprintln!("  start | stop | list | started | timeoff | workalias | install | rotate");
-            process::exit(1);
-        }
-    };
-    let rest: Vec<String> = args.into_iter().skip(1).collect();
-    let cmd = cmd.as_str();
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    let cmd = args.first().cloned();
+    let rest: Vec<String> = args.drain(1..).collect();
     let timesheet = timesheet_path();
-    let result = match cmd {
-        "start" => cmd_start(&rest, &timesheet),
-        "stop" => cmd_stop(&timesheet),
-        "list" => cmd_list(rest.first().map(String::as_str), &timesheet),
-        "started" => cmd_started(&rest, &timesheet),
-        "timeoff" => cmd_timeoff(&timesheet),
-        "workalias" => cmd_workalias(&rest, &timesheet),
-        "install" => cmd_install(&rest),
-        "rotate" => do_rotate(&timesheet),
-        _ => {
-            eprintln!("Usage: ts <command> [args...]");
-            eprintln!("  start | stop | list | started | timeoff | workalias | install | rotate");
-            process::exit(1);
-        }
+    let result = match cmd.as_deref() {
+        None => cmd_help(),
+        Some("start") => cmd_start(&rest, &timesheet),
+        Some("stop") => cmd_stop(&timesheet),
+        Some("list") => cmd_list(rest.first().map(String::as_str), &timesheet),
+        Some("started") => cmd_started(&rest, &timesheet),
+        Some("timeoff") => cmd_timeoff(&timesheet),
+        Some("workalias") => cmd_workalias(&rest, &timesheet),
+        Some("install") => cmd_install(&rest),
+        Some("rotate") => do_rotate(&timesheet),
+        Some("manpage") => cmd_manpage(),
+        Some("help") => cmd_help(),
+        Some(_) => cmd_help(),
     };
     if let Err(e) = result {
         eprintln!("{}", e);
