@@ -27,6 +27,7 @@
 //! | `workalias`| Interactively replace activity text in this week's START entries (regex). |
 //! | `install`  | Copy binary to a directory on PATH. |
 //! | `rotate`   | Rename log to `timesheet.YYMMDD`; append if same-day file exists. |
+//! | `restart`  | Kill and restart the reminder daemon. |
 //! | `manpage`  | Output Unix manual page in groff format to stdout. |
 //! | `help`     | Show the man page in a pager (equivalent to `ts manpage | man -l -`). |
 
@@ -364,7 +365,7 @@ fn cmd_stop(timesheet: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn process_log_for_report(lines: &[(usize, LogLine)], virtual_stop: Option<i64>) -> (Vec<(String, f64)>, Vec<f64>, bool) {
+fn process_log_for_report(lines: &[(usize, LogLine)], virtual_stop: Option<i64>) -> (Vec<(String, f64, f64)>, Vec<f64>, bool) {
     let mut stack: Vec<(i64, String)> = Vec::new();
     let mut act_sec: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut dow_sec: [f64; 7] = [0.0; 7];
@@ -409,9 +410,14 @@ fn process_log_for_report(lines: &[(usize, LogLine)], virtual_stop: Option<i64>)
     }
     let total: i64 = act_sec.values().sum();
     let work_in_progress = !stack.is_empty();
-    let mut by_act: Vec<(String, f64)> = act_sec
+    let mut by_act: Vec<(String, f64, f64)> = act_sec
         .into_iter()
-        .map(|(a, s)| (a, 100.0 * s as f64 / total as f64))
+        .map(|(a, s)| {
+            let sec = s as f64;
+            let pct = 100.0 * sec / total as f64;
+            let hr = sec / 3600.0;
+            (a, pct, hr)
+        })
         .collect();
     by_act.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let dow_hr: Vec<f64> = dow_sec.iter().map(|s| s / 3600.0).collect();
@@ -444,8 +450,8 @@ fn cmd_list(list_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
         println!("No work recorded.");
         return Ok(());
     }
-    for (act, pct) in &by_act {
-        println!("{:.1}%  {}", pct, act);
+    for (act, pct, hr) in &by_act {
+        println!("{:.1}%  {:.2}h  {}", pct, hr, act);
     }
     for (i, name) in DAY_NAMES.iter().enumerate() {
         println!("{}  {:.2}", name, dow_hr.get(i).copied().unwrap_or(0.0));
@@ -820,6 +826,8 @@ ts \- timesheet CLI (start, stop, list, report by activity and weekday)
 .PP
 .B ts rotate
 .PP
+.B ts restart
+.PP
 .B ts manpage
 .PP
 .B ts help
@@ -921,6 +929,9 @@ Rename the timesheet log to
 .B timesheet.YYMMDDHHMM
 using the timestamp of the log's most recent entry (START or STOP).
 Errors if the log is missing or has no valid entries.
+.TP
+.B restart
+Kill the reminder daemon (if running) and start a fresh one. Use this to restart the 5\-minute \"What are you working on?\" prompts.
 .TP
 .B manpage
 Write this manual page in groff format to stdout. Example:
@@ -1031,6 +1042,29 @@ fn is_pid_running(pid: u32) -> bool {
     }
 }
 
+/// Kill the reminder daemon if running (read PID from file, send SIGTERM, remove PID file). No-op on non-Unix.
+fn kill_reminder_daemon_if_running() {
+    #[cfg(not(unix))]
+    return;
+
+    #[cfg(unix)]
+    {
+        let pid_path = reminder_pid_path();
+        if let Ok(data) = fs::read_to_string(&pid_path) {
+            if let Ok(pid) = data.trim().parse::<u32>() {
+                if is_pid_running(pid) {
+                    let _ = Command::new("kill").arg(pid.to_string()).status();
+                    thread::sleep(Duration::from_millis(150));
+                    if is_pid_running(pid) {
+                        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+                    }
+                }
+            }
+        }
+        let _ = fs::remove_file(&pid_path);
+    }
+}
+
 /// Start the reminder daemon in the background if not already running. No-op on non-Unix or if daemon already running.
 fn start_reminder_daemon_if_needed(_timesheet: &Path) {
     #[cfg(not(unix))]
@@ -1047,7 +1081,8 @@ fn start_reminder_daemon_if_needed(_timesheet: &Path) {
             }
         }
         if let Ok(exe) = env::current_exe() {
-            let _ = Command::new(&exe)
+            let _ = Command::new("/usr/bin/nohup")
+                .arg(&exe)
                 .arg("--reminder-daemon")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -1055,6 +1090,15 @@ fn start_reminder_daemon_if_needed(_timesheet: &Path) {
                 .spawn();
         }
     }
+}
+
+/// Kill the reminder daemon (if running) and start a fresh one.
+fn cmd_restart(timesheet: &Path) -> Result<(), String> {
+    kill_reminder_daemon_if_running();
+    thread::sleep(Duration::from_millis(100));
+    start_reminder_daemon_if_needed(timesheet);
+    println!("Reminder daemon restarted.");
+    Ok(())
 }
 
 /// Run the reminder daemon loop: sleep 5 min, show "What are you working on?" prompt, handle response or timeout.
@@ -1141,7 +1185,7 @@ fn show_reminder_prompt_macos(activities: &[String]) -> ReminderResult {
         list_script,
         list_script
     );
-    let child = match Command::new("osascript")
+    let child = match Command::new("/usr/bin/osascript")
         .args(["-e", &script])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1164,7 +1208,7 @@ fn show_reminder_prompt_macos(activities: &[String]) -> ReminderResult {
             }
             if s == "Enter new activity..." {
                 let prompt_script = "display dialog \"Enter activity:\" with title \"ts\" default answer \"\"";
-                let child2 = match Command::new("osascript").args(["-e", prompt_script]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+                let child2 = match Command::new("/usr/bin/osascript").args(["-e", prompt_script]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
                     Ok(c) => c,
                     Err(_) => return ReminderResult::Timeout,
                 };
@@ -1244,6 +1288,7 @@ fn main() {
         Some("workalias") => cmd_workalias(&rest, &timesheet),
         Some("install") => cmd_install(&rest),
         Some("rotate") => do_rotate(&timesheet),
+        Some("restart") => cmd_restart(&timesheet),
         Some("manpage") => cmd_manpage(),
         Some("help") => cmd_help(),
         Some(_) => cmd_help(),
