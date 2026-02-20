@@ -29,7 +29,8 @@ The **`ts`** command takes a required subcommand as its first argument:
 | `list`      | Plaintext report: % time per activity, hours per day of week; if work in progress, show current task/duration. |
 | `started`   | Record a work start at a **past time**. Args: `ts started <start_time> [activity...]`. |
 | `timeoff`   | Show stop-work time for 8h/day average; if last entry is STOP, starts work for the calculation. |
-| `workalias` | Interactively replace activity text in START entries from the current week. Args: `ts workalias <pattern> <replacement>`. |
+| `alias`     | Interactively replace activity text in START entries from the current week. Args: `ts alias <pattern> <replacement>`. |
+| `rename`    | Same as `alias`. Args: `ts rename <pattern> <replacement>`. |
 | `install`   | Copy the binary to a directory on PATH. Args: `ts install [install_dir] [repo_path]`. |
 | `rotate`    | Rename `timesheet.log` to `timesheet.YYMMDDHHMM` where the timestamp is the date/time of its most recent entry. |
 
@@ -69,9 +70,13 @@ Shows the **stop-work time** that would give an average of 8 hours per day worke
   - If the last entry is STOP (work not in progress), runs `start` (from the same directory as the script) before doing the calculation, so the 8-hour average includes “work starting now.”
   - Computes total hours and number of distinct days with work. If the average is already ≥ 8 hours, prints a message and the current time. Otherwise prints the clock time at which stopping would make the average exactly 8 hours, and how many hours remain.
 
-### workalias
+### alias
 
 Searches for START entries from the current week whose activity matches the pattern. For each match, echoes original and replaced form, prompts `Replace (y/n)`; `y`/`Y` applies the replacement. Errors if no matches this week.
+
+### rename
+
+Same as **alias**.
 
 ### install
 
