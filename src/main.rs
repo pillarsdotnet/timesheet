@@ -247,6 +247,32 @@ fn max_epoch_in_log(path: &Path) -> Option<i64> {
     }
 }
 
+/// Date range (min, max) of all START/STOP entries in the log; `None` if no valid entries.
+fn date_range_in_log(path: &Path) -> Option<(NaiveDate, NaiveDate)> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut min_epoch = i64::MAX;
+    let mut max_epoch = i64::MIN;
+    for line in content.lines() {
+        match parse_line(line) {
+            Some(LogLine::Start(e, _)) | Some(LogLine::Stop(e)) => {
+                if e < min_epoch {
+                    min_epoch = e;
+                }
+                if e > max_epoch {
+                    max_epoch = e;
+                }
+            }
+            None => {}
+        }
+    }
+    if min_epoch == i64::MAX || max_epoch == i64::MIN {
+        return None;
+    }
+    let min_dt = Local.timestamp_opt(min_epoch, 0).single()?;
+    let max_dt = Local.timestamp_opt(max_epoch, 0).single()?;
+    Some((min_dt.date_naive(), max_dt.date_naive()))
+}
+
 /// Rotates the log: renames it to `timesheet.YYMMDD` using the most recent entry's date.
 /// If that file already exists (same day), appends the current log to it and removes the source.
 /// If the last entry is START (work in progress), appends a STOP at current time before rotating.
@@ -344,6 +370,8 @@ fn resolve_list_input(arg: Option<&str>, timesheet: &Path) -> Result<PathBuf, St
     }
     let norm = if list_arg.len() == 8 && list_arg.chars().all(|c| c.is_ascii_digit()) {
         Some(list_arg[2..].to_string())
+    } else if list_arg.len() == 6 && list_arg.chars().all(|c| c.is_ascii_digit()) {
+        Some(list_arg.to_string())
     } else if list_arg.contains('/') {
         let parts: Vec<&str> = list_arg.splitn(2, '/').collect();
         if parts.len() == 2 {
@@ -375,15 +403,45 @@ fn resolve_list_input(arg: Option<&str>, timesheet: &Path) -> Result<PathBuf, St
         }
     }
     if matches.len() == 1 {
-        Ok(matches.into_iter().next().unwrap())
-    } else if matches.len() > 1 {
-        Err(format!(
+        return Ok(matches.into_iter().next().unwrap());
+    }
+    if matches.len() > 1 {
+        return Err(format!(
             "ts list: multiple timesheets match \"{}\".",
             list_arg
-        ))
-    } else {
-        Err(format!("ts list: no timesheet matches \"{}\".", list_arg))
+        ));
     }
+    // No file matched by name/extension. If the arg looks like a date (e.g. 2/19 or YYMMDD),
+    // find a timesheet whose entry date range includes that date (e.g. a later log that still has 2/19).
+    let requested_date = norm.as_ref().and_then(|n| {
+        if n.len() == 6 && n.chars().all(|c| c.is_ascii_digit()) {
+            let yy: i32 = n[0..2].parse().ok()?;
+            let mm: u32 = n[2..4].parse().ok()?;
+            let dd: u32 = n[4..6].parse().ok()?;
+            let year = 2000 + yy; // 00..99 -> 2000..2099
+            NaiveDate::from_ymd_opt(year, mm, dd)
+        } else {
+            None
+        }
+    });
+    if let Some(want) = requested_date {
+        let mut containing: Vec<(PathBuf, NaiveDate)> = Vec::new();
+        for path in &candidates {
+            if let Some((min_d, max_d)) = date_range_in_log(path) {
+                if want >= min_d && want <= max_d {
+                    containing.push((path.clone(), max_d));
+                }
+            }
+        }
+        // Prefer the log with the smallest max_date that still includes the date (the "current" log as of that day).
+        if let Some((path, _)) = containing
+            .into_iter()
+            .min_by_key(|(_, max_d)| *max_d)
+        {
+            return Ok(path);
+        }
+    }
+    Err(format!("ts list: no timesheet matches \"{}\".", list_arg))
 }
 
 /// Records work start now; activity is optional (default: misc/unspecified).
@@ -2150,6 +2208,23 @@ mod tests {
         let result = resolve_list_input(Some("999999"), &ts);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no timesheet matches"));
+    }
+
+    #[test]
+    fn test_resolve_list_input_date_in_range_fallback() {
+        // No timesheet.250219 exists, but timesheet.250301 has entries spanning 2025-02-19 -> use it for 250219
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        fs::File::create(&ts).unwrap();
+        let later = dir.path().join("timesheet.250301");
+        // Epochs on 2025-02-19 and 2025-03-02 so the file's date range includes 2025-02-19
+        fs::write(
+            &later,
+            "START|1739984400|a\nSTOP|1740891600\n",
+        )
+            .unwrap(); // 2025-02-19 12:00 UTC, 2025-03-02 00:00 UTC
+        let out = resolve_list_input(Some("250219"), &ts).unwrap();
+        assert_eq!(out, later, "ts list 250219 should use log that contains that date");
     }
 
     #[test]
