@@ -29,7 +29,8 @@
 //! | `install`  | Copy binary to a directory on PATH. |
 //! | `rebuild`  | Build from local dir or clone; then install to current binary's directory. |
 //! | `rotate`   | Rename log to `timesheet.YYMMDD`; add STOP first if last entry is START; append if same-day exists. |
-//! | `restart`  | Kill and restart the reminder daemon. |
+//! | `interval` | Set or show reminder daemon interval (e.g. 3, 3m, 100s, 1h30m). |
+//! | `restart`, `reminder` | Aliases for `interval`. |
 //! | `manpage`  | Output Unix manual page in groff format to stdout. |
 //! | `help`     | Show the man page in a pager (groff -man -Tascii \| less). |
 
@@ -43,7 +44,12 @@ use std::process::{self, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 #[cfg(unix)]
-use libc::{kill, signal, SIG_IGN, SIGKILL, SIGTERM};
+use libc::{kill, signal, SIG_IGN, SIGHUP, SIGKILL, SIGTERM};
+#[cfg(target_os = "macos")]
+use libc::getuid;
+
+#[cfg(target_os = "macos")]
+mod reminder_dialog_macos;
 
 /// Default path segment under `$HOME` for the timesheet log file.
 const DEFAULT_TIMESHEET: &str = "Documents/timesheet.log";
@@ -74,6 +80,62 @@ fn reminder_pid_path() -> PathBuf {
     cache
         .unwrap_or_else(|| PathBuf::from("."))
         .join("ts-reminder.pid")
+}
+
+/// Path for the reminder interval config file (seconds as decimal string; same dir as PID file).
+fn reminder_interval_path() -> PathBuf {
+    reminder_pid_path()
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("ts-reminder-interval")
+}
+
+/// Parse a duration string into seconds. E.g. "3", "3m" -> 180; "100s" -> 100; "1h30m" -> 5400.
+/// Bare number is treated as minutes. Units: h, m, s (case-insensitive).
+fn parse_interval_duration(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("interval cannot be empty".to_string());
+    }
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut total_secs: u64 = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && !bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let num: u64 = s[start..i]
+            .parse()
+            .map_err(|_| format!("invalid number in interval: {}", s))?;
+        let unit = if i < bytes.len() {
+            let u = bytes[i];
+            if u == b'h' || u == b'H' || u == b'm' || u == b'M' || u == b's' || u == b'S' {
+                i += 1;
+                u
+            } else {
+                b'm'
+            }
+        } else {
+            b'm'
+        };
+        match unit {
+            b'h' | b'H' => total_secs += num * 3600,
+            b'm' | b'M' => total_secs += num * 60,
+            b's' | b'S' => total_secs += num,
+            _ => total_secs += num * 60,
+        }
+    }
+    if total_secs == 0 {
+        return Err("interval must be positive".to_string());
+    }
+    Ok(total_secs)
 }
 
 /// Activities from the current week's START entries, most-recently logged first (by last occurrence).
@@ -945,7 +1007,14 @@ ts \- timesheet CLI (start, stop, list, report by activity and weekday)
 .PP
 .B ts rotate
 .PP
+.B ts interval
+.RI [ duration ]
+.PP
 .B ts restart
+.RI [ duration ]
+.PP
+.B ts reminder
+.RI [ duration ]
 .PP
 .B ts manpage
 .PP
@@ -1084,8 +1153,28 @@ Rename the timesheet log to
 using the timestamp of the log's most recent entry (START or STOP).
 Errors if the log is missing or has no valid entries.
 .TP
+.B interval
+Set or show the time between reminder daemon prompts. With no argument, print the current interval. With one argument, set the interval and restart the daemon.
+.I duration
+accepts: a bare number (treated as minutes, e.g.
+.BR 3 " or " 3m ),
+seconds (e.g.
+.BR 100s ),
+or combined (e.g.
+.BR 1h30m ).
 .B restart
-Kill the reminder daemon (if running) and start a fresh one. Use this to restart the 5\-minute timer before the next reminder.
+and
+.B reminder
+are aliases for
+.BR interval .
+.TP
+.B restart
+Alias for
+.BR interval .
+.TP
+.B reminder
+Alias for
+.BR interval .
 .TP
 .B manpage
 Write this manual page in groff format to stdout. Example:
@@ -1106,6 +1195,12 @@ and reminder daemon start/kill (e.g.
 .B $HOME/Documents/timesheet.log
 Default timesheet log (path is compile-time in
 .BR DEFAULT_TIMESHEET ).
+.TP
+.B $XDG_CACHE_HOME/ts-reminder-interval
+or
+.B $HOME/.cache/ts-reminder-interval
+Reminder interval in seconds (decimal). Used by the reminder daemon; set via
+.BR "ts interval" .
 .SH "SEE ALSO"
 Full documentation and install instructions: see
 .BR INSTALL.md
@@ -1170,8 +1265,17 @@ fn cmd_help() -> Result<(), String> {
     Ok(())
 }
 
-const REMINDER_SLEEP_SECS: u64 = 300; // 5 minutes
+const REMINDER_SLEEP_SECS: u64 = 300; // 5 minutes (default when no interval file)
 const REMINDER_PROMPT_TIMEOUT_SECS: u64 = 300; // 5 minutes
+
+/// Reminder interval in seconds: from config file if present and valid, else default.
+fn get_reminder_interval_secs() -> u64 {
+    let path = reminder_interval_path();
+    match fs::read_to_string(&path) {
+        Ok(s) => s.trim().parse::<u64>().unwrap_or(REMINDER_SLEEP_SECS),
+        Err(_) => REMINDER_SLEEP_SECS,
+    }
+}
 
 /// Returns true if a process with the given PID is running (Unix: kill -0).
 fn ts_debug(msg: &str) {
@@ -1267,15 +1371,34 @@ fn start_reminder_daemon_if_needed(_timesheet: &Path) {
                 return;
             }
         };
-        ts_debug(&format!("start_reminder: spawning nohup {}", exe.display()));
-        match Command::new("/usr/bin/nohup")
-            .arg(&exe)
-            .arg("--reminder-daemon")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
+        let use_debug = env::var_os("TS_DEBUG").is_some();
+        if use_debug {
+            ts_debug("start_reminder: TS_DEBUG set, spawning daemon directly (no nohup) so you see its output");
+        } else {
+            ts_debug(&format!("start_reminder: spawning nohup {}", exe.display()));
+        }
+        let (stdout, stderr) = if use_debug {
+            (Stdio::inherit(), Stdio::inherit())
+        } else {
+            (Stdio::null(), Stdio::null())
+        };
+        let result = if use_debug {
+            Command::new(&exe)
+                .arg("--reminder-daemon")
+                .stdin(Stdio::null())
+                .stdout(stdout)
+                .stderr(stderr)
+                .spawn()
+        } else {
+            Command::new("/usr/bin/nohup")
+                .arg(&exe)
+                .arg("--reminder-daemon")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+        };
+        match result {
             Ok(child) => {
                 ts_debug(&format!("start_reminder: spawned daemon pid {}", child.id()));
                 drop(child);
@@ -1288,21 +1411,47 @@ fn start_reminder_daemon_if_needed(_timesheet: &Path) {
     }
 }
 
-/// Kill the reminder daemon (if running) and start a fresh one.
-fn cmd_restart(timesheet: &Path) -> Result<(), String> {
-    ts_debug("restart: entry");
+/// Set or show the reminder interval. With no arg: print current interval. With one arg: parse duration, save, restart daemon.
+/// Duration examples: 3, 3m (minutes), 100s (seconds), 1h30m.
+fn cmd_interval(args: &[String], timesheet: &Path) -> Result<(), String> {
+    if args.is_empty() {
+        let secs = get_reminder_interval_secs();
+        if secs % 3600 == 0 && secs >= 3600 {
+            println!("{}h", secs / 3600);
+        } else if secs % 60 == 0 && secs >= 60 {
+            println!("{}m", secs / 60);
+        } else {
+            println!("{}s", secs);
+        }
+        kill_reminder_daemon_if_running();
+        thread::sleep(Duration::from_millis(100));
+        start_reminder_daemon_if_needed(timesheet);
+        return Ok(());
+    }
+    let duration_str = args[0].as_str();
+    let secs = parse_interval_duration(duration_str)?;
+    let path = reminder_interval_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(&path, secs.to_string()).map_err(|e| format!("ts interval: cannot write config: {}", e))?;
     kill_reminder_daemon_if_running();
-    ts_debug("restart: after kill, sleeping 100ms");
     thread::sleep(Duration::from_millis(100));
-    ts_debug("restart: calling start_reminder_daemon_if_needed");
     start_reminder_daemon_if_needed(timesheet);
-    ts_debug("restart: done, printing message");
-    println!("Reminder daemon restarted.");
+    if secs % 3600 == 0 && secs >= 3600 {
+        println!("Reminder interval set to {}h. Daemon restarted.", secs / 3600);
+    } else if secs % 60 == 0 && secs >= 60 {
+        println!("Reminder interval set to {}m. Daemon restarted.", secs / 60);
+    } else {
+        println!("Reminder interval set to {}s. Daemon restarted.", secs);
+    }
     Ok(())
 }
 
-/// Run the reminder daemon loop: sleep 5 min, show "What are you working on?" prompt, handle response or timeout.
+/// Run the reminder daemon loop: sleep for configured interval, show "What are you working on?" prompt, handle response or timeout.
 fn run_reminder_daemon(timesheet: &Path) {
+    #[cfg(unix)]
+    let _ = unsafe { signal(SIGHUP, SIG_IGN) };
     let pid_path = reminder_pid_path();
     if let Some(parent) = pid_path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -1316,7 +1465,10 @@ fn run_reminder_daemon(timesheet: &Path) {
     });
 
     loop {
-        thread::sleep(Duration::from_secs(REMINDER_SLEEP_SECS));
+        let interval_secs = get_reminder_interval_secs();
+        ts_debug(&format!("reminder daemon: sleeping {}s", interval_secs));
+        thread::sleep(Duration::from_secs(interval_secs));
+        ts_debug("reminder daemon: showing prompt");
 
         let activities = activities_this_week_most_recent_first(timesheet);
         match show_reminder_prompt(&activities) {
@@ -1324,6 +1476,8 @@ fn run_reminder_daemon(timesheet: &Path) {
             ReminderResult::Activity(activity) => {
                 let _ = append_start_entry(timesheet, &activity);
             }
+            ReminderResult::EnterNew => unreachable!("show_reminder_prompt converts EnterNew to Activity, ShowAgain, or Timeout"),
+            ReminderResult::ShowAgain => {} // text dialog cancelled/failed; show reminder again after interval
             ReminderResult::Timeout => {
                 let _ = cmd_stop(&[], timesheet);
                 break;
@@ -1349,6 +1503,10 @@ impl<F: FnOnce()> Drop for Defer<F> {
 enum ReminderResult {
     DontBugMe,
     Activity(String),
+    /// User chose "Enter new activity..."; caller should show text dialog.
+    EnterNew,
+    /// User didn't complete choice (e.g. cancelled text dialog); show reminder again after interval.
+    ShowAgain,
     Timeout,
 }
 
@@ -1364,6 +1522,51 @@ fn show_reminder_prompt(activities: &[String]) -> ReminderResult {
     }
 }
 
+/// Run osascript "Enter activity:" text dialog in user session; returns the entered string or None.
+#[cfg(target_os = "macos")]
+fn prompt_enter_activity_macos(ts_debug: bool) -> Option<String> {
+    // Return only the text so stdout is just the activity (no parsing "button returned:OK, text returned:...").
+    let prompt_script = "text returned of (display dialog \"Enter activity:\" with title \"ts\" default answer \"\")";
+    let run = |use_launchctl: bool| -> Option<String> {
+        let mut cmd: Command = if use_launchctl {
+            macos_run_in_user_session("/usr/bin/osascript", &["-e", prompt_script])
+        } else {
+            let mut c = Command::new("/usr/bin/osascript");
+            c.args(["-e", prompt_script]);
+            c
+        };
+        let child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(if ts_debug { Stdio::inherit() } else { Stdio::null() })
+            .spawn()
+            .ok()?;
+        let out = match wait_with_timeout(child, Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS)) {
+            WaitOutcome::Finished(Some(o)) => o,
+            _ => return None,
+        };
+        let activity = String::from_utf8_lossy(&out).trim().to_string();
+        if activity.is_empty() {
+            None
+        } else {
+            Some(activity)
+        }
+    };
+    run(true).or_else(|| run(false))
+}
+
+/// On macOS, run a command in the user's GUI session so dialogs can appear (avoids "no user interaction allowed" from nohup daemon).
+#[cfg(target_os = "macos")]
+fn macos_run_in_user_session(exe: &str, exe_args: &[&str]) -> Command {
+    let uid = unsafe { getuid() }.to_string();
+    let mut args = vec!["asuser", &uid, exe];
+    let mut all = std::vec::Vec::from(exe_args);
+    args.append(&mut all);
+    let mut c = Command::new("/usr/bin/launchctl");
+    c.args(args);
+    c
+}
+
 #[cfg(target_os = "macos")]
 fn show_reminder_prompt_macos(activities: &[String]) -> ReminderResult {
     let mut choices = vec!["Don't Bug Me".to_string()];
@@ -1374,12 +1577,88 @@ fn show_reminder_prompt_macos(activities: &[String]) -> ReminderResult {
     }
     choices.push("Enter new activity...".to_string());
 
-    // Prefer Python tkinter dialog: single-click to choose (no OK button)
-    if let Ok(r) = show_reminder_prompt_macos_python(&choices) {
-        return r;
+    // Native Rust/AppKit dialog (many buttons, one click). Spawn ts --reminder-dialog in user's GUI session.
+    let ts_debug = env::var_os("TS_DEBUG").is_some();
+    let try_native = |use_launchctl: bool| -> Option<ReminderResult> {
+        let exe = env::current_exe().ok()?;
+        let exe_str = exe.to_string_lossy();
+        let mut args = vec!["--reminder-dialog".to_string()];
+        args.extend(choices.iter().cloned());
+        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut cmd = if use_launchctl {
+            macos_run_in_user_session(&exe_str, &args_ref)
+        } else {
+            let mut c = Command::new(&exe);
+            c.args(&args_ref);
+            c
+        };
+        let child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(if ts_debug { Stdio::inherit() } else { Stdio::null() })
+            .spawn()
+            .ok()?;
+        let timeout = Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS);
+        let stdout = match wait_with_timeout(child, timeout) {
+            WaitOutcome::Finished(Some(out)) => out,
+            _ => return None,
+        };
+        let s = String::from_utf8_lossy(&stdout).trim().to_string();
+        if s == "Don't Bug Me" {
+            return Some(ReminderResult::DontBugMe);
+        }
+        if s == "Enter new activity..." {
+            return Some(ReminderResult::EnterNew);
+        }
+        if !s.is_empty() && choices.contains(&s) {
+            return Some(ReminderResult::Activity(s));
+        }
+        None
+    };
+
+    if let Some(res) = try_native(true) {
+        if let ReminderResult::EnterNew = res {
+            if let Some(activity) = prompt_enter_activity_macos(ts_debug) {
+                return ReminderResult::Activity(activity);
+            }
+            return ReminderResult::ShowAgain;
+        } else {
+            return res;
+        }
+    }
+    if let Some(res) = try_native(false) {
+        // launchctl path failed; try direct spawn (can work when daemon was started from Terminal)
+        if let ReminderResult::EnterNew = res {
+            if let Some(activity) = prompt_enter_activity_macos(ts_debug) {
+                return ReminderResult::Activity(activity);
+            }
+            return ReminderResult::ShowAgain;
+        } else {
+            return res;
+        }
+    }
+    if ts_debug {
+        let _ = std::io::stderr().write_fmt(format_args!(
+            "ts: native reminder dialog failed or timed out, using SystemUIServer fallback\n"
+        ));
     }
 
-    // Fallback: osascript choose from list (requires click then OK)
+    // SystemUIServer can show dialogs from background processes (daemon). Try it first (with list of activities).
+    match show_reminder_prompt_macos_systemui(&choices) {
+        ReminderResult::DontBugMe => return ReminderResult::DontBugMe,
+        ReminderResult::Activity(ref a) if !a.is_empty() => return ReminderResult::Activity(a.clone()),
+        _ => {}
+    }
+    // Fall through: SystemUIServer dialog failed or timed out, try osascript
+
+    let ts_debug_stderr = env::var_os("TS_DEBUG").is_some();
+    let stderr_mode = if ts_debug_stderr {
+        Stdio::inherit()
+    } else {
+        Stdio::null()
+    };
+
+    // Fallback: osascript choose from list (requires click then OK), run in user session so dialog appears
     let list_script = choices
         .iter()
         .map(|s| escape_applescript_string(s))
@@ -1391,11 +1670,10 @@ fn show_reminder_prompt_macos(activities: &[String]) -> ReminderResult {
         list_script,
         list_script
     );
-    let child = match Command::new("/usr/bin/osascript")
-        .args(["-e", &script])
+    let child = match macos_run_in_user_session("/usr/bin/osascript", &["-e", &script])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(stderr_mode)
         .spawn()
     {
         Ok(c) => c,
@@ -1413,21 +1691,8 @@ fn show_reminder_prompt_macos(activities: &[String]) -> ReminderResult {
                 return ReminderResult::DontBugMe;
             }
             if s == "Enter new activity..." {
-                let prompt_script = "display dialog \"Enter activity:\" with title \"ts\" default answer \"\"";
-                let child2 = match Command::new("/usr/bin/osascript").args(["-e", prompt_script]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
-                    Ok(c) => c,
-                    Err(_) => return ReminderResult::Timeout,
-                };
-                if let WaitOutcome::Finished(Some(out)) = wait_with_timeout(child2, Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS)) {
-                    let text = String::from_utf8_lossy(&out);
-                    if let Some(line) = text.lines().next() {
-                        if let Some(rest) = line.strip_prefix("text returned:") {
-                            let activity = rest.trim().trim_matches('"');
-                            if !activity.is_empty() {
-                                return ReminderResult::Activity(activity.to_string());
-                            }
-                        }
-                    }
+                if let Some(activity) = prompt_enter_activity_macos(ts_debug_stderr) {
+                    return ReminderResult::Activity(activity);
                 }
                 return ReminderResult::Timeout;
             }
@@ -1439,82 +1704,142 @@ fn show_reminder_prompt_macos(activities: &[String]) -> ReminderResult {
     result
 }
 
-/// Single-click list dialog via Python tkinter (no OK button). Returns Err to fall back to osascript.
+/// Buttons-only dialog via SystemUIServer (one click = done; works from daemon).
+/// AppleScript display dialog allows at most 3 buttons, so we show: Don't Bug Me | most recent activity | Enter new activity...
 #[cfg(target_os = "macos")]
-fn show_reminder_prompt_macos_python(choices: &[String]) -> Result<ReminderResult, ()> {
-    let python_script = r#"
-import sys
-import tkinter as tk
-from tkinter import simpledialog
+fn show_reminder_prompt_macos_systemui(choices: &[String]) -> ReminderResult {
+    let stderr_mode = if env::var_os("TS_DEBUG").is_some() {
+        Stdio::inherit()
+    } else {
+        Stdio::null()
+    };
+    let timeout_dur = Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS);
 
-items = sys.argv[1:]
-if not items:
-    sys.exit(1)
-
-root = tk.Tk()
-root.title("ts")
-root.withdraw()
-root.attributes("-topmost", True)
-
-win = tk.Toplevel(root)
-win.title("ts")
-win.attributes("-topmost", True)
-win.protocol("WM_DELETE_WINDOW", lambda: (win.destroy(), root.quit()))
-
-tk.Label(win, text="What are you working on?", font=("", 11)).pack(pady=(8, 4))
-lb = tk.Listbox(win, height=min(14, len(items)), font=("", 12), selectmode=tk.SINGLE, exportselection=False)
-for i in items:
-    lb.insert(tk.END, i)
-lb.pack(padx=8, pady=(0, 8))
-lb.selection_set(0)
-lb.see(0)
-
-def on_click(event):
-    sel = lb.curselection()
-    if not sel:
-        return
-    idx = int(sel[0])
-    choice = items[idx]
-    if choice == "Enter new activity...":
-        win.destroy()
-        root.update()
-        s = simpledialog.askstring("ts", "Enter activity:", parent=root)
-        if s and s.strip():
-            print(s.strip())
-    else:
-        print(choice)
-    root.quit()
-    sys.stdout.flush()
-
-lb.bind("<ButtonRelease-1>", on_click)
-lb.focus_set()
-
-win.update_idletasks()
-win.geometry("+%d+%d" % (win.winfo_screenwidth()//2 - win.winfo_reqwidth()//2, win.winfo_screenheight()//2 - win.winfo_reqheight()//2))
-win.deiconify()
-root.mainloop()
-"#;
-    let mut cmd = Command::new("python3");
-    cmd.arg("-c")
-        .arg(python_script)
-        .args(choices.iter().map(String::as_str))
+    // AppleScript display dialog allows max 3 buttons. Build exactly 3: Don't Bug Me, (optional) top activity, Enter new activity...
+    let three_buttons: Vec<&str> = {
+        let mut b = Vec::with_capacity(3);
+        b.push("Don't Bug Me");
+        if choices.len() > 2 {
+            b.push(choices[1].as_str());
+        }
+        b.push("Enter new activity...");
+        b
+    };
+    let buttons_script = three_buttons
+        .iter()
+        .map(|s| format!("\"{}\"", escape_applescript_string(s)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let script = format!(
+        "tell application \"SystemUIServer\" to display dialog \"What are you working on?\" with title \"ts\" buttons {{{}}} default button \"Don't Bug Me\"",
+        buttons_script
+    );
+    if let Ok(child) = macos_run_in_user_session("/usr/bin/osascript", &["-e", &script])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let child = cmd.spawn().map_err(|_| ())?;
-    let timeout = Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS);
-    let stdout = match wait_with_timeout(child, timeout) {
-        WaitOutcome::Finished(Some(s)) => s,
-        _ => return Err(()),
+        .stderr(stderr_mode)
+        .spawn()
+    {
+        match wait_with_timeout(child, timeout_dur) {
+            WaitOutcome::Finished(Some(stdout)) => {
+                let s = String::from_utf8_lossy(&stdout).trim().to_string();
+                for part in s.split(',') {
+                    let part = part.trim();
+                    if let Some(rest) = part.strip_prefix("button returned:") {
+                        let btn = rest.trim().trim_matches('"');
+                        if btn == "Don't Bug Me" {
+                            return ReminderResult::DontBugMe;
+                        }
+                        if btn == "Enter new activity..." {
+                            break;
+                        }
+                        return ReminderResult::Activity(btn.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // When user chose "Enter new activity...": try choose from list (all activities) for one more click, then text dialog.
+    let stderr2 = if env::var_os("TS_DEBUG").is_some() {
+        Stdio::inherit()
+    } else {
+        Stdio::null()
     };
-    let s = String::from_utf8_lossy(&stdout).trim().to_string();
-    if s.is_empty() {
-        return Ok(ReminderResult::Timeout);
+    if choices.len() > 2 {
+        let list_script = choices
+            .iter()
+            .map(|s| format!("\"{}\"", escape_applescript_string(s)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let list_cmd = format!(
+            "tell application \"SystemUIServer\" to choose from list {{{}}} with title \"ts\" with prompt \"What are you working on?\" default items {{item 1 of {{{}}}}}",
+            list_script,
+            list_script
+        );
+        if let Ok(child) = macos_run_in_user_session("/usr/bin/osascript", &["-e", &list_cmd])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(stderr2)
+            .spawn()
+        {
+            if let WaitOutcome::Finished(Some(stdout)) = wait_with_timeout(child, timeout_dur) {
+                let s = String::from_utf8_lossy(&stdout).trim().to_string();
+                if s == "false" {
+                    return ReminderResult::Timeout;
+                }
+                if s == "Don't Bug Me" {
+                    return ReminderResult::DontBugMe;
+                }
+                if s != "Enter new activity..." {
+                    return ReminderResult::Activity(s);
+                }
+            }
+        }
     }
-    if s == "Don't Bug Me" {
-        return Ok(ReminderResult::DontBugMe);
+    // Text dialog for new activity or when list was cancelled.
+    let script = "tell application \"SystemUIServer\" to display dialog \"What are you working on?\" default answer \"\" with title \"ts\" buttons {\"Don't Bug Me\", \"OK\"} default button \"OK\"";
+    let stderr2 = if env::var_os("TS_DEBUG").is_some() {
+        Stdio::inherit()
+    } else {
+        Stdio::null()
+    };
+    let child = match macos_run_in_user_session("/usr/bin/osascript", &["-e", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(stderr2)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return ReminderResult::Timeout,
+    };
+    match wait_with_timeout(child, timeout_dur) {
+        WaitOutcome::Finished(Some(stdout)) => {
+            let s = String::from_utf8_lossy(&stdout).trim().to_string();
+            let mut activity_from_text: Option<String> = None;
+            for part in s.split(',') {
+                let part = part.trim();
+                if let Some(rest) = part.strip_prefix("button returned:") {
+                    let btn = rest.trim().trim_matches('"');
+                    if btn == "Don't Bug Me" {
+                        return ReminderResult::DontBugMe;
+                    }
+                }
+                if let Some(rest) = part.strip_prefix("text returned:") {
+                    let activity = rest.trim().trim_matches('"').trim();
+                    if !activity.is_empty() {
+                        activity_from_text = Some(activity.to_string());
+                    }
+                }
+            }
+            if let Some(activity) = activity_from_text {
+                return ReminderResult::Activity(activity);
+            }
+        }
+        _ => {}
     }
-    Ok(ReminderResult::Activity(s))
+    ReminderResult::Timeout
 }
 
 fn escape_applescript_string(s: &str) -> String {
@@ -1573,6 +1898,15 @@ fn main() {
         process::exit(0);
     }
 
+    #[cfg(target_os = "macos")]
+    if cmd.as_deref() == Some("--reminder-dialog") {
+        let choices: Vec<String> = rest.clone();
+        if let Some(selected) = reminder_dialog_macos::run_native_reminder_dialog(choices) {
+            println!("{}", selected);
+        }
+        process::exit(0);
+    }
+
     if env::var_os("TS_DEBUG").is_some() {
         let cmd_name = cmd.as_deref().unwrap_or("(none)");
         let _ = std::io::stderr().write_fmt(format_args!("ts: dispatching to {:?}\n", cmd_name));
@@ -1591,7 +1925,8 @@ fn main() {
         Some("install") => cmd_install(&rest),
         Some("rebuild") => cmd_rebuild(&rest),
         Some("rotate") => do_rotate(&timesheet),
-        Some("restart") => cmd_restart(&timesheet),
+        Some("interval") => cmd_interval(&rest, &timesheet),
+        Some("restart") | Some("reminder") => cmd_interval(&rest, &timesheet),
         Some("manpage") => cmd_manpage(),
         Some("help") => cmd_help(),
         Some(_) => cmd_help(),
