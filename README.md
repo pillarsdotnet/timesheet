@@ -9,7 +9,7 @@ Korn shell scripts for tracking work start/stop and reporting time by activity a
 
 - `ksh` (Korn shell)
 - `awk`
-- Timesheet data file: `~/Documents/timesheet.log` (edit `TIMESHEET` in each script to change)
+- Timesheet data file: `~/Documents/timesheet.log` (edit `TIMESHEET` in the `ts` script to change)
 
 ## Data format
 
@@ -20,26 +20,31 @@ The log file contains one entry per line:
 
 Start/stop pairs are matched in **LIFO order** (each STOP pairs with the most recent START). The report scripts use these pairs to compute duration and attribute time to activity and day of week.
 
-## Scripts
+## ts command
+
+All functionality is in a single script **`ts`**. The first argument is a required subcommand:
+
+| Subcommand   | Description |
+|-------------|-------------|
+| `start`     | Record work start **now**. Optional args = activity (default: misc/unspecified). |
+| `stop`      | Record work stop **now**. Same behavior as legacy stop script. |
+| `list`      | Plaintext report: % time per activity, hours per day of week; if work in progress, show current task/duration. |
+| `started`   | Record a work start at a **past time**. Args: `ts started <start_time> [activity...]`. Same behavior as legacy started. |
+| `timeoff`   | Show stop-work time for 8h/day average; if last entry is STOP, starts work for the calculation. |
+| `workalias` | Interactively replace activity text in START entries from the current week. Args: `ts workalias <pattern> <replacement>`. |
+| `install`   | Copy `ts` to a directory on PATH. Args: `ts install [install_dir] [repo_path]`. |
+| `rotate`    | Rename `timesheet.log` to `timesheet.YYMMDDHHMM` where the timestamp is the date/time of its most recent entry. |
 
 ### start
 
-Records that work is starting **now**. Appends a single START entry.
-
-- **Arguments:** Optional. Any arguments are the activity description; if omitted, activity is `misc/unspecified`.
-- **Behavior:** Appends `START|$(date +%s)|activity` to the timesheet. Does not modify existing entries.
+Appends `START|$(date +%s)|activity` to the timesheet. Does not modify existing entries.
 
 ### started
 
-Records a work start at a **past time**. First argument is required (the start time); remaining arguments are the activity.
-
-- **Arguments:** `started <start_time> [activity...]`. `start_time` is required (e.g. `"2025-02-16 09:00"` or `"9:00 AM"`). Activity defaults to `misc/unspecified`.
 - **Time formats:** GNU `date -d` style, or `YYYY-MM-DD HH:MM[:SS]`, or `HH:%M` (today).
-- **Behavior:**
-  - **Last entry is START (work in progress), and that START was recorded today:** Replaces that START with the new time and activity (adjusts the current session). Does not add a new line.
-  - **Last entry is STOP, your start time is before that stop time, and that STOP was recorded today:** Inserts the new START line **before** that STOP so the pair is correct in the log. Then exits.
-  - **Otherwise:** Appends the new START at the end of the file.
-- **Constraint:** Does not adjust or insert relative to an entry that was **not** made on the current day (uses local date).
+- **Last entry is START recorded today:** Replaces that START with the new time and activity.
+- **Last entry is STOP recorded today and start time &lt; stop time:** Inserts the new START before that STOP.
+- **Otherwise:** Appends the new START at the end. Only adjusts entries made on the current day.
 
 ### stop
 
@@ -52,17 +57,10 @@ Records that work is stopping **now**.
   - **Last entry is START (or anything else):** Appends the new STOP (normal pairing with the most recent START).
 - **Constraint:** Does not adjust an entry that was not made on the current day.
 
-### timesheet
+### list
 
-Prints a **plaintext report** to stdout. Does not change the log file.
-
-- **Arguments:** None.
-- **Behavior:**
-  - **Last entry is START (work in progress):** Treats work as having just stopped for the report: uses the log plus a virtual `STOP|now` so the current session is included in the totals. The file is not modified.
-  - **Otherwise:** Uses the log as-is.
-- **Output (two parts):**
-  1. **By activity:** Percentage of total time per activity, sorted from highest to lowest (e.g. `60.0%  coding`).
-  2. **By day of week:** Total hours per weekday (Sunday through Saturday), two decimal places (e.g. `Monday  6.50`). The week is Sunday 00:00:00 through Saturday 23:59:59; each segment is attributed to the day of its start time.
+- **Last entry is START (work in progress):** Uses log plus a virtual `STOP|now` for the report; file not modified. Appends a line with current task, start time, and duration.
+- **Output:** (1) By activity: percentage per activity, high to low. (2) By day of week: hours per weekday (Sun–Sat). Week = Sunday 00:00:00 through Saturday 23:59:59.
 
 ### timeoff
 
@@ -75,45 +73,36 @@ Shows the **stop-work time** that would give an average of 8 hours per day worke
 
 ### workalias
 
-Interactively replace activity text in START entries from the **current week** (Sunday 00:00:00 through Saturday 23:59:59).
-
-- **Arguments:** Two required. `workalias <pattern> <replacement>`.
-  - **pattern:** A string or regular expression that must match at least one activity previously logged for this week. Matching is against the activity field of START lines (e.g. `coding`, `misc/.*`).
-  - **replacement:** The string to substitute for the matched activity.
-- **Behavior:** Searches the timesheet log for START entries from the current week whose activity matches the pattern. For each match, the script echoes the original line and the replaced form, then prompts `Replace (y/n)`. If the user responds with `y` or `Y`, the replacement is written to the log; any other response skips that replacement.
-- **Constraint:** Exits with an error if no activities match the pattern for this week.
+Searches for START entries from the current week whose activity matches the pattern. For each match, echoes original and replaced form, prompts `Replace (y/n)`; `y`/`Y` applies the replacement. Errors if no matches this week.
 
 ### install
 
-Copies the six scripts (`start`, `started`, `stop`, `timesheet`, `timeoff`, `workalias`) into a directory and makes them executable.
+- **install_dir omitted:** Installs `ts` into the first writable directory on `PATH`.
+- **install_dir given:** Installs `ts` into that directory (created if needed). Exits with an error if `ts` is missing in the repo path. Usage: `ts install [install_dir] [repo_path]`.
 
-- **Usage:** `./install [install_dir] [repo_path]`. Both arguments are optional.
-- **Arguments:**
-  - **install_dir:** If given, scripts are installed into this directory (created if needed). Must be writable.
-  - **repo_path:** If given, path to the repository containing the scripts (default: directory of `install`).
-- **Behavior when install_dir is omitted:** Iterates over directories in `PATH` in order and installs into the **first directory that is writable** by the current user. If none are writable, prints an error and exits without installing.
-- **Behavior when install_dir is given:** Uses that directory (creates it with `mkdir -p` if it does not exist). Exits with an error if the directory cannot be created or is not writable.
-- Exits with an error if any of the six scripts is missing in the repo directory.
+### rotate
+
+Renames the timesheet log to `timesheet.YYMMDDHHMM` using the timestamp of the log's most recent entry (START or STOP). Errors if the log is missing or has no valid entries.
 
 ## Install
 
 From the repository directory:
 
 ```sh
-./install
+./ts install
 ```
 
-This installs into the first writable directory on your `PATH`. To install into a specific directory (e.g. `~/bin`):
+This installs `ts` into the first writable directory on your `PATH`. To install into a specific directory (e.g. `~/bin`):
 
 ```sh
-./install ~/bin
+./ts install ~/bin
 ```
 
 Or copy and chmod manually:
 
 ```sh
-cp start started stop timesheet timeoff workalias ~/bin/
-chmod +x ~/bin/start ~/bin/started ~/bin/stop ~/bin/timesheet ~/bin/timeoff ~/bin/workalias
+cp ts ~/bin/
+chmod +x ~/bin/ts
 ```
 
-Ensure `TIMESHEET` in each script points to your log file (default: `~/Documents/timesheet.log`). For `timeoff` to invoke `start` when work is stopped, the scripts should be in the same directory (e.g. all in `~/bin`).
+Ensure `TIMESHEET` in the `ts` script points to your log file (default: `~/Documents/timesheet.log`).
