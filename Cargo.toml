@@ -2,13 +2,17 @@
 name = "ts"
 version = "0.1.0"
 edition = "2021"
-description = "Timesheet CLI: start, stop, list, started, timeoff, workalias, install, rotate, manpage"
+description = "Timesheet CLI: start, stop, list, started, timeoff, alias, rename, install, rotate, manpage"
 authors = ["Robert August Vincent II <pillarsdotnet@gmail.com>"]
 license = "MIT"
 
 [dependencies]
 chrono = "0.4"
+libc = "0.2"
 regex = "1.10"
+
+[profile.release]
+strip = true
 
 [dev-dependencies]
 tempfile = "3"

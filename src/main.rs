@@ -24,7 +24,8 @@
 //! | `list`     | Report % per activity and hours per weekday; optional file/extension arg. |
 //! | `started`  | Record a past start time; adjusts today's last START or inserts before today's STOP. |
 //! | `timeoff`  | Show stop time for 8 h/day average; starts work if last was STOP. |
-//! | `workalias`| Interactively replace activity text in this week's START entries (regex). |
+//! | `alias`    | Interactively replace activity text in this week's START entries (regex). |
+//! | `rename`   | Same as `alias`. |
 //! | `install`  | Copy binary to a directory on PATH. |
 //! | `rotate`   | Rename log to `timesheet.YYMMDD`; append if same-day file exists. |
 //! | `restart`  | Kill and restart the reminder daemon. |
@@ -40,6 +41,8 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::thread;
 use std::time::Duration;
+#[cfg(unix)]
+use libc::{kill, signal, SIG_IGN, SIGKILL, SIGTERM};
 
 /// Default path segment under `$HOME` for the timesheet log file.
 const DEFAULT_TIMESHEET: &str = "Documents/timesheet.log";
@@ -48,6 +51,11 @@ const DEFAULT_TIMESHEET: &str = "Documents/timesheet.log";
 const DAY_NAMES: [&str; 7] = [
     "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
 ];
+
+/// Truncate hours to two decimal places (discard fractions beyond the second decimal).
+fn trunc2(h: f64) -> f64 {
+    (h * 100.0).trunc() / 100.0
+}
 
 /// Returns the default timesheet path: `$HOME/Documents/timesheet.log`, or `./Documents/timesheet.log` if `HOME` is unset.
 fn timesheet_path() -> PathBuf {
@@ -426,6 +434,9 @@ fn process_log_for_report(lines: &[(usize, LogLine)], virtual_stop: Option<i64>)
 
 /// Prints report: % per activity and hours per weekday; optional arg selects file (e.g. `log`, `0220`, path).
 fn cmd_list(list_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
+    if env::var_os("TS_DEBUG").is_some() {
+        let _ = std::io::stderr().write_all(b"ts: cmd_list entered\n");
+    }
     let list_input = resolve_list_input(list_arg, timesheet)?;
     if !list_input.exists() {
         println!("No timesheet data found.");
@@ -456,6 +467,8 @@ fn cmd_list(list_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
     for (i, name) in DAY_NAMES.iter().enumerate() {
         println!("{}  {:.2}", name, dow_hr.get(i).copied().unwrap_or(0.0));
     }
+    let total_hr: f64 = dow_hr.iter().map(|&h| trunc2(h)).sum();
+    println!("Total  {:.2}", trunc2(total_hr));
     if is_current && work_in_progress {
         if let Some((_, LogLine::Start(epoch, activity))) = last_start {
             let start_dt = Local.timestamp_opt(*epoch, 0).single().unwrap_or_else(Local::now);
@@ -639,8 +652,9 @@ fn cmd_timeoff(timesheet: &Path) -> Result<(), String> {
         println!("No work recorded.");
         return Ok(());
     }
-    let total_hr = total_sec as f64 / 3600.0;
-    let need_hr = 8.0 * num_days - total_hr;
+    let total_hr_worked = trunc2(total_sec as f64 / 3600.0);
+    let target_hr = trunc2(8.0 * num_days);
+    let need_hr = trunc2(target_hr - total_hr_worked);
     if need_hr <= 0.0 {
         println!("Average already at least 8 hours per day worked. You may stop now.");
         println!("{}", Local::now().format("%a %b %d %H:%M:%S %Z %Y"));
@@ -657,16 +671,18 @@ fn cmd_timeoff(timesheet: &Path) -> Result<(), String> {
 }
 
 /// Interactively replace activity text in this week's START entries; pattern is a regex, prompt Replace (y/n) per match.
+/// Used by both `alias` and `rename` subcommands.
 fn cmd_workalias(args: &[String], timesheet: &Path) -> Result<(), String> {
     let (pattern, replacement) = match args {
         [p, r, ..] => (p.as_str(), r.to_string()),
         _ => {
-            eprintln!("Usage: ts workalias <pattern> <replacement>");
+            eprintln!("Usage: ts alias <pattern> <replacement>");
+            eprintln!("       ts rename <pattern> <replacement>");
             return Err("missing args".to_string());
         }
     };
     if !timesheet.exists() {
-        return Err("ts workalias: no timesheet data found.".to_string());
+        return Err("ts alias: no timesheet data found.".to_string());
     }
     let now = Local::now().timestamp();
     let week_start = week_start_epoch(now);
@@ -683,7 +699,7 @@ fn cmd_workalias(args: &[String], timesheet: &Path) -> Result<(), String> {
     }
     if matches_vec.is_empty() {
         return Err(format!(
-            "ts workalias: no activities matching \"{}\" found for this week.",
+            "ts alias: no activities matching \"{}\" found for this week.",
             pattern
         ));
     }
@@ -784,6 +800,19 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
         perms.set_mode(0o755);
         fs::set_permissions(&dest_file, perms).map_err(|e| e.to_string())?;
     }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("xattr")
+            .arg("-d")
+            .arg("com.apple.quarantine")
+            .arg(&dest_file)
+            .output();
+        let _ = Command::new("codesign")
+            .arg("-s")
+            .arg("-")
+            .arg(&dest_file)
+            .output();
+    }
     println!("Installed {}", dest_file.display());
     println!("Done. ts is in {} and executable.", dest.display());
     Ok(())
@@ -817,7 +846,11 @@ ts \- timesheet CLI (start, stop, list, report by activity and weekday)
 .PP
 .B ts timeoff
 .PP
-.B ts workalias
+.B ts alias
+.I pattern
+.I replacement
+.PP
+.B ts rename
 .I pattern
 .I replacement
 .PP
@@ -897,7 +930,7 @@ If the last entry is STOP, runs
 .B start
 before the calculation so the average includes work starting now.
 .TP
-.B workalias
+.B alias
 Interactively replace activity text in START entries from the current week.
 .I pattern
 is a regex;
@@ -909,6 +942,10 @@ For each match, prompts
 or
 .B Y
 applies the replacement. Errors if no matches this week.
+.TP
+.B rename
+Same as
+.BR alias .
 .TP
 .B install
 Copy the binary to a directory on
@@ -941,6 +978,13 @@ Write this manual page in groff format to stdout. Example:
 Run the equivalent of
 .B "ts manpage | man \-l \-"
 to show this manual page in the system pager.
+.SH ENVIRONMENT
+.TP
+.B TS_DEBUG
+If set (any value), log debug messages to stderr for
+.B restart
+and reminder daemon start/kill (e.g.
+.BR "TS_DEBUG=1 ts restart" ).
 .SH FILES
 .B $HOME/Documents/timesheet.log
 Default timesheet log (path is compile-time in
@@ -1027,18 +1071,34 @@ const REMINDER_SLEEP_SECS: u64 = 300; // 5 minutes
 const REMINDER_PROMPT_TIMEOUT_SECS: u64 = 300; // 5 minutes
 
 /// Returns true if a process with the given PID is running (Unix: kill -0).
+fn ts_debug(msg: &str) {
+    if env::var_os("TS_DEBUG").is_some() {
+        let _ = writeln!(io::stderr(), "ts: {}", msg);
+    }
+}
+
+/// Returns true if a process with the given PID exists (Unix: kill(pid, 0)). Does not spawn any subprocess.
 fn is_pid_running(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        let status = Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status();
-        status.map(|s| s.success()).unwrap_or(false)
+        unsafe { kill(pid as i32, 0) == 0 }
     }
     #[cfg(not(unix))]
     {
         let _ = pid;
         false
+    }
+}
+
+/// Send a signal to a process by PID. Does not spawn the kill binary. No-op on non-Unix.
+fn signal_pid(pid: u32, sig: i32) {
+    #[cfg(unix)]
+    {
+        let _ = unsafe { kill(pid as i32, sig) };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, sig);
     }
 }
 
@@ -1050,23 +1110,33 @@ fn kill_reminder_daemon_if_running() {
 
     #[cfg(unix)]
     {
+        ts_debug("kill_reminder: entry");
         let pid_path = reminder_pid_path();
         if let Ok(data) = fs::read_to_string(&pid_path) {
+            ts_debug(&format!("kill_reminder: read pid file {:?}", data.trim()));
             if let Ok(pid) = data.trim().parse::<u32>() {
                 if pid == process::id() {
+                    ts_debug("kill_reminder: pid is self, removing file and skipping kill");
                     let _ = fs::remove_file(&pid_path);
                     return;
                 }
                 if is_pid_running(pid) {
-                    let _ = Command::new("kill").arg(pid.to_string()).status();
+                    ts_debug(&format!("kill_reminder: sending SIGTERM to {}", pid));
+                    signal_pid(pid, SIGTERM);
                     thread::sleep(Duration::from_millis(150));
                     if is_pid_running(pid) {
-                        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+                        ts_debug(&format!("kill_reminder: sending SIGKILL to {}", pid));
+                        signal_pid(pid, SIGKILL);
                     }
+                } else {
+                    ts_debug("kill_reminder: process not running");
                 }
             }
+        } else {
+            ts_debug("kill_reminder: no pid file or unreadable");
         }
         let _ = fs::remove_file(&pid_path);
+        ts_debug("kill_reminder: done");
     }
 }
 
@@ -1077,31 +1147,53 @@ fn start_reminder_daemon_if_needed(_timesheet: &Path) {
 
     #[cfg(unix)]
     {
+        ts_debug("start_reminder: entry");
         let pid_path = reminder_pid_path();
         if let Ok(data) = fs::read_to_string(&pid_path) {
             if let Ok(pid) = data.trim().parse::<u32>() {
                 if is_pid_running(pid) {
+                    ts_debug("start_reminder: daemon already running, skipping spawn");
                     return;
                 }
             }
         }
-        if let Ok(exe) = env::current_exe() {
-            let _ = Command::new("/usr/bin/nohup")
-                .arg(&exe)
-                .arg("--reminder-daemon")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
+        let exe = match env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                ts_debug(&format!("start_reminder: current_exe failed: {}", e));
+                return;
+            }
+        };
+        ts_debug(&format!("start_reminder: spawning nohup {}", exe.display()));
+        match Command::new("/usr/bin/nohup")
+            .arg(&exe)
+            .arg("--reminder-daemon")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => {
+                ts_debug(&format!("start_reminder: spawned daemon pid {}", child.id()));
+                drop(child);
+            }
+            Err(e) => {
+                ts_debug(&format!("start_reminder: spawn failed: {}", e));
+            }
         }
+        ts_debug("start_reminder: done");
     }
 }
 
 /// Kill the reminder daemon (if running) and start a fresh one.
 fn cmd_restart(timesheet: &Path) -> Result<(), String> {
+    ts_debug("restart: entry");
     kill_reminder_daemon_if_running();
+    ts_debug("restart: after kill, sleeping 100ms");
     thread::sleep(Duration::from_millis(100));
+    ts_debug("restart: calling start_reminder_daemon_if_needed");
     start_reminder_daemon_if_needed(timesheet);
+    ts_debug("restart: done, printing message");
     println!("Reminder daemon restarted.");
     Ok(())
 }
@@ -1273,6 +1365,13 @@ fn wait_with_timeout(mut child: process::Child, timeout: Duration) -> WaitOutcom
 }
 
 fn main() {
+    if env::var_os("TS_DEBUG").is_some() {
+        let _ = std::io::stderr().write_all(b"ts: main entered\n");
+    }
+    #[cfg(unix)]
+    unsafe {
+        signal(libc::SIGPIPE, SIG_IGN);
+    }
     let mut args: Vec<String> = env::args().skip(1).collect();
     let cmd = args.first().cloned();
     let rest: Vec<String> = args.drain(1..).collect();
@@ -1283,6 +1382,11 @@ fn main() {
         process::exit(0);
     }
 
+    if env::var_os("TS_DEBUG").is_some() {
+        let cmd_name = cmd.as_deref().unwrap_or("(none)");
+        let _ = std::io::stderr().write_fmt(format_args!("ts: dispatching to {:?}\n", cmd_name));
+    }
+
     let result = match cmd.as_deref() {
         None => cmd_help(),
         Some("start") => cmd_start(&rest, &timesheet),
@@ -1290,7 +1394,8 @@ fn main() {
         Some("list") => cmd_list(rest.first().map(String::as_str), &timesheet),
         Some("started") => cmd_started(&rest, &timesheet),
         Some("timeoff") => cmd_timeoff(&timesheet),
-        Some("workalias") => cmd_workalias(&rest, &timesheet),
+        Some("alias") => cmd_workalias(&rest, &timesheet),
+        Some("rename") => cmd_workalias(&rest, &timesheet),
         Some("install") => cmd_install(&rest),
         Some("rotate") => do_rotate(&timesheet),
         Some("restart") => cmd_restart(&timesheet),
