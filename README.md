@@ -5,6 +5,24 @@ Co-author: Cursor-AI.
 
 CLI for tracking work start/stop and reporting time by activity and by day of week.
 
+## Motivation
+
+In the 90's, I had a boss who required me to turn in a detailed weekly timesheet
+listing exactly how much time I spent on each task, assigned or unassigned. As
+a borderline austistic, the idea of fudging or guessing at such a report was
+deeply troubling. So I self-assigned a task to write quick-and-dirty program
+that pops up every five minutes and asks what I've been doing. I called it
+"bugme".
+
+My present position has similar reporting requirements, so I have recreated that
+old program with improvements. I took the opportunity to simultaneously scratch
+two itches: AI and the Rust Programming Language. So I used Cursor-AI almost
+exclusively to write the program code, both in its original form as a set of
+Korn Shell scripts, and in its current form as a Rust program.
+
+One of these days, when I find the time, I'll read through the code and try to
+figure out how it works. For now I'm just glad that it does.
+
 ## Requirements
 
 - Timesheet data file: `~/Documents/timesheet.log` (edit `DEFAULT_TIMESHEET` in `src/main.rs` and rebuild to change)
@@ -20,72 +38,36 @@ Start/stop pairs are matched in **LIFO order** (each STOP pairs with the most re
 
 ## ts command
 
-The **`ts`** command takes a required subcommand as its first argument:
+The **`ts`** command takes a required subcommand as its first argument. Full documentation: **`ts help`** or **`ts manpage`**.
+
+Subcommands (alphabetical):
 
 | Subcommand   | Description |
 |-------------|-------------|
-| `start`     | Record work start **now**. Optional args = activity (default: misc/unspecified). |
-| `stop`      | Record work stop **now**. |
-| `list`      | Plaintext report: % time per activity, hours per day of week; if work in progress, show current task/duration. |
-| `started`   | Record a work start at a **past time**. Args: `ts started <start_time> [activity...]`. |
-| `timeoff`   | Show stop-work time for 8h/day average; if last entry is STOP, starts work for the calculation. |
-| `alias`     | Interactively replace activity text in START entries from the current week. Args: `ts alias <pattern> <replacement>`. |
-| `rename`    | Same as `alias`. Args: `ts rename <pattern> <replacement>`. |
-| `install`   | Copy the binary to a directory on PATH. Args: `ts install [install_dir] [repo_path]`. |
-| `rotate`    | Rename `timesheet.log` to `timesheet.YYMMDDHHMM` where the timestamp is the date/time of its most recent entry. |
+| `alias`     | Interactively replace activity text in START entries from the current week (regex pattern and replacement). |
+| `autostart` | Register `ts start` on login and `ts stop` on logout/shutdown (macOS: LaunchAgents; Linux: systemd user). Use `ts autostart uninstall` to remove. |
+| `help`      | Show the manual page in a pager (groff -man -Tascii \| less). |
+| `install`   | Copy the binary to a directory on PATH. Optional: `ts install [install_dir] [repo_path]`. |
+| `interval`  | Set or show the reminder daemon interval (e.g. `3`, `3m`, `100s`, `1h30m`). With an argument, sets the interval and restarts the daemon. |
+| `list`      | Plaintext report: % time per activity, hours per day of week; optional file/extension or date (e.g. `ts list 2/19` or `ts list 260220`) to select a log. If work in progress, shows current task and duration. |
+| `manpage`   | Output the Unix manual page in groff format to stdout. |
+| `rebuild`   | Build from source and install into the directory of the running binary. Optional directory argument; see `ts help`. |
+| `rename`    | Same as `alias`. |
+| `reminder`  | Alias for `interval`. |
+| `restart`   | Alias for `interval` (with no argument, reports current interval and restarts the daemon). |
+| `rotate`    | Rename `timesheet.log` to `timesheet.YYMMDD` using the most recent entry's date; if last entry is START, appends a STOP first. If a file for that date already exists, appends to it. |
+| `start`     | Record work start **now**. Optional activity (default: misc/unspecified). Starts the reminder daemon if not already running. |
+| `started`   | Record a work start at a **past time**. Args: `ts started <start_time> [activity...]`. Time formats: e.g. `YYYY-MM-DD HH:MM`, `HH:MM`, or GNU date -d style. |
+| `stop`      | Record work stop at **now** or at an optional stop time. If the last entry is already STOP and no time is given, nothing happens; if a time is given, the last STOP is amended. If the last entry is START, appends the new STOP. When a stop is recorded, stops the reminder daemon. |
+| `stopped`   | Alias for `stop`. |
+| `timeoff`   | Show the stop-work time for an 8 h/day average over days with work. If the last entry is STOP, runs `start` first so the average includes work starting now. |
 
-### start
+### Reminder daemon
 
-Appends `START|$(date +%s)|activity` to the timesheet. Does not modify existing entries.
-
-### started
-
-- **Time formats:** GNU `date -d` style, or `YYYY-MM-DD HH:MM[:SS]`, or `HH:%M` (today).
-- **Last entry is START recorded today:** Replaces that START with the new time and activity.
-- **Last entry is STOP recorded today and start time &lt; stop time:** Inserts the new START before that STOP.
-- **Otherwise:** Appends the new START at the end. Only adjusts entries made on the current day.
-
-### stop
-
-Records that work is stopping **now**.
-
-- **Arguments:** None.
-- **Behavior:**
-  - **Last entry is STOP, and that stop was recorded today:** Does **not** simply append another STOP. Inserts a START one second after that stop time, then appends the new STOP. So you get a continuous session from “one second after last stop” until now.
-  - **Last entry is STOP from a previous day:** Does **not** modify that entry. Only appends the new STOP.
-  - **Last entry is START (or anything else):** Appends the new STOP (normal pairing with the most recent START).
-- **Constraint:** Does not adjust an entry that was not made on the current day.
-
-### list
-
-- **Last entry is START (work in progress):** Uses log plus a virtual `STOP|now` for the report; file not modified. Appends a line with current task, start time, and duration.
-- **Output:** (1) By activity: percentage per activity, high to low. (2) By day of week: hours per weekday (Sun–Sat). Week = Sunday 00:00:00 through Saturday 23:59:59.
-
-### timeoff
-
-Shows the **stop-work time** that would give an average of 8 hours per day worked (over every day that has at least one completed session).
-
-- **Arguments:** None.
-- **Behavior:**
-  - If the last entry is STOP (work not in progress), runs `start` (from the same directory as the script) before doing the calculation, so the 8-hour average includes “work starting now.”
-  - Computes total hours and number of distinct days with work. If the average is already ≥ 8 hours, prints a message and the current time. Otherwise prints the clock time at which stopping would make the average exactly 8 hours, and how many hours remain.
-
-### alias
-
-Searches for START entries from the current week whose activity matches the pattern. For each match, echoes original and replaced form, prompts `Replace (y/n)`; `y`/`Y` applies the replacement. Errors if no matches this week.
-
-### rename
-
-Same as **alias**.
-
-### install
-
-- **install_dir omitted:** Installs the binary into the first writable directory on `PATH`.
-- **install_dir given:** Installs into that directory (created if needed). Exits with an error if the binary is missing in the repo path. Usage: `ts install [install_dir] [repo_path]`.
-
-### rotate
-
-Renames the timesheet log to `timesheet.YYMMDDHHMM` using the timestamp of the log's most recent entry (START or STOP). Errors if the log is missing or has no valid entries.
+- **`ts start`** starts the reminder daemon if it is not already running (it prompts “What are you working on?” at the configured interval).
+- **`ts stop`** (when it records a stop) stops the reminder daemon.
+- **`ts interval`** or **`ts restart [duration]`** sets or shows the interval and restarts the daemon.
+- **`ts autostart`** (macOS/Linux) registers `ts start` at login and `ts stop` at logout/shutdown.
 
 ## Install
 
@@ -94,7 +76,6 @@ From the repository directory:
 ```sh
 cargo build --release && ./target/release/ts install
 ```
-
 
 To install into a specific directory (e.g. `~/bin`): `ts install ~/bin`. Or copy manually:
 
@@ -124,3 +105,5 @@ cargo doc --no-deps --open
 ```
 
 Output is under `target/doc/ts/`.
+
+For command-line usage, run **`ts help`** or **`ts manpage`**.
