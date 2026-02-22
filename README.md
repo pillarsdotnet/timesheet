@@ -60,7 +60,7 @@ Subcommands (alphabetical):
 | `started`   | Record a work start at a **past time**. Args: `ts started <start_time> [activity...]`. Time formats: e.g. `YYYY-MM-DD HH:MM`, `HH:MM`, or GNU date -d style. |
 | `stop`      | Record work stop at **now** or at an optional stop time. If the last entry is already STOP and no time is given, nothing happens; if a time is given, the last STOP is amended. If the last entry is START, appends the new STOP. When a stop is recorded, stops the reminder daemon. |
 | `stopped`   | Alias for `stop`. |
-| `timeoff`   | Show the stop-work time for an 8 h/day average over days with work. If the last entry is STOP, runs `start` first so the average includes work starting now. |
+| `timeoff`   | Show the stop-work time for an 8 h/day average. Requires only a START entry (work in progress); no completed session on the current day is required. If the log is empty or the last entry is STOP, appends a START first. |
 
 ### Reminder daemon
 
