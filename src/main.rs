@@ -33,7 +33,7 @@
 //! | `start`    | Record work start now; optional activity (default: misc/unspecified); starts reminder daemon. |
 //! | `started`  | Record a past start time; adjusts today's last START or inserts before today's STOP. |
 //! | `stop`     | Record work stop (optional time); amends previous STOP if work already stopped; stops reminder daemon when a stop is recorded. |
-//! | `timeoff`  | Show stop time for 8 h/day average; starts work if last was STOP. |
+//! | `timeoff`  | Show stop time for 8 h/day average; only requires a START entry (adds one if log empty or last is STOP). |
 
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 use regex::Regex;
@@ -751,22 +751,25 @@ fn cmd_started(args: &[String], timesheet: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Shows stop time for 8 h/day average; starts work (appends START) if last entry was STOP.
+/// Shows stop time for 8 h/day average. Requires only a START entry (work in progress); no completed
+/// session on the current day is required. If the log is empty or the last entry is STOP, appends a START first.
 fn cmd_timeoff(timesheet: &Path) -> Result<(), String> {
     maybe_rotate_if_previous_week(timesheet)?;
-    if timesheet.exists() {
+    let needs_start = if timesheet.exists() {
         let content = fs::read_to_string(timesheet).unwrap_or_default();
         let last = content.lines().rev().find(|l| !l.trim().is_empty());
-        if last.map(|l| l.starts_with("STOP|")).unwrap_or(false) {
-            let now = Local::now().timestamp();
-            let line = format!("START|{}|misc/unspecified\n", now);
-            let mut f = fs::OpenOptions::new().append(true).open(timesheet).map_err(|e| e.to_string())?;
-            f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+        last.map(|l| l.starts_with("STOP|")).unwrap_or(true) // empty or last is STOP -> need START
+    } else {
+        true
+    };
+    if needs_start {
+        if let Some(parent) = timesheet.parent() {
+            let _ = fs::create_dir_all(parent);
         }
-    }
-    if !timesheet.exists() {
-        println!("No timesheet data.");
-        return Ok(());
+        let now = Local::now().timestamp();
+        let line = format!("START|{}|misc/unspecified\n", now);
+        let mut f = fs::OpenOptions::new().create(true).append(true).open(timesheet).map_err(|e| e.to_string())?;
+        f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
     }
     let content = fs::read_to_string(timesheet).unwrap_or_default();
     let mut stack: Vec<(i64, String)> = Vec::new();
@@ -790,8 +793,8 @@ fn cmd_timeoff(timesheet: &Path) -> Result<(), String> {
                     let dur = *e - start_epoch;
                     if dur > 0 {
                         total_sec += dur;
-                        day_seen.insert(start_epoch / 86400);
                     }
+                    day_seen.insert(start_epoch / 86400); // count day even if dur == 0 (e.g. just started)
                 }
                 stack.push((*e, a.clone()));
             }
@@ -800,8 +803,8 @@ fn cmd_timeoff(timesheet: &Path) -> Result<(), String> {
                     let dur = *e - start_epoch;
                     if dur > 0 {
                         total_sec += dur;
-                        day_seen.insert(start_epoch / 86400);
                     }
+                    day_seen.insert(start_epoch / 86400);
                 }
             }
         }
@@ -1294,11 +1297,9 @@ Alias for
 .BR stop .
 .TP
 .B timeoff
-Show the stop-work time that would give an average of 8 hours per day worked
-(over every day that has at least one completed session).
-If the last entry is STOP, runs
-.B start
-before the calculation so the average includes work starting now.
+Show the stop-work time that would give an average of 8 hours per day worked.
+Requires only a START entry (work in progress); no completed session on the current day is required.
+If the log is empty or the last entry is STOP, appends a START first so the calculation can run.
 .SH ENVIRONMENT
 .TP
 .B TS_DEBUG
