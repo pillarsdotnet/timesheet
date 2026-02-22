@@ -19,20 +19,21 @@
 //!
 //! | Command    | Description |
 //! |------------|-------------|
-//! | `start`    | Record work start now; optional activity (default: misc/unspecified). |
-//! | `stop`     | Record work stop (optional time); amends previous STOP if work already stopped. |
-//! | `list`     | Report % per activity and hours per weekday; optional file/extension arg. |
-//! | `started`  | Record a past start time; adjusts today's last START or inserts before today's STOP. |
-//! | `timeoff`  | Show stop time for 8 h/day average; starts work if last was STOP. |
 //! | `alias`    | Interactively replace activity text in this week's START entries (regex). |
-//! | `rename`   | Same as `alias`. |
-//! | `install`  | Copy binary to a directory on PATH. |
-//! | `rebuild`  | Build from local dir or clone; then install to current binary's directory. |
-//! | `rotate`   | Rename log to `timesheet.YYMMDD`; add STOP first if last entry is START; append if same-day exists. |
-//! | `interval` | Set or show reminder daemon interval (e.g. 3, 3m, 100s, 1h30m). |
-//! | `restart`, `reminder` | Aliases for `interval`. |
-//! | `manpage`  | Output Unix manual page in groff format to stdout. |
+//! | `autostart` | Register `ts start` on login and `ts stop` on logout/shutdown (macOS/Linux). |
 //! | `help`     | Show the man page in a pager (groff -man -Tascii \| less). |
+//! | `install`  | Copy binary to a directory on PATH. |
+//! | `interval` | Set or show reminder daemon interval (e.g. 3, 3m, 100s, 1h30m). |
+//! | `list`     | Report % per activity and hours per weekday; optional file/extension arg. |
+//! | `manpage`  | Output Unix manual page in groff format to stdout. |
+//! | `rebuild`  | Build from local dir or clone; then install to current binary's directory. |
+//! | `rename`   | Same as `alias`. |
+//! | `restart`, `reminder` | Aliases for `interval`. |
+//! | `rotate`   | Rename log to `timesheet.YYMMDD`; add STOP first if last entry is START; append if same-day exists. |
+//! | `start`    | Record work start now; optional activity (default: misc/unspecified); starts reminder daemon. |
+//! | `started`  | Record a past start time; adjusts today's last START or inserts before today's STOP. |
+//! | `stop`     | Record work stop (optional time); amends previous STOP if work already stopped; stops reminder daemon when a stop is recorded. |
+//! | `timeoff`  | Show stop time for 8 h/day average; starts work if last was STOP. |
 
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 use regex::Regex;
@@ -495,32 +496,37 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
 }
 
 /// Records work stop at the given time (or now if no time given). Same time formats as `ts started`.
-/// If the last entry is already STOP, amends that stop time instead of inserting an intervening START.
+/// If the last entry is already STOP: no stop-time argument → no change; with stop-time → amend that entry.
 fn cmd_stop(args: &[String], timesheet: &Path) -> Result<(), String> {
     maybe_rotate_if_previous_week(timesheet)?;
+    let content = fs::read_to_string(timesheet).unwrap_or_default();
+    let last = content.lines().rev().find(|l| !l.trim().is_empty());
+    if matches!(last, Some(l) if l.starts_with("STOP|")) {
+        let Some(t) = args.first().map(String::as_str) else {
+            return Ok(());
+        };
+        let stop_epoch = parse_start_time(t).ok_or_else(|| format!("ts stop: could not parse stop time: {}", t))?;
+        let lines: Vec<&str> = content.lines().collect();
+        let without_last = if lines.is_empty() {
+            String::new()
+        } else {
+            lines[..lines.len() - 1].join("\n") + "\n"
+        };
+        let new_content = format!("{}STOP|{}\n", without_last, stop_epoch);
+        fs::write(timesheet, &new_content).map_err(|e| e.to_string())?;
+        kill_reminder_daemon_if_running();
+        let stop_dt = Local.timestamp_opt(stop_epoch, 0).single().unwrap_or_else(Local::now);
+        println!("Stopped at {}", stop_dt.format("%a %b %d %H:%M:%S %Z %Y"));
+        return Ok(());
+    }
     let stop_epoch = match args.first().map(String::as_str) {
         Some(t) => parse_start_time(t).ok_or_else(|| format!("ts stop: could not parse stop time: {}", t))?,
         None => Local::now().timestamp(),
     };
-    let content = fs::read_to_string(timesheet).unwrap_or_default();
-    let last = content.lines().rev().find(|l| !l.trim().is_empty());
-    match last {
-        Some(l) if l.starts_with("STOP|") => {
-            let lines: Vec<&str> = content.lines().collect();
-            let without_last = if lines.is_empty() {
-                String::new()
-            } else {
-                lines[..lines.len() - 1].join("\n") + "\n"
-            };
-            let new_content = format!("{}STOP|{}\n", without_last, stop_epoch);
-            fs::write(timesheet, &new_content).map_err(|e| e.to_string())?;
-        }
-        _ => {
-            let line = format!("STOP|{}\n", stop_epoch);
-            let mut f = fs::OpenOptions::new().create(true).append(true).open(timesheet).map_err(|e| e.to_string())?;
-            f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
-        }
-    }
+    let line = format!("STOP|{}\n", stop_epoch);
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(timesheet).map_err(|e| e.to_string())?;
+    f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    kill_reminder_daemon_if_running();
     let stop_dt = Local.timestamp_opt(stop_epoch, 0).single().unwrap_or_else(Local::now);
     println!("Stopped at {}", stop_dt.format("%a %b %d %H:%M:%S %Z %Y"));
     Ok(())
@@ -1064,8 +1070,47 @@ ts \- timesheet CLI (start, stop, list, report by activity and weekday)
 .I command
 .RI [ args... ]
 .PP
+.B ts alias
+.I pattern
+.I replacement
+.PP
+.B ts autostart
+.RI [ uninstall ]
+.PP
+.B ts help
+.PP
+.B ts install
+.RI [ install_dir " [" repo_path ]]
+.PP
+.B ts interval
+.RI [ duration ]
+.PP
+.B ts list
+.RI [ file_or_extension ]
+.PP
+.B ts manpage
+.PP
+.B ts rebuild
+.RI [ directory ]
+.PP
+.B ts rename
+.I pattern
+.I replacement
+.PP
+.B ts reminder
+.RI [ duration ]
+.PP
+.B ts restart
+.RI [ duration ]
+.PP
+.B ts rotate
+.PP
 .B ts start
 .RI [ activity ]
+.PP
+.B ts started
+.I start_time
+.RI [ activity... ]
 .PP
 .B ts stop
 .RI [ stop_time ]
@@ -1073,43 +1118,7 @@ ts \- timesheet CLI (start, stop, list, report by activity and weekday)
 .B ts stopped
 .RI [ stop_time ]
 .PP
-.B ts list
-.RI [ file_or_extension ]
-.PP
-.B ts started
-.I start_time
-.RI [ activity... ]
-.PP
 .B ts timeoff
-.PP
-.B ts alias
-.I pattern
-.I replacement
-.PP
-.B ts rename
-.I pattern
-.I replacement
-.PP
-.B ts install
-.RI [ install_dir " [" repo_path ]]
-.PP
-.B ts rebuild
-.RI [ directory ]
-.PP
-.B ts rotate
-.PP
-.B ts interval
-.RI [ duration ]
-.PP
-.B ts restart
-.RI [ duration ]
-.PP
-.B ts reminder
-.RI [ duration ]
-.PP
-.B ts manpage
-.PP
-.B ts help
 .SH DESCRIPTION
 .B ts
 tracks work start/stop and reports time by activity and by day of week.
@@ -1131,57 +1140,6 @@ Start/stop pairs are matched in LIFO order (each STOP pairs with the most recent
 The report uses these pairs to compute duration and attribute time to activity and weekday.
 .SH COMMANDS
 .TP
-.B start
-Record work start
-.IR now .
-Optional
-.I activity
-(default: misc/unspecified). Appends a START line; does not modify existing entries.
-.TP
-.B stop
-Record work stop at
-.IR now
-or at optional
-.I stop_time
-(same formats as
-.BR started ).
-If the last entry is already STOP, amends that stop time to the new time instead of appending.
-If the last entry is START, appends the new STOP (normal pairing).
-.TP
-.B stopped
-Alias for
-.BR stop .
-.TP
-.B list
-Plaintext report: percentage of time per activity (high to low), and hours per day of week (Sun\-Sat).
-If work is in progress (last entry is START), uses a virtual STOP at current time for the report
-and shows current task, start time, and duration.
-Optional
-.I file_or_extension
-selects an alternate log path or extension filter.
-.TP
-.B started
-Record a work start at a
-.IR "past time" .
-.I start_time
-accepts GNU
-.B date \-d
-style, or
-.B YYYY\-MM\-DD\ HH:MM[:SS],
-or
-.B HH:MM
-(today).
-If the last entry is START recorded today, replaces that START with the new time and activity.
-If the last entry is STOP recorded today and start time < stop time, inserts the new START before that STOP.
-Otherwise appends the new START; only adjusts entries made on the current day.
-.TP
-.B timeoff
-Show the stop-work time that would give an average of 8 hours per day worked
-(over every day that has at least one completed session).
-If the last entry is STOP, runs
-.B start
-before the calculation so the average includes work starting now.
-.TP
 .B alias
 Interactively replace activity text in START entries from the current week.
 .I pattern
@@ -1195,9 +1153,19 @@ or
 .B Y
 applies the replacement. Errors if no matches this week.
 .TP
-.B rename
-Same as
-.BR alias .
+.B autostart
+Register
+.B "ts start"
+to run at login and
+.B "ts stop"
+to run at logout or system shutdown. On macOS uses LaunchAgents; on Linux uses systemd user services. With
+.I uninstall
+removes the registration.
+.TP
+.B help
+Run the equivalent of
+.B "ts manpage | groff \-man \-Tascii | less"
+to show this manual page in the system pager.
 .TP
 .B install
 Copy the binary to a directory on
@@ -1212,6 +1180,33 @@ is given, installs there (directory created if needed).
 Optional
 .I repo_path
 is the directory containing the binary (default: current executable's directory).
+.TP
+.B interval
+Set or show the time between reminder daemon prompts. With no argument, print the current interval. With one argument, set the interval and restart the daemon.
+.I duration
+accepts: a bare number (treated as minutes, e.g.
+.BR 3 " or " 3m ),
+seconds (e.g.
+.BR 100s ),
+or combined (e.g.
+.BR 1h30m ).
+.B restart
+and
+.B reminder
+are aliases for
+.BR interval .
+.TP
+.B list
+Plaintext report: percentage of time per activity (high to low), and hours per day of week (Sun\-Sat).
+If work is in progress (last entry is START), uses a virtual STOP at current time for the report
+and shows current task, start time, and duration.
+Optional
+.I file_or_extension
+selects an alternate log path or extension filter.
+.TP
+.B manpage
+Write this manual page in groff format to stdout. Example:
+.B "ts manpage | groff \-man \-Tascii | less"
 .TP
 .B rebuild
 Build from source and install into the directory of the currently running binary.
@@ -1237,6 +1232,18 @@ clones
 .B https://github.com/pillarsdotnet/timesheet
 and builds from the clone.
 .TP
+.B rename
+Same as
+.BR alias .
+.TP
+.B reminder
+Alias for
+.BR interval .
+.TP
+.B restart
+Alias for
+.BR interval .
+.TP
 .B rotate
 If the last entry is START (work in progress), appends a STOP at current time first.
 Rename the timesheet log to
@@ -1244,37 +1251,54 @@ Rename the timesheet log to
 using the timestamp of the log's most recent entry (START or STOP).
 Errors if the log is missing or has no valid entries.
 .TP
-.B interval
-Set or show the time between reminder daemon prompts. With no argument, print the current interval. With one argument, set the interval and restart the daemon.
-.I duration
-accepts: a bare number (treated as minutes, e.g.
-.BR 3 " or " 3m ),
-seconds (e.g.
-.BR 100s ),
-or combined (e.g.
-.BR 1h30m ).
-.B restart
-and
-.B reminder
-are aliases for
-.BR interval .
+.B start
+Record work start
+.IR now .
+Optional
+.I activity
+(default: misc/unspecified). Appends a START line; does not modify existing entries.
+Also starts the reminder daemon if not already running.
 .TP
-.B restart
+.B started
+Record a work start at a
+.IR "past time" .
+.I start_time
+accepts GNU
+.B date \-d
+style, or
+.B YYYY\-MM\-DD\ HH:MM[:SS],
+or
+.B HH:MM
+(today).
+If the last entry is START recorded today, replaces that START with the new time and activity.
+If the last entry is STOP recorded today and start time < stop time, inserts the new START before that STOP.
+Otherwise appends the new START; only adjusts entries made on the current day.
+.TP
+.B stop
+Record work stop at
+.IR now
+or at optional
+.I stop_time
+(same formats as
+.BR started ).
+If the last entry is already STOP and no
+.I stop_time
+is given, nothing happens. If
+.I stop_time
+is given, the last STOP entry is amended to that time.
+If the last entry is START, appends the new STOP (normal pairing).
+When a stop is recorded (append or amend), also stops the reminder daemon.
+.TP
+.B stopped
 Alias for
-.BR interval .
+.BR stop .
 .TP
-.B reminder
-Alias for
-.BR interval .
-.TP
-.B manpage
-Write this manual page in groff format to stdout. Example:
-.B "ts manpage | groff \-man \-Tascii | less"
-.TP
-.B help
-Run the equivalent of
-.B "ts manpage | groff \-man \-Tascii | less"
-to show this manual page in the system pager.
+.B timeoff
+Show the stop-work time that would give an average of 8 hours per day worked
+(over every day that has at least one completed session).
+If the last entry is STOP, runs
+.B start
+before the calculation so the average includes work starting now.
 .SH ENVIRONMENT
 .TP
 .B TS_DEBUG
@@ -1353,6 +1377,221 @@ fn cmd_help() -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     let _ = child.wait();
+    Ok(())
+}
+
+/// Register "ts start" on login and "ts stop" on logout/shutdown (macOS: launchd; Linux: systemd user). Use "ts autostart uninstall" to remove.
+fn cmd_autostart(args: &[String]) -> Result<(), String> {
+    let uninstall = args.first().map(String::as_str) == Some("uninstall");
+    #[cfg(target_os = "macos")]
+    {
+        if uninstall {
+            do_autostart_uninstall_macos()
+        } else {
+            do_autostart_install_macos()
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if uninstall {
+            do_autostart_uninstall_linux()
+        } else {
+            do_autostart_install_linux()
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = uninstall;
+        Err("ts autostart: not supported on this platform (macOS and Linux only).".to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn do_autostart_install_macos() -> Result<(), String> {
+    let exe = env::current_exe().map_err(|e| e.to_string())?;
+    let exe_path = exe.to_string_lossy();
+    let home = env::var_os("HOME").ok_or("ts autostart: HOME not set")?;
+    let agents = PathBuf::from(&home).join("Library/LaunchAgents");
+    let support = PathBuf::from(&home).join("Library/Application Support/ts");
+    fs::create_dir_all(&support).map_err(|e| format!("ts autostart: cannot create {}: {}", support.display(), e))?;
+
+    let script_path = support.join("autostart-session.sh");
+    let script = format!(
+        r#"#!/bin/sh
+trap 'exec "{}" stop' TERM
+while true; do sleep 3600; done
+"#,
+        exe_path.replace('"', "\\\"")
+    );
+    fs::write(&script_path, script).map_err(|e| format!("ts autostart: cannot write script: {}", e))?;
+    #[allow(clippy::disallowed_methods)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&script_path).map_err(|e| e.to_string())?.permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&script_path, perms).map_err(|e| e.to_string())?;
+    }
+
+    let start_plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ts.autostart.start</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+        <string>start</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+"#,
+        exe_path.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    );
+    let session_plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ts.autostart.session</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+    </array>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
+"#,
+        script_path.to_string_lossy().replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    );
+
+    fs::create_dir_all(&agents).map_err(|e| format!("ts autostart: cannot create {}: {}", agents.display(), e))?;
+    let start_plist_path = agents.join("com.ts.autostart.start.plist");
+    let session_plist_path = agents.join("com.ts.autostart.session.plist");
+    fs::write(&start_plist_path, &start_plist).map_err(|e| format!("ts autostart: cannot write plist: {}", e))?;
+    fs::write(&session_plist_path, &session_plist).map_err(|e| format!("ts autostart: cannot write plist: {}", e))?;
+
+    let _ = Command::new("launchctl").arg("unload").arg(&start_plist_path).output();
+    let _ = Command::new("launchctl").arg("unload").arg(&session_plist_path).output();
+    if !Command::new("launchctl").arg("load").arg(&start_plist_path).status().map_err(|e| e.to_string())?.success() {
+        return Err("ts autostart: launchctl load start plist failed".to_string());
+    }
+    if !Command::new("launchctl").arg("load").arg(&session_plist_path).status().map_err(|e| e.to_string())?.success() {
+        return Err("ts autostart: launchctl load session plist failed".to_string());
+    }
+    println!("Autostart installed: \"ts start\" runs at login, \"ts stop\" runs at logout/shutdown.");
+    println!("  Start: {}  Session (stop on exit): {}", start_plist_path.display(), session_plist_path.display());
+    println!("  To remove: ts autostart uninstall");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn do_autostart_uninstall_macos() -> Result<(), String> {
+    let home = env::var_os("HOME").ok_or("ts autostart: HOME not set")?;
+    let agents = PathBuf::from(&home).join("Library/LaunchAgents");
+    let start_plist_path = agents.join("com.ts.autostart.start.plist");
+    let session_plist_path = agents.join("com.ts.autostart.session.plist");
+    let support = PathBuf::from(&home).join("Library/Application Support/ts");
+    let script_path = support.join("autostart-session.sh");
+
+    let _ = Command::new("launchctl").arg("unload").arg(&start_plist_path).output();
+    let _ = Command::new("launchctl").arg("unload").arg(&session_plist_path).output();
+    let _ = fs::remove_file(&start_plist_path);
+    let _ = fs::remove_file(&session_plist_path);
+    let _ = fs::remove_file(&script_path);
+    println!("Autostart uninstalled.");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn do_autostart_install_linux() -> Result<(), String> {
+    let exe = env::current_exe().map_err(|e| e.to_string())?;
+    let exe_path = exe.to_string_lossy();
+    let config = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env::var_os("HOME").ok_or("ts autostart: HOME not set")?).join(".config"));
+    let user_units = config.join("systemd/user");
+    fs::create_dir_all(&user_units).map_err(|e| format!("ts autostart: cannot create {}: {}", user_units.display(), e))?;
+
+    let start_unit = format!(
+        r#"[Unit]
+Description=ts start on login
+[Service]
+Type=oneshot
+ExecStart={} start
+[Install]
+WantedBy=default.target
+"#,
+        exe_path
+    );
+    let session_unit = format!(
+        r#"[Unit]
+Description=ts stop on logout
+[Service]
+Type=simple
+ExecStart=/bin/sleep infinity
+ExecStop={} stop
+[Install]
+WantedBy=default.target
+"#,
+        exe_path
+    );
+
+    let start_path = user_units.join("ts-autostart-start.service");
+    let session_path = user_units.join("ts-autostart-session.service");
+    fs::write(&start_path, &start_unit).map_err(|e| format!("ts autostart: cannot write unit: {}", e))?;
+    fs::write(&session_path, &session_unit).map_err(|e| format!("ts autostart: cannot write unit: {}", e))?;
+
+    if !Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status()
+        .map_err(|e| e.to_string())?
+        .success()
+    {
+        return Err("ts autostart: systemctl daemon-reload failed".to_string());
+    }
+    if !Command::new("systemctl")
+        .args(["--user", "enable", "--now", "ts-autostart-start.service"])
+        .status()
+        .map_err(|e| e.to_string())?
+        .success()
+    {
+        return Err("ts autostart: systemctl enable start service failed".to_string());
+    }
+    if !Command::new("systemctl")
+        .args(["--user", "enable", "--now", "ts-autostart-session.service"])
+        .status()
+        .map_err(|e| e.to_string())?
+        .success()
+    {
+        return Err("ts autostart: systemctl enable session service failed".to_string());
+    }
+    println!("Autostart installed: \"ts start\" runs at login, \"ts stop\" runs at logout/shutdown.");
+    println!("  Units: {}  {}", start_path.display(), session_path.display());
+    println!("  To remove: ts autostart uninstall");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn do_autostart_uninstall_linux() -> Result<(), String> {
+    let home = env::var_os("HOME").ok_or("ts autostart: HOME not set")?;
+    let config = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&home));
+    let user_units = config.join("systemd/user");
+    let start_path = user_units.join("ts-autostart-start.service");
+    let session_path = user_units.join("ts-autostart-session.service");
+
+    let _ = Command::new("systemctl").args(["--user", "disable", "--now", "ts-autostart-start.service"]).output();
+    let _ = Command::new("systemctl").args(["--user", "disable", "--now", "ts-autostart-session.service"]).output();
+    let _ = fs::remove_file(&start_path);
+    let _ = fs::remove_file(&session_path);
+    println!("Autostart uninstalled.");
     Ok(())
 }
 
@@ -2018,6 +2257,7 @@ fn main() {
         Some("rotate") => do_rotate(&timesheet),
         Some("interval") => cmd_interval(&rest, &timesheet),
         Some("restart") | Some("reminder") => cmd_interval(&rest, &timesheet),
+        Some("autostart") => cmd_autostart(&rest),
         Some("manpage") => cmd_manpage(),
         Some("help") => cmd_help(),
         Some(_) => cmd_help(),
@@ -2359,6 +2599,48 @@ mod tests {
         assert_eq!(lines.len(), 2, "expected START and STOP lines, got: {:?}", lines);
         assert!(lines[0].starts_with("START|"));
         assert!(lines[1].starts_with("STOP|"));
+    }
+
+    #[test]
+    fn test_cmd_stop_no_op_when_last_is_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        let now = chrono::Local::now().timestamp();
+        let week_start = week_start_epoch(now);
+        fs::write(
+            &ts,
+            format!("START|{}|coding\nSTOP|{}\n", week_start + 3600, week_start + 7200),
+        )
+        .unwrap();
+        let before = fs::read_to_string(&ts).unwrap();
+        let result = cmd_stop(&[], &ts);
+        assert!(result.is_ok());
+        let after = fs::read_to_string(&ts).unwrap();
+        assert_eq!(before, after, "ts stop should not change file when last entry is STOP and no time given");
+    }
+
+    #[test]
+    fn test_cmd_stop_amends_last_stop_when_time_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        let now = chrono::Local::now().timestamp();
+        let week_start = week_start_epoch(now);
+        let old_stop = week_start + 7200;
+        fs::write(
+            &ts,
+            format!("START|{}|coding\nSTOP|{}\n", week_start + 3600, old_stop),
+        )
+        .unwrap();
+        let new_time = "2026-02-20 15:00";
+        let result = cmd_stop(&[new_time.to_string()], &ts);
+        assert!(result.is_ok());
+        let content = fs::read_to_string(&ts).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].starts_with("STOP|"));
+        let new_epoch: i64 = lines[1].strip_prefix("STOP|").unwrap().parse().unwrap();
+        let expected = parse_start_time(new_time).unwrap();
+        assert_eq!(new_epoch, expected, "last STOP should be amended to the given time");
     }
 
     #[test]
