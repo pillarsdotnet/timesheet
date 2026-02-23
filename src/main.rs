@@ -974,6 +974,20 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
             .arg("-")
             .arg(&dest_file)
             .output();
+        // Copy icon so the reminder dialog shows the timesheet icon in the dock.
+        let icon_src = [
+            script_dir.join("assets").join("icon.svg"),
+            script_dir.join("..").join("assets").join("icon.svg"),
+            script_dir.join("..").join("..").join("assets").join("icon.svg"),
+        ]
+        .into_iter()
+        .find(|p| p.exists());
+        if let Some(src) = icon_src {
+            let dest_icon = dest.join("ts-icon.svg");
+            if fs::copy(&src, &dest_icon).is_ok() {
+                println!("Installed icon {}", dest_icon.display());
+            }
+        }
     }
     println!("Installed {}", dest_file.display());
     println!("Done. ts is in {} and executable.", dest.display());

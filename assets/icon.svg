@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="paper" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#f8f6f3"/>
+      <stop offset="100%" style="stop-color:#ebe8e2"/>
+    </linearGradient>
+    <linearGradient id="header" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#2c5282"/>
+      <stop offset="100%" style="stop-color:#1a365d"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-opacity="0.15"/>
+    </filter>
+  </defs>
+  <!-- Paper / timesheet -->
+  <rect x="112" y="80" width="800" height="864" rx="24" ry="24" fill="url(#paper)" stroke="#c4beb5" stroke-width="2" filter="url(#shadow)"/>
+  <!-- Header row (like "Time | Activity") -->
+  <rect x="144" y="128" width="736" height="72" rx="8" ry="8" fill="url(#header)"/>
+  <rect x="144" y="200" width="736" height="4" fill="transparent"/>
+  <!-- Horizontal lines (timesheet rows) -->
+  <line x1="176" y1="268" x2="848" y2="268" stroke="#9ca3af" stroke-width="2" stroke-linecap="round"/>
+  <line x1="176" y1="348" x2="848" y2="348" stroke="#9ca3af" stroke-width="2" stroke-linecap="round"/>
+  <line x1="176" y1="428" x2="848" y2="428" stroke="#9ca3af" stroke-width="2" stroke-linecap="round"/>
+  <line x1="176" y1="508" x2="848" y2="508" stroke="#9ca3af" stroke-width="2" stroke-linecap="round"/>
+  <line x1="176" y1="588" x2="848" y2="588" stroke="#9ca3af" stroke-width="2" stroke-linecap="round"/>
+  <line x1="176" y1="668" x2="848" y2="668" stroke="#9ca3af" stroke-width="2" stroke-linecap="round"/>
+  <line x1="176" y1="748" x2="848" y2="748" stroke="#9ca3af" stroke-width="2" stroke-linecap="round"/>
+  <line x1="176" y1="828" x2="848" y2="828" stroke="#9ca3af" stroke-width="2" stroke-linecap="round"/>
+  <!-- Left margin (vertical rule) -->
+  <line x1="320" y1="268" x2="320" y2="828" stroke="#d1d5db" stroke-width="1" stroke-dasharray="4 4"/>
+  <line x1="520" y1="268" x2="520" y2="828" stroke="#d1d5db" stroke-width="1" stroke-dasharray="4 4"/>
+  <!-- Small "ts" or clock hint in header -->
+  <text x="512" y="178" font-family="system-ui, -apple-system, sans-serif" font-size="36" font-weight="600" fill="white" text-anchor="middle">ts</text>
+</svg>
