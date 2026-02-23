@@ -29,7 +29,7 @@ pub fn run_native_reminder_dialog(choices: Vec<String>) -> Option<String> {
     DIALOG_RESULT.with(|r| *r.borrow_mut() = None);
 
     let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Prohibited);
     app.activate();
 
     let allocated = ReminderDialogDelegate::alloc(mtm);
@@ -61,6 +61,11 @@ define_class!(
                 return;
             }
 
+            // Regular: visible in dock and Cmd-Tab so the user can reach the dialog.
+            let app = NSApplication::sharedApplication(mtm);
+            app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+            app.activate();
+
             let alert = NSAlert::new(mtm);
             alert.setMessageText(&NSString::from_str("What are you working on?"));
             // One button per choice (NSAlert supports any number of buttons).
@@ -75,7 +80,8 @@ define_class!(
                 DIALOG_RESULT.with(|r| *r.borrow_mut() = Some(selected));
             }
 
-            let app = NSApplication::sharedApplication(mtm);
+            // Prohibited: hide from dock and Cmd-Tab again before exiting.
+            app.setActivationPolicy(NSApplicationActivationPolicy::Prohibited);
             let _: () = unsafe { msg_send![&app, stop: None::<&AnyObject>] };
         }
     }
