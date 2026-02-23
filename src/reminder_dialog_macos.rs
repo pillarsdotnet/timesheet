@@ -64,7 +64,9 @@ define_class!(
             // Regular: visible in dock and Cmd-Tab so the user can reach the dialog.
             let app = NSApplication::sharedApplication(mtm);
             app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
-            app.activate();
+            // Force to front (deprecated on macOS 14+ but still helps on earlier versions).
+            #[allow(deprecated)]
+            app.activateIgnoringOtherApps(true);
 
             let alert = NSAlert::new(mtm);
             alert.setMessageText(&NSString::from_str("What are you working on?"));
@@ -72,6 +74,10 @@ define_class!(
             for choice in choices.iter() {
                 alert.addButtonWithTitle(&NSString::from_str(choice));
             }
+
+            // Force the alert window on top of other apps.
+            let alert_window = alert.window();
+            alert_window.orderFrontRegardless();
 
             let response: NSModalResponse = unsafe { msg_send![&alert, runModal] };
             let idx = response as isize - NSALERT_FIRST_BUTTON_RETURN as isize;
