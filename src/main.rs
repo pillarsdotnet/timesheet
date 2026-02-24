@@ -45,7 +45,7 @@ use std::process::{self, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 #[cfg(unix)]
-use libc::{kill, signal, SIG_IGN, SIGHUP, SIGKILL, SIGTERM};
+use libc::{kill, setpgid, signal, SIG_IGN, SIGHUP, SIGKILL, SIGTERM};
 #[cfg(target_os = "macos")]
 use libc::getuid;
 
@@ -1175,7 +1175,7 @@ Register
 .B "ts start"
 to run at login and
 .B "ts stop"
-to run at logout or system shutdown. On macOS uses LaunchAgents; on Linux uses systemd user services. With
+to run at logout or system shutdown. On macOS uses LaunchAgents and a logout hook (so STOP is recorded on logout/shutdown); if the logout hook cannot be set (sudo required), the command to run manually is printed. On Linux uses systemd user services. With
 .I uninstall
 removes the registration.
 .TP
@@ -1331,6 +1331,15 @@ or
 .B $HOME/.cache/ts-reminder-interval
 Reminder interval in seconds (decimal). Used by the reminder daemon; set via
 .BR "ts interval" .
+.TP
+.B "$HOME/Library/Application Support/ts/" (macOS)
+Autostart scripts: session script (stop on TERM), logout hook script (stop on logout/shutdown). The logout hook is registered with
+.BR "defaults write com.apple.loginwindow LogoutHook" ;
+if
+.B ts\ autostart
+cannot set it, run the printed
+.B sudo
+command once.
 .SH "SEE ALSO"
 Full documentation and install instructions: see
 .BR INSTALL.md
@@ -1447,6 +1456,38 @@ while true; do sleep 3600; done
         fs::set_permissions(&script_path, perms).map_err(|e| e.to_string())?;
     }
 
+    // LogoutHook runs as root on logout/shutdown; run ts stop as the console user so STOP is recorded.
+    let logout_hook_path = support.join("logout-hook.sh");
+    let exe_escaped = exe_path.replace('\\', "\\\\").replace('"', "\\\"");
+    let logout_script = format!(
+        r#"#!/bin/sh
+user=$(stat -f '%Su' /dev/console 2>/dev/null)
+[ -z "$user" ] && exit 0
+exec su - "$user" -c 'exec "$1" stop' _ "{}"
+"#,
+        exe_escaped
+    );
+    fs::write(&logout_hook_path, logout_script).map_err(|e| format!("ts autostart: cannot write logout hook: {}", e))?;
+    #[allow(clippy::disallowed_methods)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&logout_hook_path).map_err(|e| e.to_string())?.permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&logout_hook_path, perms).map_err(|e| e.to_string())?;
+    }
+    match Command::new("sudo")
+        .args(["defaults", "write", "com.apple.loginwindow", "LogoutHook", logout_hook_path.to_string_lossy().as_ref()])
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        _ => {
+            println!(
+                "  Logout hook not set (sudo required). To record STOP on logout/shutdown, run:\n  sudo defaults write com.apple.loginwindow LogoutHook \"{}\"",
+                logout_hook_path.display()
+            );
+        }
+    }
+
     let start_plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1500,7 +1541,7 @@ while true; do sleep 3600; done
         return Err("ts autostart: launchctl load session plist failed".to_string());
     }
     println!("Autostart installed: \"ts start\" runs at login, \"ts stop\" runs at logout/shutdown.");
-    println!("  Start: {}  Session (stop on exit): {}", start_plist_path.display(), session_plist_path.display());
+    println!("  Start: {}  Session (stop on exit): {}  LogoutHook: {}", start_plist_path.display(), session_plist_path.display(), logout_hook_path.display());
     println!("  To remove: ts autostart uninstall");
     Ok(())
 }
@@ -1513,12 +1554,17 @@ fn do_autostart_uninstall_macos() -> Result<(), String> {
     let session_plist_path = agents.join("com.ts.autostart.session.plist");
     let support = PathBuf::from(&home).join("Library/Application Support/ts");
     let script_path = support.join("autostart-session.sh");
+    let logout_hook_path = support.join("logout-hook.sh");
 
     let _ = Command::new("launchctl").arg("unload").arg(&start_plist_path).output();
     let _ = Command::new("launchctl").arg("unload").arg(&session_plist_path).output();
+    let _ = Command::new("sudo")
+        .args(["defaults", "delete", "com.apple.loginwindow", "LogoutHook"])
+        .output();
     let _ = fs::remove_file(&start_plist_path);
     let _ = fs::remove_file(&session_plist_path);
     let _ = fs::remove_file(&script_path);
+    let _ = fs::remove_file(&logout_hook_path);
     println!("Autostart uninstalled.");
     Ok(())
 }
@@ -1761,9 +1807,9 @@ fn start_reminder_daemon_if_needed(_timesheet: &Path) {
 fn cmd_interval(args: &[String], timesheet: &Path) -> Result<(), String> {
     if args.is_empty() {
         let secs = get_reminder_interval_secs();
-        if secs % 3600 == 0 && secs >= 3600 {
+        if secs >= 3600 && secs.is_multiple_of(3600) {
             println!("{}h", secs / 3600);
-        } else if secs % 60 == 0 && secs >= 60 {
+        } else if secs >= 60 && secs.is_multiple_of(60) {
             println!("{}m", secs / 60);
         } else {
             println!("{}s", secs);
@@ -1796,7 +1842,11 @@ fn cmd_interval(args: &[String], timesheet: &Path) -> Result<(), String> {
 /// Run the reminder daemon loop: sleep for configured interval, show "What are you working on?" prompt, handle response or timeout.
 fn run_reminder_daemon(timesheet: &Path) {
     #[cfg(unix)]
-    let _ = unsafe { signal(SIGHUP, SIG_IGN) };
+    {
+        let _ = unsafe { signal(SIGHUP, SIG_IGN) };
+        // Detach from launchd job so we survive when the "ts start" RunAtLoad job exits (launchd kills child processes when the job's main process exits).
+        let _ = unsafe { setpgid(0, 0) };
+    }
     let pid_path = reminder_pid_path();
     if let Some(parent) = pid_path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -2085,24 +2135,21 @@ fn show_reminder_prompt_macos_systemui(choices: &[String]) -> ReminderResult {
         .stderr(stderr_mode)
         .spawn()
     {
-        match wait_with_timeout(child, timeout_dur) {
-            WaitOutcome::Finished(Some(stdout)) => {
-                let s = String::from_utf8_lossy(&stdout).trim().to_string();
-                for part in s.split(',') {
-                    let part = part.trim();
-                    if let Some(rest) = part.strip_prefix("button returned:") {
-                        let btn = rest.trim().trim_matches('"');
-                        if btn == "Don't Bug Me" {
-                            return ReminderResult::DontBugMe;
-                        }
-                        if btn == "Enter new activity..." {
-                            break;
-                        }
-                        return ReminderResult::Activity(btn.to_string());
+        if let WaitOutcome::Finished(Some(stdout)) = wait_with_timeout(child, timeout_dur) {
+            let s = String::from_utf8_lossy(&stdout).trim().to_string();
+            for part in s.split(',') {
+                let part = part.trim();
+                if let Some(rest) = part.strip_prefix("button returned:") {
+                    let btn = rest.trim().trim_matches('"');
+                    if btn == "Don't Bug Me" {
+                        return ReminderResult::DontBugMe;
                     }
+                    if btn == "Enter new activity..." {
+                        break;
+                    }
+                    return ReminderResult::Activity(btn.to_string());
                 }
             }
-            _ => {}
         }
     }
 
@@ -2159,30 +2206,27 @@ fn show_reminder_prompt_macos_systemui(choices: &[String]) -> ReminderResult {
         Ok(c) => c,
         Err(_) => return ReminderResult::Timeout,
     };
-    match wait_with_timeout(child, timeout_dur) {
-        WaitOutcome::Finished(Some(stdout)) => {
-            let s = String::from_utf8_lossy(&stdout).trim().to_string();
-            let mut activity_from_text: Option<String> = None;
-            for part in s.split(',') {
-                let part = part.trim();
-                if let Some(rest) = part.strip_prefix("button returned:") {
-                    let btn = rest.trim().trim_matches('"');
-                    if btn == "Don't Bug Me" {
-                        return ReminderResult::DontBugMe;
-                    }
-                }
-                if let Some(rest) = part.strip_prefix("text returned:") {
-                    let activity = rest.trim().trim_matches('"').trim();
-                    if !activity.is_empty() {
-                        activity_from_text = Some(activity.to_string());
-                    }
+    if let WaitOutcome::Finished(Some(stdout)) = wait_with_timeout(child, timeout_dur) {
+        let s = String::from_utf8_lossy(&stdout).trim().to_string();
+        let mut activity_from_text: Option<String> = None;
+        for part in s.split(',') {
+            let part = part.trim();
+            if let Some(rest) = part.strip_prefix("button returned:") {
+                let btn = rest.trim().trim_matches('"');
+                if btn == "Don't Bug Me" {
+                    return ReminderResult::DontBugMe;
                 }
             }
-            if let Some(activity) = activity_from_text {
-                return ReminderResult::Activity(activity);
+            if let Some(rest) = part.strip_prefix("text returned:") {
+                let activity = rest.trim().trim_matches('"').trim();
+                if !activity.is_empty() {
+                    activity_from_text = Some(activity.to_string());
+                }
             }
         }
-        _ => {}
+        if let Some(activity) = activity_from_text {
+            return ReminderResult::Activity(activity);
+        }
     }
     ReminderResult::Timeout
 }
@@ -2203,10 +2247,10 @@ fn wait_with_timeout(mut child: process::Child, timeout: Duration) -> WaitOutcom
     loop {
         match child.try_wait() {
             Ok(Some(_)) => {
-                let stdout = child.stdout.take().and_then(|mut s| {
+                let stdout = child.stdout.take().map(|mut s| {
                     let mut v = Vec::new();
                     let _ = io::copy(&mut s, &mut v);
-                    Some(v)
+                    v
                 });
                 return WaitOutcome::Finished(stdout);
             }
