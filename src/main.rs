@@ -1251,7 +1251,7 @@ to run at login and
 .B "ts stop"
 to run at logout or system shutdown. Optional
 .I interval
-(e.g.\ \&5s, 3m) sets the reminder interval and starts the daemon in this session. On macOS uses LaunchAgents and a logout hook (so STOP is recorded on logout/shutdown); if the logout hook cannot be set (sudo required), the command to run manually is printed; once registered, later runs skip the prompt. On Linux uses systemd user services. With
+(e.g.\ \&5s, 3m) sets the reminder interval and starts the daemon in this session; if the daemon is already running, it is restarted so the new interval takes effect immediately. On macOS uses LaunchAgents and a logout hook (so STOP is recorded on logout/shutdown); if the logout hook cannot be set (sudo required), the command to run manually is printed; once registered, later runs skip the prompt. On Linux uses systemd user services. With
 .I uninstall
 removes the registration.
 .TP
@@ -1502,6 +1502,8 @@ fn cmd_autostart(args: &[String]) -> Result<(), String> {
                 if let Err(e) = fs::write(&path, secs.to_string()) {
                     eprintln!("ts autostart: could not set interval: {}", e);
                 } else {
+                    kill_reminder_daemon_if_running();
+                    thread::sleep(Duration::from_millis(100));
                     start_reminder_daemon_if_needed(&timesheet_path());
                 }
             }
@@ -1575,30 +1577,42 @@ exec su - "$user" -c 'exec "$1" stop' _ "{}"
         perms.set_mode(0o700);
         fs::set_permissions(&logout_hook_path, perms).map_err(|e| e.to_string())?;
     }
-    // Skip sudo prompt if we already registered (marker file), or if defaults read succeeds and path matches.
-    // Reading com.apple.loginwindow often requires root, so we rely on the marker after first successful register.
+    // Skip sudo prompt if we already registered (marker file), or if defaults read shows our path.
+    // Reading com.apple.loginwindow often requires root; try without sudo first, then with sudo when marker is missing.
     let marker_path = support.join("logout-hook-registered");
-    let hook_already_set = marker_path.exists()
-        || Command::new("defaults")
+    let ours = logout_hook_path.to_string_lossy().trim().to_string();
+    let canonical_ours = fs::canonicalize(&logout_hook_path)
+        .ok()
+        .and_then(|p| p.into_os_string().into_string().ok())
+        .unwrap_or_default();
+    let path_matches = |current: &str| {
+        current == ours.as_str() || (!canonical_ours.is_empty() && current == canonical_ours)
+    };
+    let mut hook_already_set = marker_path.exists();
+    if !hook_already_set {
+        let read_out = Command::new("defaults")
             .args(["read", "com.apple.loginwindow", "LogoutHook"])
             .output()
-            .ok()
-            .and_then(|o| {
+            .ok();
+        if let Some(o) = read_out {
+            if o.status.success() {
+                let current = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                hook_already_set = path_matches(&current);
+            }
+        }
+        if !hook_already_set {
+            let sudo_out = Command::new("sudo")
+                .args(["defaults", "read", "com.apple.loginwindow", "LogoutHook"])
+                .output()
+                .ok();
+            if let Some(o) = sudo_out {
                 if o.status.success() {
                     let current = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    let ours = logout_hook_path.to_string_lossy().trim().to_string();
-                    let canonical_ours = fs::canonicalize(&logout_hook_path)
-                        .ok()
-                        .and_then(|p| p.into_os_string().into_string().ok())
-                        .unwrap_or_default();
-                    Some(current == ours || (!canonical_ours.is_empty() && current == canonical_ours))
-                } else {
-                    None
+                    hook_already_set = path_matches(&current);
                 }
-            })
-            .unwrap_or(false);
-
-    // If we detected the hook via defaults read but the marker is missing, create it so we skip the prompt next time.
+            }
+        }
+    }
     if hook_already_set && !marker_path.exists() {
         let _ = fs::write(&marker_path, "");
     }
