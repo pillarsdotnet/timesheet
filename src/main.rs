@@ -31,9 +31,9 @@
 //! | `rename`   | Same as `alias`. |
 //! | `restart`, `reminder` | Aliases for `interval`. |
 //! | `rotate`   | Rename log to `timesheet.YYMMDD`; add STOP first if last entry is START; append if same-day exists. |
-//! | `start`    | Record work start now; optional activity (default: misc/unspecified); starts reminder daemon. |
+//! | `start`    | Record work start now; on macOS with no activity, shows reminder dialog to pick/enter; otherwise optional activity (default: misc/unspecified); starts reminder daemon. |
 //! | `started`  | Record a past start time; adjusts today's last START or inserts before today's STOP. |
-//! | `stop`     | Record work stop (optional time); amends previous STOP if work already stopped; stops reminder daemon when a stop is recorded. |
+//! | `stop`     | Record work stop (optional time); amends previous STOP if work already stopped; stops reminder daemon and shows "stopped" dialog when a stop is recorded (skipped during logout/shutdown). |
 //! | `timeoff`  | Show stop time for 8 h/day average; only requires a START entry (adds one if log empty or last is STOP). |
 //! | `uninstall` | Stop daemon, remove autostart hooks, optionally remove log files, remove binary and icon. |
 
@@ -484,10 +484,23 @@ fn resolve_list_input(arg: Option<&str>, timesheet: &Path) -> Result<PathBuf, St
     Err(format!("ts list: no timesheet matches \"{}\".", list_arg))
 }
 
-/// Records work start now; activity is optional (default: misc/unspecified).
+/// Records work start now; activity is optional. With no argument on macOS, shows the reminder dialog to pick/enter an activity.
+/// On other platforms or if the user declines, falls back to misc/unspecified.
 fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
     maybe_rotate_if_previous_week(timesheet)?;
     let activity = if args.is_empty() {
+        #[cfg(all(target_os = "macos", not(test)))]
+        {
+            let activities = activities_this_week_most_recent_first(timesheet);
+            match show_reminder_prompt(&activities) {
+                ReminderResult::Activity(a) => a,
+                ReminderResult::DontBugMe | ReminderResult::Timeout | ReminderResult::ShowAgain => {
+                    return Ok(());
+                }
+                ReminderResult::EnterNew => unreachable!("show_reminder_prompt converts EnterNew to Activity, ShowAgain, or Timeout"),
+            }
+        }
+        #[cfg(any(not(target_os = "macos"), test))]
         "misc/unspecified".to_string()
     } else {
         args.join(" ")
@@ -520,6 +533,9 @@ fn cmd_stop(args: &[String], timesheet: &Path) -> Result<(), String> {
         };
         let new_content = format!("{}STOP|{}\n", without_last, stop_epoch);
         fs::write(timesheet, &new_content).map_err(|e| e.to_string())?;
+        if is_reminder_daemon_running() {
+            show_reminders_stopped_notification();
+        }
         kill_reminder_daemon_if_running();
         let stop_dt = Local.timestamp_opt(stop_epoch, 0).single().unwrap_or_else(Local::now);
         println!("Stopped at {}", stop_dt.format("%a %b %d %H:%M:%S %Z %Y"));
@@ -532,6 +548,9 @@ fn cmd_stop(args: &[String], timesheet: &Path) -> Result<(), String> {
     let line = format!("STOP|{}\n", stop_epoch);
     let mut f = fs::OpenOptions::new().create(true).append(true).open(timesheet).map_err(|e| e.to_string())?;
     f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    if is_reminder_daemon_running() {
+        show_reminders_stopped_notification();
+    }
     kill_reminder_daemon_if_running();
     let stop_dt = Local.timestamp_opt(stop_epoch, 0).single().unwrap_or_else(Local::now);
     println!("Stopped at {}", stop_dt.format("%a %b %d %H:%M:%S %Z %Y"));
@@ -628,6 +647,24 @@ fn cmd_tail(tail_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
     }
     let last_ten: Vec<&LogLine> = dedup.iter().rev().take(10).rev().collect();
     let now = Local::now().timestamp();
+    let mut max_duration_width = 0usize;
+    for (i, ll) in last_ten.iter().enumerate() {
+        if let LogLine::Start(epoch, _) = ll {
+            let end = last_ten.get(i + 1).and_then(|n| match n {
+                LogLine::Stop(e) => Some(*e),
+                LogLine::Start(_, _) => None,
+            }).unwrap_or(now);
+            let secs = end - *epoch;
+            let duration_fmt = if secs >= 3600 {
+                format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+            } else if secs >= 60 {
+                format!("{}m", secs / 60)
+            } else {
+                format!("{}s", secs)
+            };
+            max_duration_width = max_duration_width.max(duration_fmt.len());
+        }
+    }
     for (i, ll) in last_ten.iter().enumerate() {
         match ll {
             LogLine::Start(epoch, activity) => {
@@ -644,9 +681,7 @@ fn cmd_tail(tail_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
                 } else {
                     format!("{}s", secs)
                 };
-                let in_progress = end == now && last_ten.get(i + 1).map(|n| matches!(n, LogLine::Start(_, _))).unwrap_or(true);
-                let duration_suffix = if in_progress { " (in progress)" } else { "" };
-                println!("START  {}  {}  {}{}", dt.format("%Y-%m-%d %H:%M:%S"), duration_fmt, activity, duration_suffix);
+                println!("START  {}  {:>width$}  {}", dt.format("%Y-%m-%d %H:%M:%S"), duration_fmt, activity, width = max_duration_width);
             }
             LogLine::Stop(epoch) => {
                 let dt = Local.timestamp_opt(*epoch, 0).single().unwrap_or_else(Local::now);
@@ -1072,6 +1107,9 @@ fn cmd_uninstall(args: &[String]) -> Result<(), String> {
 
     println!("Uninstalling ts from {} ...", install_dir.display());
 
+    if is_reminder_daemon_running() {
+        show_reminders_stopped_notification();
+    }
     kill_reminder_daemon_if_running();
 
     uninstall_autostart_hooks()?;
@@ -1318,6 +1356,9 @@ to run at logout or system shutdown. Optional
 (e.g.\ \&5s, 3m) sets the reminder interval and starts the daemon in this session; if the daemon is already running, it is restarted so the new interval takes effect immediately. On macOS uses LaunchAgents and a logout hook (so STOP is recorded on logout/shutdown); if the logout hook cannot be set (sudo required), the command to run manually is printed; once registered, later runs skip the prompt. On Linux uses systemd user services. With
 .I uninstall
 removes the registration.
+Without
+.I interval
+: starts the daemon if not running and prints the current reminder interval.
 .TP
 .B help
 Run the equivalent of
@@ -1374,7 +1415,7 @@ selects an alternate log path or extension filter.
 .TP
 .B tail
 Output the latest ten log entries; timestamps are shown in local time.
-START lines include a duration (until the next STOP, or \"in progress\" if none).
+START lines include a duration (until the next STOP, or current time if none).
 Consecutive START entries with the same activity are collapsed (last timestamp kept), then the last 10 entries are shown.
 Optional
 .I file_or_extension
@@ -1431,7 +1472,10 @@ Errors if the log is missing or has no valid entries.
 .B start
 Record work start
 .IR now .
-Optional
+On macOS with no
+.IR activity ,
+shows the reminder dialog to pick or enter an activity.
+Otherwise optional
 .I activity
 (default: misc/unspecified). Appends a START line; does not modify existing entries.
 Also starts the reminder daemon if not already running.
@@ -1464,7 +1508,9 @@ is given, nothing happens. If
 .I stop_time
 is given, the last STOP entry is amended to that time.
 If the last entry is START, appends the new STOP (normal pairing).
-When a stop is recorded (append or amend), also stops the reminder daemon.
+When a stop is recorded (append or amend), stops the reminder daemon and shows a dialog that reminders have been stopped (skipped when
+.B TS_LOGOUT
+is set, e.g.\ during logout/shutdown).
 .TP
 .B stopped
 Alias for
@@ -1481,6 +1527,11 @@ If set (any value), log debug messages to stderr for
 .B restart
 and reminder daemon start/kill (e.g.
 .BR "TS_DEBUG=1 ts restart" ).
+.TP
+.B TS_LOGOUT
+If set (any value), suppresses the "reminders stopped" dialog when
+.B ts\ stop
+is invoked (used by autostart scripts during logout/shutdown).
 .SH FILES
 .B $HOME/Documents/timesheet.log
 Default timesheet log (path is compile-time in
@@ -1569,16 +1620,33 @@ fn cmd_help() -> Result<(), String> {
 fn cmd_autostart(args: &[String]) -> Result<(), String> {
     let uninstall = args.first().map(String::as_str) == Some("uninstall");
     if !uninstall {
-        if let Some(interval_arg) = args.first() {
+        let interval_set = if let Some(interval_arg) = args.first() {
             if let Ok(secs) = parse_interval_duration(interval_arg) {
                 let path = reminder_interval_path();
                 if let Err(e) = fs::write(&path, secs.to_string()) {
                     eprintln!("ts autostart: could not set interval: {}", e);
+                    false
                 } else {
                     kill_reminder_daemon_if_running();
                     thread::sleep(Duration::from_millis(100));
                     start_reminder_daemon_if_needed(&timesheet_path());
+                    true
                 }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !interval_set {
+            start_reminder_daemon_if_needed(&timesheet_path());
+            let secs = get_reminder_interval_secs();
+            if secs >= 3600 && secs % 3600 == 0 {
+                println!("Reminder interval: {}h", secs / 3600);
+            } else if secs >= 60 && secs % 60 == 0 {
+                println!("Reminder interval: {}m", secs / 60);
+            } else {
+                println!("Reminder interval: {}s", secs);
             }
         }
     }
@@ -1617,7 +1685,7 @@ fn do_autostart_install_macos() -> Result<(), String> {
     let script_path = support.join("autostart-session.sh");
     let script = format!(
         r#"#!/bin/sh
-trap 'exec "{}" stop' TERM
+trap 'TS_LOGOUT=1 exec "{}" stop' TERM
 while true; do sleep 3600; done
 "#,
         exe_path.replace('"', "\\\"")
@@ -1638,7 +1706,7 @@ while true; do sleep 3600; done
         r#"#!/bin/sh
 user=$(stat -f '%Su' /dev/console 2>/dev/null)
 [ -z "$user" ] && exit 0
-exec su - "$user" -c 'exec "$1" stop' _ "{}"
+exec su - "$user" -c 'TS_LOGOUT=1 exec "$1" stop' _ "{}"
 "#,
         exe_escaped
     );
@@ -1828,6 +1896,7 @@ WantedBy=default.target
 Description=ts stop on logout
 [Service]
 Type=simple
+Environment=TS_LOGOUT=1
 ExecStart=/bin/sleep infinity
 ExecStop={} stop
 [Install]
@@ -1930,6 +1999,55 @@ fn signal_pid(pid: u32, sig: i32) {
     #[cfg(not(unix))]
     {
         let _ = (pid, sig);
+    }
+}
+
+/// Returns true if the reminder daemon is running (PID file exists, PID is alive, and not self). No-op on non-Unix.
+fn is_reminder_daemon_running() -> bool {
+    #[cfg(not(unix))]
+    return false;
+
+    #[cfg(unix)]
+    {
+        let pid_path = reminder_pid_path();
+        if let Ok(data) = fs::read_to_string(&pid_path) {
+            if let Ok(pid) = data.trim().parse::<u32>() {
+                if pid != process::id() && is_pid_running(pid) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Show a dialog/notification that timesheet reminders have been stopped. Spawns and does not block.
+/// No-op if TS_LOGOUT is set (logout/shutdown); skips on non-macOS/Linux.
+fn show_reminders_stopped_notification() {
+    if env::var_os("TS_LOGOUT").is_some() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let script = "display dialog \"Timesheet reminders have been stopped.\" with title \"Timesheet\" buttons {\"OK\"} default button 1";
+        let _ = macos_run_in_user_session("/usr/bin/osascript", &["-e", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = Command::new("notify-send")
+            .args(["--app-name=Timesheet", "Timesheet reminders have been stopped."])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = ();
     }
 }
 
@@ -2100,13 +2218,17 @@ fn run_reminder_daemon(timesheet: &Path) {
 
         let activities = activities_this_week_most_recent_first(timesheet);
         match show_reminder_prompt(&activities) {
-            ReminderResult::DontBugMe => break,
+            ReminderResult::DontBugMe => {
+                show_reminders_stopped_notification();
+                break;
+            }
             ReminderResult::Activity(activity) => {
                 let _ = append_start_entry(timesheet, &activity);
             }
             ReminderResult::EnterNew => unreachable!("show_reminder_prompt converts EnterNew to Activity, ShowAgain, or Timeout"),
             ReminderResult::ShowAgain => {} // text dialog cancelled/failed; show reminder again after interval
             ReminderResult::Timeout => {
+                show_reminders_stopped_notification();
                 let _ = cmd_stop(&[], timesheet);
                 break;
             }
