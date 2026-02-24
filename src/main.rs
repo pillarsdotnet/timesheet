@@ -2320,7 +2320,7 @@ fn macos_run_in_user_session(exe: &str, exe_args: &[&str]) -> Command {
 #[cfg(target_os = "macos")]
 fn show_reminder_prompt_macos(activities: &[String]) -> ReminderResult {
     let mut choices = vec!["Don't Bug Me".to_string()];
-    for a in activities {
+    for a in activities.iter().rev() {
         if !a.is_empty() && !choices.contains(a) {
             choices.push(a.clone());
         }
@@ -2455,7 +2455,7 @@ fn show_reminder_prompt_macos(activities: &[String]) -> ReminderResult {
 }
 
 /// Buttons-only dialog via SystemUIServer (one click = done; works from daemon).
-/// AppleScript display dialog allows at most 3 buttons, so we show: Don't Bug Me | most recent activity | Enter new activity...
+/// AppleScript display dialog allows at most 3 buttons, so we show: Don't Bug Me | first activity (least-recent) | Enter new activity...
 #[cfg(target_os = "macos")]
 fn show_reminder_prompt_macos_systemui(choices: &[String]) -> ReminderResult {
     let stderr_mode = if env::var_os("TS_DEBUG").is_some() {
@@ -2465,7 +2465,7 @@ fn show_reminder_prompt_macos_systemui(choices: &[String]) -> ReminderResult {
     };
     let timeout_dur = Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS);
 
-    // AppleScript display dialog allows max 3 buttons. Build exactly 3: Don't Bug Me, (optional) top activity, Enter new activity...
+    // AppleScript display dialog allows max 3 buttons. Build exactly 3: Don't Bug Me, (optional) first activity, Enter new activity...
     let three_buttons: Vec<&str> = {
         let mut b = Vec::with_capacity(3);
         b.push("Don't Bug Me");
