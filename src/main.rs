@@ -1559,18 +1559,28 @@ exec su - "$user" -c 'exec "$1" stop' _ "{}"
         perms.set_mode(0o700);
         fs::set_permissions(&logout_hook_path, perms).map_err(|e| e.to_string())?;
     }
-    let hook_already_set = Command::new("defaults")
-        .args(["read", "com.apple.loginwindow", "LogoutHook"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).trim() == logout_hook_path.to_string_lossy().trim())
-            } else {
-                None
-            }
-        })
-        .unwrap_or(false);
+    // Skip sudo prompt if we already registered (marker file), or if defaults read succeeds and path matches.
+    // Reading com.apple.loginwindow often requires root, so we rely on the marker after first successful register.
+    let marker_path = support.join("logout-hook-registered");
+    let hook_already_set = marker_path.exists()
+        || Command::new("defaults")
+            .args(["read", "com.apple.loginwindow", "LogoutHook"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    let current = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    let ours = logout_hook_path.to_string_lossy().trim().to_string();
+                    let canonical_ours = fs::canonicalize(&logout_hook_path)
+                        .ok()
+                        .and_then(|p| p.into_os_string().into_string().ok())
+                        .unwrap_or_default();
+                    Some(current == ours || (!canonical_ours.is_empty() && current == canonical_ours))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(false);
 
     if !hook_already_set {
         let logout_cmd = format!(
@@ -1594,6 +1604,7 @@ exec su - "$user" -c 'exec "$1" stop' _ "{}"
                 {
                     return Err("ts autostart: logout hook command failed (sudo may have been cancelled).".to_string());
                 }
+                let _ = fs::write(&marker_path, "");
                 println!("  Logout hook registered.");
             }
         }
@@ -1676,6 +1687,7 @@ fn do_autostart_uninstall_macos() -> Result<(), String> {
     let _ = fs::remove_file(&session_plist_path);
     let _ = fs::remove_file(&script_path);
     let _ = fs::remove_file(&logout_hook_path);
+    let _ = fs::remove_file(support.join("logout-hook-registered"));
     println!("Autostart uninstalled.");
     Ok(())
 }
