@@ -25,6 +25,7 @@
 //! | `install`  | Copy binary and icon to a directory on PATH (icon embedded on macOS). |
 //! | `interval` | Set or show reminder daemon interval (e.g. 3, 3m, 100s, 1h30m). |
 //! | `list`     | Report % per activity and hours per weekday; optional file/extension arg. |
+//! | `tail`     | Last 10 log entries with timestamps in local time; optional file/extension arg. |
 //! | `manpage`  | Output Unix manual page in groff format to stdout. |
 //! | `rebuild`  | Build from local dir or clone; then install to current binary's directory. |
 //! | `rename`   | Same as `alias`. |
@@ -594,6 +595,66 @@ fn process_log_for_report(lines: &[(usize, LogLine)], virtual_stop: Option<i64>)
     by_act.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let dow_hr: Vec<f64> = dow_sec.iter().map(|s| s / 3600.0).collect();
     (by_act, dow_hr, work_in_progress)
+}
+
+/// Outputs the latest ten log entries with epoch timestamps converted to local time. Optional arg selects file (same as list).
+/// Consecutive START entries with the same activity are collapsed (last timestamp kept); then the last 10 entries are shown.
+fn cmd_tail(tail_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
+    let path = resolve_list_input(tail_arg, timesheet)?;
+    if !path.exists() {
+        println!("No timesheet data found.");
+        return Ok(());
+    }
+    let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let entries: Vec<LogLine> = content
+        .lines()
+        .filter_map(|line| parse_line(line))
+        .collect();
+    let mut dedup: Vec<LogLine> = Vec::new();
+    for ll in &entries {
+        match ll {
+            LogLine::Start(epoch, activity) => {
+                if let Some(LogLine::Start(_, prev_act)) = dedup.last() {
+                    if prev_act == activity {
+                        dedup.pop();
+                    }
+                }
+                dedup.push(LogLine::Start(*epoch, activity.clone()));
+            }
+            LogLine::Stop(epoch) => {
+                dedup.push(LogLine::Stop(*epoch));
+            }
+        }
+    }
+    let last_ten: Vec<&LogLine> = dedup.iter().rev().take(10).rev().collect();
+    let now = Local::now().timestamp();
+    for (i, ll) in last_ten.iter().enumerate() {
+        match ll {
+            LogLine::Start(epoch, activity) => {
+                let dt = Local.timestamp_opt(*epoch, 0).single().unwrap_or_else(Local::now);
+                let end = last_ten.get(i + 1).and_then(|n| match n {
+                    LogLine::Stop(e) => Some(*e),
+                    LogLine::Start(_, _) => None,
+                }).unwrap_or(now);
+                let secs = end - *epoch;
+                let duration_fmt = if secs >= 3600 {
+                    format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+                } else if secs >= 60 {
+                    format!("{}m", secs / 60)
+                } else {
+                    format!("{}s", secs)
+                };
+                let in_progress = end == now && last_ten.get(i + 1).map(|n| matches!(n, LogLine::Start(_, _))).unwrap_or(true);
+                let duration_suffix = if in_progress { " (in progress)" } else { "" };
+                println!("START  {}  {}  {}{}", dt.format("%Y-%m-%d %H:%M:%S"), duration_fmt, activity, duration_suffix);
+            }
+            LogLine::Stop(epoch) => {
+                let dt = Local.timestamp_opt(*epoch, 0).single().unwrap_or_else(Local::now);
+                println!("STOP   {}", dt.format("%Y-%m-%d %H:%M:%S"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Prints report: % per activity and hours per weekday; optional arg selects file (e.g. `log`, `0220`, path).
@@ -1178,6 +1239,9 @@ ts \- timesheet CLI (start, stop, list, report by activity and weekday)
 .B ts list
 .RI [ file_or_extension ]
 .PP
+.B ts tail
+.RI [ file_or_extension ]
+.PP
 .B ts manpage
 .PP
 .B ts rebuild
@@ -1307,6 +1371,15 @@ and shows current task, start time, and duration.
 Optional
 .I file_or_extension
 selects an alternate log path or extension filter.
+.TP
+.B tail
+Output the latest ten log entries; timestamps are shown in local time.
+START lines include a duration (until the next STOP, or \"in progress\" if none).
+Consecutive START entries with the same activity are collapsed (last timestamp kept), then the last 10 entries are shown.
+Optional
+.I file_or_extension
+selects an alternate log path or extension (same as
+.BR list ).
 .TP
 .B manpage
 Write this manual page in groff format to stdout. Example:
@@ -2467,6 +2540,7 @@ fn main() {
         Some("stop") => cmd_stop(&rest, &timesheet),
         Some("stopped") => cmd_stop(&rest, &timesheet),
         Some("list") => cmd_list(rest.first().map(String::as_str), &timesheet),
+        Some("tail") => cmd_tail(rest.first().map(String::as_str), &timesheet),
         Some("started") => cmd_started(&rest, &timesheet),
         Some("timeoff") => cmd_timeoff(&timesheet),
         Some("alias") => cmd_workalias(&rest, &timesheet),
