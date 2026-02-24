@@ -1244,11 +1244,14 @@ or
 applies the replacement. Errors if no matches this week.
 .TP
 .B autostart
+[\fIinterval\fR]
 Register
 .B "ts start"
 to run at login and
 .B "ts stop"
-to run at logout or system shutdown. On macOS uses LaunchAgents and a logout hook (so STOP is recorded on logout/shutdown); if the logout hook cannot be set (sudo required), the command to run manually is printed. On Linux uses systemd user services. With
+to run at logout or system shutdown. Optional
+.I interval
+(e.g.\ \&5s, 3m) sets the reminder interval and starts the daemon in this session. On macOS uses LaunchAgents and a logout hook (so STOP is recorded on logout/shutdown); if the logout hook cannot be set (sudo required), the command to run manually is printed; once registered, later runs skip the prompt. On Linux uses systemd user services. With
 .I uninstall
 removes the registration.
 .TP
@@ -1489,8 +1492,21 @@ fn cmd_help() -> Result<(), String> {
 }
 
 /// Register "ts start" on login and "ts stop" on logout/shutdown (macOS: launchd; Linux: systemd user). Use "ts autostart uninstall" to remove.
+/// Optional first argument: interval (e.g. 5s, 3m) to set reminder interval and start the daemon in this session so the reminder appears soon.
 fn cmd_autostart(args: &[String]) -> Result<(), String> {
     let uninstall = args.first().map(String::as_str) == Some("uninstall");
+    if !uninstall {
+        if let Some(interval_arg) = args.first() {
+            if let Ok(secs) = parse_interval_duration(interval_arg) {
+                let path = reminder_interval_path();
+                if let Err(e) = fs::write(&path, secs.to_string()) {
+                    eprintln!("ts autostart: could not set interval: {}", e);
+                } else {
+                    start_reminder_daemon_if_needed(&timesheet_path());
+                }
+            }
+        }
+    }
     #[cfg(target_os = "macos")]
     {
         if uninstall {
@@ -1582,6 +1598,11 @@ exec su - "$user" -c 'exec "$1" stop' _ "{}"
             })
             .unwrap_or(false);
 
+    // If we detected the hook via defaults read but the marker is missing, create it so we skip the prompt next time.
+    if hook_already_set && !marker_path.exists() {
+        let _ = fs::write(&marker_path, "");
+    }
+
     if !hook_already_set {
         let logout_cmd = format!(
             "sudo defaults write com.apple.loginwindow LogoutHook \"{}\"",
@@ -1604,7 +1625,9 @@ exec su - "$user" -c 'exec "$1" stop' _ "{}"
                 {
                     return Err("ts autostart: logout hook command failed (sudo may have been cancelled).".to_string());
                 }
-                let _ = fs::write(&marker_path, "");
+                if fs::write(&marker_path, "").is_err() {
+                    eprintln!("  Warning: could not save registration state; you may be prompted again next time.");
+                }
                 println!("  Logout hook registered.");
             }
         }
