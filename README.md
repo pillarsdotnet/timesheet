@@ -42,32 +42,32 @@ The **`ts`** command takes a required subcommand as its first argument. Full doc
 
 Subcommands (alphabetical):
 
-| Subcommand   | Description |
-|-------------|-------------|
-| `alias`     | Interactively replace activity text in START entries from the current week (regex pattern and replacement). |
-| `autostart` | Register `ts start` on login and `ts stop` on logout/shutdown (macOS: LaunchAgents; Linux: systemd user). Use `ts autostart uninstall` to remove. |
-| `help`      | Show the manual page in a pager (groff -man -Tascii \| less). |
-| `install`   | Copy the binary to a directory on PATH. Optional: `ts install [install_dir] [repo_path]`. |
-| `interval`  | Set or show the reminder daemon interval (e.g. `3`, `3m`, `100s`, `1h30m`). With an argument, sets the interval and restarts the daemon. |
-| `list`      | Plaintext report: % time per activity, hours per day of week; optional file/extension or date (e.g. `ts list 2/19` or `ts list 260220`) to select a log. If work in progress, shows current task and duration. |
-| `manpage`   | Output the Unix manual page in groff format to stdout. |
-| `rebuild`   | Build from source and install into the directory of the running binary. Optional directory argument; see `ts help`. |
-| `rename`    | Same as `alias`. |
-| `reminder`  | Alias for `interval`. |
-| `restart`   | Alias for `interval` (with no argument, reports current interval and restarts the daemon). |
-| `rotate`    | Rename `timesheet.log` to `timesheet.YYMMDD` using the most recent entry's date; if last entry is START, appends a STOP first. If a file for that date already exists, appends to it. |
-| `start`     | Record work start **now**. Optional activity (default: misc/unspecified). Starts the reminder daemon if not already running. |
-| `started`   | Record a work start at a **past time**. Args: `ts started <start_time> [activity...]`. Time formats: e.g. `YYYY-MM-DD HH:MM`, `HH:MM`, or GNU date -d style. |
+| Subcommand  | Description                                                                                                                                                                                                                                                                           |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `alias`     | Interactively replace activity text in START entries from the current week (regex pattern and replacement).                                                                                                                                                                           |
+| `autostart` | Register `ts start` on login and `ts stop` on logout/shutdown (macOS: LaunchAgents + logout hook; Linux: systemd user). Use `ts autostart uninstall` to remove.                                                                                                                       |
+| `help`      | Show the manual page in a pager (groff -man -Tascii \| less).                                                                                                                                                                                                                         |
+| `install`   | Copy the binary to a directory on PATH. Optional: `ts install [install_dir] [repo_path]`.                                                                                                                                                                                             |
+| `interval`  | Set or show the reminder daemon interval (e.g. `3`, `3m`, `100s`, `1h30m`). With an argument, sets the interval and restarts the daemon.                                                                                                                                              |
+| `list`      | Plaintext report: % time per activity, hours per day of week; optional file/extension or date (e.g. `ts list 2/19` or `ts list 260220`) to select a log. If work in progress, shows current task and duration.                                                                        |
+| `manpage`   | Output the Unix manual page in groff format to stdout.                                                                                                                                                                                                                                |
+| `rebuild`   | Build from source and install into the directory of the running binary. Optional directory argument; see `ts help`.                                                                                                                                                                   |
+| `rename`    | Same as `alias`.                                                                                                                                                                                                                                                                      |
+| `reminder`  | Alias for `interval`.                                                                                                                                                                                                                                                                 |
+| `restart`   | Alias for `interval` (with no argument, reports current interval and restarts the daemon).                                                                                                                                                                                            |
+| `rotate`    | Rename `timesheet.log` to `timesheet.YYMMDD` using the most recent entry's date; if last entry is START, appends a STOP first. If a file for that date already exists, appends to it.                                                                                                 |
+| `start`     | Record work start **now**. Optional activity (default: misc/unspecified). Starts the reminder daemon if not already running.                                                                                                                                                          |
+| `started`   | Record a work start at a **past time**. Args: `ts started <start_time> [activity...]`. Time formats: e.g. `YYYY-MM-DD HH:MM`, `HH:MM`, or GNU date -d style.                                                                                                                          |
 | `stop`      | Record work stop at **now** or at an optional stop time. If the last entry is already STOP and no time is given, nothing happens; if a time is given, the last STOP is amended. If the last entry is START, appends the new STOP. When a stop is recorded, stops the reminder daemon. |
-| `stopped`   | Alias for `stop`. |
-| `timeoff`   | Show the stop-work time for an 8 h/day average. Requires only a START entry (work in progress); no completed session on the current day is required. If the log is empty or the last entry is STOP, appends a START first. |
+| `stopped`   | Alias for `stop`.                                                                                                                                                                                                                                                                     |
+| `timeoff`   | Show the stop-work time for an 8 h/day average. Requires only a START entry (work in progress); no completed session on the current day is required. If the log is empty or the last entry is STOP, appends a START first.                                                            |
 
 ### Reminder daemon
 
 - **`ts start`** starts the reminder daemon if it is not already running (it prompts “What are you working on?” at the configured interval).
 - **`ts stop`** (when it records a stop) stops the reminder daemon.
 - **`ts interval`** or **`ts restart [duration]`** sets or shows the interval and restarts the daemon.
-- **`ts autostart`** (macOS/Linux) registers `ts start` at login and `ts stop` at logout/shutdown.
+- **`ts autostart`** (macOS/Linux) registers `ts start` at login and `ts stop` at logout/shutdown. On macOS it also installs a **logout hook** so STOP is recorded when you log out or shut down; if the hook cannot be set (sudo required), the command to run manually is printed—run it once to enable STOP on logout/shutdown.
 
 ## Install
 
@@ -95,6 +95,10 @@ cargo build --release
 ```
 
 The binary is produced at `target/release/ts` (or `target/debug/ts` for `cargo build`). See [INSTALL.md](INSTALL.md) for full instructions.
+
+### Commit messages
+
+The CI lint workflow checks commit messages with [commitlint](https://commitlint.js.org/) (Conventional Commits). Use a leading type and optional scope, e.g. `feat(macos): add dock icon` or `fix: record STOP on shutdown`. See `.commitlintrc.yaml` and [Conventional Commits](https://www.conventionalcommits.org/).
 
 ### Documentation
 

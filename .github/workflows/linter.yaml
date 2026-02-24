@@ -29,11 +29,11 @@ jobs:
       - name: Commitlint
         uses: wagoid/commitlint-github-action@v6
         with:
-          configFile: .commitlintrc.json
+          configFile: .commitlintrc.yaml
           failOnWarnings: true
 
       - name: Markdownlint
         run: markdownlint "**/*.md"
 
       - name: Prettier (check)
-        run: prettier --check "**/*.md" "**/*.yaml" "**/*.yml"
+        run: prettier --check "**/*.md" "**/*.yaml"

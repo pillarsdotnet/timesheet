@@ -18,7 +18,7 @@ cd timesheet
 
 ## Build and install
 
-**1. Build the release binary:**
+### 1. Build the release binary
 
 ```sh
 cargo build --release
@@ -26,7 +26,7 @@ cargo build --release
 
 The binary is written to `target/release/ts` (or `target/debug/ts` if you use `cargo build` without `--release`).
 
-**2. Install the binary**
+### 2. Install the binary
 
 **Using the binary's install subcommand** (run from the repo so it can find itself):
 
@@ -44,6 +44,16 @@ chmod +x ~/bin/ts
 ```
 
 Ensure `~/bin` (or your chosen directory) is on your `PATH`.
+
+## Autostart (optional)
+
+To run **`ts start`** at login and **`ts stop`** at logout/shutdown:
+
+```sh
+ts autostart
+```
+
+On macOS this uses LaunchAgents and a logout hook. If the installer prints a `sudo defaults write com.apple.loginwindow LogoutHook ...` command, run it once (it requires your password) so that STOP is recorded when you log out or shut down. To remove: **`ts autostart uninstall`**.
 
 ## Configuration
 

@@ -1,8 +1,6 @@
 //! Native macOS reminder dialog using AppKit NSAlert (supports many buttons; one click = done).
 //! Used when the daemon spawns `ts --reminder-dialog choice1 choice2 ...` via launchctl asuser.
 
-#![cfg(target_os = "macos")]
-
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, AnyThread, MainThreadMarker, MainThreadOnly};
@@ -18,7 +16,7 @@ use std::path::PathBuf;
 const NSALERT_FIRST_BUTTON_RETURN: NSModalResponse = 1000;
 
 thread_local! {
-    static DIALOG_RESULT: RefCell<Option<String>> = RefCell::new(None);
+    static DIALOG_RESULT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 static CHOICES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -111,7 +109,7 @@ define_class!(
             alert_window.orderFrontRegardless();
 
             let response: NSModalResponse = unsafe { msg_send![&alert, runModal] };
-            let idx = response as isize - NSALERT_FIRST_BUTTON_RETURN as isize;
+            let idx = response as isize - NSALERT_FIRST_BUTTON_RETURN;
             if idx >= 0 && (idx as usize) < choices.len() {
                 let selected = choices[idx as usize].clone();
                 DIALOG_RESULT.with(|r| *r.borrow_mut() = Some(selected));
