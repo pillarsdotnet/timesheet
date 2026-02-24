@@ -22,7 +22,7 @@
 //! | `alias`    | Interactively replace activity text in this week's START entries (regex). |
 //! | `autostart` | Register `ts start` on login and `ts stop` on logout/shutdown (macOS/Linux). |
 //! | `help`     | Show the man page in a pager (groff -man -Tascii \| less). |
-//! | `install`  | Copy binary to a directory on PATH. |
+//! | `install`  | Copy binary and icon to a directory on PATH (icon embedded on macOS). |
 //! | `interval` | Set or show reminder daemon interval (e.g. 3, 3m, 100s, 1h30m). |
 //! | `list`     | Report % per activity and hours per weekday; optional file/extension arg. |
 //! | `manpage`  | Output Unix manual page in groff format to stdout. |
@@ -34,6 +34,7 @@
 //! | `started`  | Record a past start time; adjusts today's last START or inserts before today's STOP. |
 //! | `stop`     | Record work stop (optional time); amends previous STOP if work already stopped; stops reminder daemon when a stop is recorded. |
 //! | `timeoff`  | Show stop time for 8 h/day average; only requires a START entry (adds one if log empty or last is STOP). |
+//! | `uninstall` | Stop daemon, remove autostart hooks, optionally remove log files, remove binary and icon. |
 
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 use regex::Regex;
@@ -54,6 +55,10 @@ mod reminder_dialog_macos;
 
 /// Default path segment under `$HOME` for the timesheet log file.
 const DEFAULT_TIMESHEET: &str = "Documents/timesheet.log";
+
+/// Icon for macOS reminder dock; embedded so "ts install" can write it without the repo.
+#[cfg(target_os = "macos")]
+const EMBEDDED_ICON_SVG: &[u8] = include_bytes!("../assets/icon.svg");
 
 /// Weekday names for the list report (Sunday first).
 const DAY_NAMES: [&str; 7] = [
@@ -974,23 +979,89 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
             .arg("-")
             .arg(&dest_file)
             .output();
-        // Copy icon so the reminder dialog shows the timesheet icon in the dock.
-        let icon_src = [
-            script_dir.join("assets").join("icon.svg"),
-            script_dir.join("..").join("assets").join("icon.svg"),
-            script_dir.join("..").join("..").join("assets").join("icon.svg"),
-        ]
-        .into_iter()
-        .find(|p| p.exists());
-        if let Some(src) = icon_src {
-            let dest_icon = dest.join("ts-icon.svg");
-            if fs::copy(&src, &dest_icon).is_ok() {
-                println!("Installed icon {}", dest_icon.display());
-            }
+        // Write embedded icon so reminder dialog shows timesheet icon in dock (works without repo).
+        let dest_icon = dest.join("ts-icon.svg");
+        if fs::write(&dest_icon, EMBEDDED_ICON_SVG).is_ok() {
+            println!("Installed icon {}", dest_icon.display());
         }
     }
     println!("Installed {}", dest_file.display());
     println!("Done. ts is in {} and executable.", dest.display());
+    Ok(())
+}
+
+/// Remove startup/shutdown/login/logout hooks that reference ts. No-op on unsupported platforms.
+fn uninstall_autostart_hooks() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    return do_autostart_uninstall_macos();
+    #[cfg(target_os = "linux")]
+    return do_autostart_uninstall_linux();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = ();
+        Ok(())
+    }
+}
+
+/// Stop reminder daemon, remove autostart hooks, optionally remove log files, then remove ts-icon.svg and the ts binary.
+fn cmd_uninstall(args: &[String]) -> Result<(), String> {
+    let _ = args;
+    let exe = env::current_exe().map_err(|e| e.to_string())?;
+    let install_dir = exe.parent().ok_or("ts uninstall: could not determine install directory")?;
+
+    println!("Uninstalling ts from {} ...", install_dir.display());
+
+    kill_reminder_daemon_if_running();
+
+    uninstall_autostart_hooks()?;
+
+    let default_log = timesheet_path();
+    if let Some(log_dir) = default_log.parent() {
+        let mut log_files: Vec<PathBuf> = Vec::new();
+        if default_log.exists() {
+            log_files.push(default_log.clone());
+        }
+        if log_dir.exists() {
+            if let Ok(entries) = fs::read_dir(log_dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                        if name.starts_with("timesheet.") && name != "timesheet.log" {
+                            log_files.push(p);
+                        }
+                    }
+                }
+            }
+        }
+        if !log_files.is_empty() {
+            println!(
+                "Timesheet log files: {}",
+                log_files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+            );
+            print!("Remove timesheet log files? [y/N] ");
+            let _ = io::stdout().flush();
+            let mut line = String::new();
+            if io::stdin().lock().read_line(&mut line).is_ok() {
+                let answer = line.trim().to_lowercase();
+                if answer == "y" || answer == "yes" {
+                    for f in &log_files {
+                        let _ = fs::remove_file(f);
+                        println!("Removed {}", f.display());
+                    }
+                }
+            }
+        }
+    }
+
+    let icon_path = install_dir.join("ts-icon.svg");
+    if icon_path.exists() {
+        fs::remove_file(&icon_path).map_err(|e| format!("ts uninstall: could not remove icon: {}", e))?;
+        println!("Removed {}", icon_path.display());
+    }
+
+    fs::remove_file(&exe).map_err(|e| format!("ts uninstall: could not remove binary: {}", e))?;
+    println!("Removed {}", exe.display());
+    println!("Uninstall complete.");
     Ok(())
 }
 
@@ -1099,6 +1170,8 @@ ts \- timesheet CLI (start, stop, list, report by activity and weekday)
 .B ts install
 .RI [ install_dir " [" repo_path ]]
 .PP
+.B ts uninstall
+.PP
 .B ts interval
 .RI [ duration ]
 .PP
@@ -1185,7 +1258,9 @@ Run the equivalent of
 to show this manual page in the system pager.
 .TP
 .B install
-Copy the binary to a directory on
+Copy the binary (and on macOS the embedded icon as
+.BR ts-icon.svg )
+to a directory on
 .BR PATH .
 If
 .I install_dir
@@ -1196,7 +1271,16 @@ If
 is given, installs there (directory created if needed).
 Optional
 .I repo_path
-is the directory containing the binary (default: current executable's directory).
+is the directory containing the binary (default: current executable's directory). On macOS the icon is embedded so
+.B ts-icon.svg
+is always written even without the source repository.
+.TP
+.B uninstall
+Stop the reminder daemon, remove startup/shutdown/login/logout hooks (LaunchAgents and LogoutHook on macOS, systemd user units on Linux), prompt to remove timesheet log files (y/N), then remove
+.B ts-icon.svg
+and the
+.B ts
+binary from the directory containing the running executable.
 .TP
 .B interval
 Set or show the time between reminder daemon prompts. With no argument, print the current interval. With one argument, set the interval and restart the daemon.
@@ -1475,16 +1559,28 @@ exec su - "$user" -c 'exec "$1" stop' _ "{}"
         perms.set_mode(0o700);
         fs::set_permissions(&logout_hook_path, perms).map_err(|e| e.to_string())?;
     }
-    match Command::new("sudo")
-        .args(["defaults", "write", "com.apple.loginwindow", "LogoutHook", logout_hook_path.to_string_lossy().as_ref()])
-        .status()
-    {
-        Ok(s) if s.success() => {}
-        _ => {
-            println!(
-                "  Logout hook not set (sudo required). To record STOP on logout/shutdown, run:\n  sudo defaults write com.apple.loginwindow LogoutHook \"{}\"",
-                logout_hook_path.display()
-            );
+    let logout_cmd = format!(
+        "sudo defaults write com.apple.loginwindow LogoutHook \"{}\"",
+        logout_hook_path.display()
+    );
+    println!("  To record STOP on logout/shutdown, register the logout hook.");
+    println!("  This command requires local administrator access (you may be prompted for your password):");
+    println!("  {}", logout_cmd);
+    print!("  Run this command now? [y/N] ");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    if io::stdin().lock().read_line(&mut line).is_ok() {
+        let answer = line.trim().to_lowercase();
+        if answer == "y" || answer == "yes" {
+            if !Command::new("sudo")
+                .args(["defaults", "write", "com.apple.loginwindow", "LogoutHook", logout_hook_path.to_string_lossy().as_ref()])
+                .status()
+                .map_err(|e| e.to_string())?
+                .success()
+            {
+                return Err("ts autostart: logout hook command failed (sudo may have been cancelled).".to_string());
+            }
+            println!("  Logout hook registered.");
         }
     }
 
@@ -2312,6 +2408,7 @@ fn main() {
         Some("alias") => cmd_workalias(&rest, &timesheet),
         Some("rename") => cmd_workalias(&rest, &timesheet),
         Some("install") => cmd_install(&rest),
+        Some("uninstall") => cmd_uninstall(&rest),
         Some("rebuild") => cmd_rebuild(&rest),
         Some("rotate") => do_rotate(&timesheet),
         Some("interval") => cmd_interval(&rest, &timesheet),
