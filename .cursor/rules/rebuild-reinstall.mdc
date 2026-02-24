@@ -1,0 +1,14 @@
+---
+description: What "rebuild and reinstall" means for this project
+globs: "**/*"
+alwaysApply: false
+---
+
+# Rebuild and reinstall
+
+When the user says "rebuild and reinstall" (or equivalent) in this project:
+
+1. Run `cargo build --release`
+2. Run `./target/release/ts install ~/bin`
+
+Install to `~/bin` specifically, not the first writable directory on PATH.
