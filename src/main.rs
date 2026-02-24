@@ -1559,28 +1559,43 @@ exec su - "$user" -c 'exec "$1" stop' _ "{}"
         perms.set_mode(0o700);
         fs::set_permissions(&logout_hook_path, perms).map_err(|e| e.to_string())?;
     }
-    let logout_cmd = format!(
-        "sudo defaults write com.apple.loginwindow LogoutHook \"{}\"",
-        logout_hook_path.display()
-    );
-    println!("  To record STOP on logout/shutdown, register the logout hook.");
-    println!("  This command requires local administrator access (you may be prompted for your password):");
-    println!("  {}", logout_cmd);
-    print!("  Run this command now? [y/N] ");
-    let _ = io::stdout().flush();
-    let mut line = String::new();
-    if io::stdin().lock().read_line(&mut line).is_ok() {
-        let answer = line.trim().to_lowercase();
-        if answer == "y" || answer == "yes" {
-            if !Command::new("sudo")
-                .args(["defaults", "write", "com.apple.loginwindow", "LogoutHook", logout_hook_path.to_string_lossy().as_ref()])
-                .status()
-                .map_err(|e| e.to_string())?
-                .success()
-            {
-                return Err("ts autostart: logout hook command failed (sudo may have been cancelled).".to_string());
+    let hook_already_set = Command::new("defaults")
+        .args(["read", "com.apple.loginwindow", "LogoutHook"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim() == logout_hook_path.to_string_lossy().trim())
+            } else {
+                None
             }
-            println!("  Logout hook registered.");
+        })
+        .unwrap_or(false);
+
+    if !hook_already_set {
+        let logout_cmd = format!(
+            "sudo defaults write com.apple.loginwindow LogoutHook \"{}\"",
+            logout_hook_path.display()
+        );
+        println!("  To record STOP on logout/shutdown, register the logout hook.");
+        println!("  This command requires local administrator access (you may be prompted for your password):");
+        println!("  {}", logout_cmd);
+        print!("  Run this command now? [y/N] ");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        if io::stdin().lock().read_line(&mut line).is_ok() {
+            let answer = line.trim().to_lowercase();
+            if answer == "y" || answer == "yes" {
+                if !Command::new("sudo")
+                    .args(["defaults", "write", "com.apple.loginwindow", "LogoutHook", logout_hook_path.to_string_lossy().as_ref()])
+                    .status()
+                    .map_err(|e| e.to_string())?
+                    .success()
+                {
+                    return Err("ts autostart: logout hook command failed (sudo may have been cancelled).".to_string());
+                }
+                println!("  Logout hook registered.");
+            }
         }
     }
 
