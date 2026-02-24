@@ -2325,11 +2325,6 @@ fn show_reminder_prompt_macos(activities: &[String]) -> ReminderResult {
             choices.push(a.clone());
         }
     }
-    // Limit activity options to one fewer than current to avoid NSAlert switching to horizontal layout.
-    let activity_count = choices.len().saturating_sub(1);
-    if activity_count > 0 && choices.len() > 2 {
-        choices.truncate(activity_count);
-    }
     choices.push("Enter new activity...".to_string());
 
     // Native Rust/AppKit dialog (many buttons, one click). Spawn ts --reminder-dialog in user's GUI session.

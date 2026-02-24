@@ -1,23 +1,27 @@
-//! Native macOS reminder dialog using AppKit NSAlert (supports many buttons; one click = done).
+//! Native macOS reminder dialog using a custom NSPanel with vertical NSStackView of buttons.
 //! Used when the daemon spawns `ts --reminder-dialog choice1 choice2 ...` via launchctl asuser.
+//! Custom panel guarantees vertical layout regardless of choice count (NSAlert switches to horizontal).
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, AnyThread, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSImage,
-    NSModalResponse,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
+    NSButton, NSImage, NSPanel, NSScrollView, NSStackView, NSStackViewDistribution,
+    NSUserInterfaceLayoutOrientation, NSView, NSWindowDelegate, NSWindowStyleMask,
 };
-use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSString};
+use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSString, NSSize};
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-// NSAlert button return codes (first button = 1000, second = 1001, ...)
-const NSALERT_FIRST_BUTTON_RETURN: NSModalResponse = 1000;
+// NSUserInterfaceLayoutOrientationVertical = 1
+const NS_USER_INTERFACE_LAYOUT_ORIENTATION_VERTICAL: NSUserInterfaceLayoutOrientation =
+    NSUserInterfaceLayoutOrientation(1);
 
 thread_local! {
     static DIALOG_RESULT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
+
 
 static CHOICES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 /// Icon path for dock (ts-icon.svg/png next to exe, or assets/icon.svg when running from repo).
@@ -60,6 +64,44 @@ pub fn run_native_reminder_dialog(choices: Vec<String>) -> Option<String> {
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
+    #[name = "TSReminderButtonHandler"]
+    struct TSReminderButtonHandler;
+
+    impl TSReminderButtonHandler {
+        #[unsafe(method(choiceClicked:))]
+        fn choice_clicked(&self, sender: Option<&NSButton>) {
+            if let Some(btn) = sender {
+                let title = btn.title().to_string();
+                DIALOG_RESULT.with(|r| *r.borrow_mut() = Some(title));
+                let app = NSApplication::sharedApplication(MainThreadMarker::new().unwrap());
+                app.stopModal();
+            }
+        }
+    }
+
+    unsafe impl NSObjectProtocol for TSReminderButtonHandler {}
+);
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "TSReminderPanelDelegate"]
+    struct TSReminderPanelDelegate;
+
+    impl TSReminderPanelDelegate {
+        #[unsafe(method(windowWillClose:))]
+        fn window_will_close(&self, _notification: &NSNotification) {
+            NSApplication::sharedApplication(MainThreadMarker::new().unwrap()).stopModal();
+        }
+    }
+
+    unsafe impl NSObjectProtocol for TSReminderPanelDelegate {}
+    unsafe impl NSWindowDelegate for TSReminderPanelDelegate {}
+);
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
     #[name = "ReminderDialogDelegate"]
     struct ReminderDialogDelegate;
 
@@ -93,29 +135,90 @@ define_class!(
                     }
                 }
             }
-            // Force to front (deprecated on macOS 14+ but still helps on earlier versions).
             #[allow(deprecated)]
             app.activateIgnoringOtherApps(true);
 
-            let alert = NSAlert::new(mtm);
-            alert.setMessageText(&NSString::from_str("What are you working on?"));
-            // One button per choice (NSAlert supports any number of buttons).
+            // Create handler for button clicks.
+            let handler_alloc = TSReminderButtonHandler::alloc(mtm);
+            let handler: Retained<TSReminderButtonHandler> = unsafe { msg_send![handler_alloc, init] };
+            let sel_choice_clicked = objc2::sel!(choiceClicked:);
+
+            // Panel: 320x400 content, titled, closable.
+            let content_rect = NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(320.0, 400.0),
+            );
+            let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable;
+            let panel_alloc = NSPanel::alloc(mtm);
+            let panel: Retained<NSPanel> =
+                NSPanel::initWithContentRect_styleMask_backing_defer(
+                    panel_alloc,
+                    content_rect,
+                    style,
+                    NSBackingStoreType::Buffered,
+                    false,
+                );
+            panel.setTitle(&NSString::from_str("What are you working on?"));
+            unsafe { panel.setReleasedWhenClosed(false) };
+            let panel_delegate_alloc = TSReminderPanelDelegate::alloc(mtm);
+            let panel_delegate: Retained<TSReminderPanelDelegate> =
+                unsafe { msg_send![panel_delegate_alloc, init] };
+            panel.setDelegate(Some(ProtocolObject::from_ref(&*panel_delegate)));
+
+            // Content view.
+            let content_frame = NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(320.0, 400.0),
+            );
+            let content_alloc = NSView::alloc(mtm);
+            let content: Retained<NSView> =
+                unsafe { msg_send![content_alloc, initWithFrame: content_frame] };
+            panel.setContentView(Some(&content));
+
+            // Vertical stack for buttons. Height = ~32pt per button (24pt + 8pt spacing).
+            let button_height: f64 = 32.0;
+            let stack_height = (choices.len() as f64 * button_height).max(160.0);
+            let stack_frame = NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(280.0, stack_height),
+            );
+            let stack_alloc = NSStackView::alloc(mtm);
+            let stack: Retained<NSStackView> =
+                unsafe { msg_send![stack_alloc, initWithFrame: stack_frame] };
+            stack.setOrientation(NS_USER_INTERFACE_LAYOUT_ORIENTATION_VERTICAL);
+            stack.setSpacing(8.0);
+            stack.setDistribution(NSStackViewDistribution::FillEqually);
+
             for choice in choices.iter() {
-                alert.addButtonWithTitle(&NSString::from_str(choice));
+                let btn = unsafe {
+                    NSButton::buttonWithTitle_target_action(
+                        &NSString::from_str(choice),
+                        Some(handler.as_ref() as &AnyObject),
+                        Some(sel_choice_clicked),
+                        mtm,
+                    )
+                };
+                stack.addArrangedSubview(&btn);
             }
 
-            // Force the alert window on top of other apps.
-            let alert_window = alert.window();
-            alert_window.orderFrontRegardless();
+            let scroll_frame = NSRect::new(
+                NSPoint::new(20.0, 20.0),
+                NSSize::new(280.0, 360.0),
+            );
+            let scroll_alloc = NSScrollView::alloc(mtm);
+            let scroll: Retained<NSScrollView> =
+                unsafe { msg_send![scroll_alloc, initWithFrame: scroll_frame] };
+            scroll.setDocumentView(Some(&stack));
+            scroll.setHasVerticalScroller(true);
+            scroll.setHasHorizontalScroller(false);
+            scroll.setAutohidesScrollers(true);
+            content.addSubview(&scroll);
+            panel.setContentSize(NSSize::new(320.0, 400.0));
+            panel.center();
+            panel.orderFrontRegardless();
 
-            let response: NSModalResponse = unsafe { msg_send![&alert, runModal] };
-            let idx = response as isize - NSALERT_FIRST_BUTTON_RETURN;
-            if idx >= 0 && (idx as usize) < choices.len() {
-                let selected = choices[idx as usize].clone();
-                DIALOG_RESULT.with(|r| *r.borrow_mut() = Some(selected));
-            }
+            let _ = app.runModalForWindow(&panel);
 
-            // Prohibited: hide from dock and Cmd-Tab again before exiting.
             app.setActivationPolicy(NSApplicationActivationPolicy::Prohibited);
             let _: () = unsafe { msg_send![&app, stop: None::<&AnyObject>] };
         }
