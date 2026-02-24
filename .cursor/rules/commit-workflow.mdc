@@ -1,0 +1,16 @@
+---
+description: Before committing, update docs if changes warrant it, then commit
+alwaysApply: true
+---
+
+# Commit workflow
+
+When the user says "commit these changes" (or equivalent):
+
+1. **Update docs first**  
+   Review the changes (e.g. `git diff`, `git status`). If they add or change behavior, options, or usage, update the relevant docs (e.g. README, manpage in `src/main.rs`, INSTALL.md) so the docs match the code. Only then proceed to commit.
+
+2. **Then commit**  
+   Stage and commit with an appropriate message (e.g. conventional commit format if the project uses it).
+
+Do not commit until docs have been updated when the changes warrant it.
