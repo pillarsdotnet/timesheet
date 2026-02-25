@@ -982,9 +982,8 @@ fn cmd_workalias(args: &[String], timesheet: &Path) -> Result<(), String> {
         let end_epoch = lines_vec
             .get(*line_num)
             .and_then(|l| parse_line(l))
-            .and_then(|ll| match ll {
-                LogLine::Stop(stop_e) => Some(stop_e),
-                _ => None,
+            .map(|ll| match ll {
+                LogLine::Start(e, _) | LogLine::Stop(e) => e,
             })
             .unwrap_or(now);
         let secs = end_epoch - epoch;
