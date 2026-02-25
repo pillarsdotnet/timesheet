@@ -492,12 +492,15 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
         #[cfg(all(target_os = "macos", not(test)))]
         {
             let activities = activities_this_week_most_recent_first(timesheet);
-            match show_reminder_prompt(&activities) {
-                ReminderResult::Activity(a) => a,
-                ReminderResult::DontBugMe | ReminderResult::Timeout | ReminderResult::ShowAgain => {
-                    return Ok(());
+            loop {
+                match show_reminder_prompt(&activities) {
+                    ReminderResult::Activity(a) => break a,
+                    ReminderResult::DontBugMe | ReminderResult::Timeout | ReminderResult::ShowAgain => {
+                        return Ok(());
+                    }
+                    ReminderResult::ShowAgainImmediate => {} // re-show immediately
+                    ReminderResult::EnterNew => unreachable!("show_reminder_prompt converts EnterNew to Activity"),
                 }
-                ReminderResult::EnterNew => unreachable!("show_reminder_prompt converts EnterNew to Activity, ShowAgain, or Timeout"),
             }
         }
         #[cfg(any(not(target_os = "macos"), test))]
@@ -2260,6 +2263,7 @@ fn run_reminder_daemon(timesheet: &Path) {
             }
             ReminderResult::EnterNew => unreachable!("show_reminder_prompt converts EnterNew to Activity, ShowAgain, or Timeout"),
             ReminderResult::ShowAgain => {} // text dialog cancelled/failed; show reminder again after interval
+            ReminderResult::ShowAgainImmediate => {} // dismissed without choice; re-show immediately
             ReminderResult::Timeout => {
                 show_reminders_stopped_notification();
                 let _ = cmd_stop(&[], timesheet);
@@ -2290,6 +2294,8 @@ enum ReminderResult {
     EnterNew,
     /// User didn't complete choice (e.g. cancelled text dialog); show reminder again after interval.
     ShowAgain,
+    /// Dialog dismissed without choice (e.g. process killed); re-show immediately, do not STOP.
+    ShowAgainImmediate,
     Timeout,
 }
 
@@ -2362,8 +2368,16 @@ fn show_reminder_prompt_macos(activities: &[String]) -> ReminderResult {
 
     // Native Rust/AppKit dialog (many buttons, one click). Spawn ts --reminder-dialog in user's GUI session.
     let ts_debug = env::var_os("TS_DEBUG").is_some();
-    let try_native = |use_launchctl: bool| -> Option<ReminderResult> {
-        let exe = env::current_exe().ok()?;
+    enum NativeOutcome {
+        Result(ReminderResult),
+        Dismissed,      // Child ran but returned empty; re-show immediately
+        Unavailable,    // Spawn failed or timeout; fall through to SystemUIServer
+    }
+    let try_native = |use_launchctl: bool| -> NativeOutcome {
+        let exe = match env::current_exe().ok() {
+            Some(e) => e,
+            None => return NativeOutcome::Unavailable,
+        };
         let exe_str = exe.to_string_lossy();
         let mut args = vec!["--reminder-dialog".to_string()];
         args.extend(choices.iter().cloned());
@@ -2375,31 +2389,34 @@ fn show_reminder_prompt_macos(activities: &[String]) -> ReminderResult {
             c.args(&args_ref);
             c
         };
-        let child = cmd
+        let child = match cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(if ts_debug { Stdio::inherit() } else { Stdio::null() })
             .spawn()
-            .ok()?;
+        {
+            Ok(c) => c,
+            Err(_) => return NativeOutcome::Unavailable,
+        };
         let timeout = Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS);
         let stdout = match wait_with_timeout(child, timeout) {
             WaitOutcome::Finished(Some(out)) => out,
-            _ => return None,
+            _ => return NativeOutcome::Unavailable,
         };
         let s = String::from_utf8_lossy(&stdout).trim().to_string();
         if s == "Don't Bug Me" {
-            return Some(ReminderResult::DontBugMe);
+            return NativeOutcome::Result(ReminderResult::DontBugMe);
         }
         if s == "Enter new activity..." {
-            return Some(ReminderResult::EnterNew);
+            return NativeOutcome::Result(ReminderResult::EnterNew);
         }
         if !s.is_empty() && choices.contains(&s) {
-            return Some(ReminderResult::Activity(s));
+            return NativeOutcome::Result(ReminderResult::Activity(s));
         }
-        None
+        NativeOutcome::Dismissed
     };
 
-    if let Some(res) = try_native(true) {
+    let handle_native = |res: ReminderResult| {
         if let ReminderResult::EnterNew = res {
             if let Some(activity) = prompt_enter_activity_macos(ts_debug) {
                 return ReminderResult::Activity(activity);
@@ -2408,17 +2425,16 @@ fn show_reminder_prompt_macos(activities: &[String]) -> ReminderResult {
         } else {
             return res;
         }
+    };
+    match try_native(true) {
+        NativeOutcome::Result(res) => return handle_native(res),
+        NativeOutcome::Dismissed => return ReminderResult::ShowAgainImmediate,
+        NativeOutcome::Unavailable => {}
     }
-    if let Some(res) = try_native(false) {
-        // launchctl path failed; try direct spawn (can work when daemon was started from Terminal)
-        if let ReminderResult::EnterNew = res {
-            if let Some(activity) = prompt_enter_activity_macos(ts_debug) {
-                return ReminderResult::Activity(activity);
-            }
-            return ReminderResult::ShowAgain;
-        } else {
-            return res;
-        }
+    match try_native(false) {
+        NativeOutcome::Result(res) => return handle_native(res),
+        NativeOutcome::Dismissed => return ReminderResult::ShowAgainImmediate,
+        NativeOutcome::Unavailable => {}
     }
     if ts_debug {
         let _ = std::io::stderr().write_fmt(format_args!(
