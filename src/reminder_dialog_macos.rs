@@ -8,7 +8,7 @@ use objc2::{define_class, msg_send, AnyThread, MainThreadMarker, MainThreadOnly}
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
     NSButton, NSImage, NSPanel, NSScrollView, NSStackView, NSStackViewDistribution,
-    NSUserInterfaceLayoutOrientation, NSView, NSWindowDelegate, NSWindowStyleMask,
+    NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSString, NSSize};
 use std::cell::RefCell;
@@ -89,9 +89,17 @@ define_class!(
     struct TSReminderPanelDelegate;
 
     impl TSReminderPanelDelegate {
+        /// Only allow close when user chose a button (DIALOG_RESULT set). Block Escape and close button.
+        #[unsafe(method(windowShouldClose:))]
+        fn window_should_close(&self, _sender: &NSWindow) -> bool {
+            DIALOG_RESULT.with(|r| r.borrow().is_some())
+        }
+        /// If window closes despite windowShouldClose (e.g. app quit), end modal so we can re-show.
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _notification: &NSNotification) {
-            NSApplication::sharedApplication(MainThreadMarker::new().unwrap()).stopModal();
+            if DIALOG_RESULT.with(|r| r.borrow().is_some()) {
+                NSApplication::sharedApplication(MainThreadMarker::new().unwrap()).stopModal();
+            }
         }
     }
 
@@ -148,7 +156,7 @@ define_class!(
                 NSPoint::new(0.0, 0.0),
                 NSSize::new(320.0, 400.0),
             );
-            let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable;
+            let style = NSWindowStyleMask::Titled; // No Closable: only button-clicks dismiss
             let panel_alloc = NSPanel::alloc(mtm);
             let panel: Retained<NSPanel> =
                 NSPanel::initWithContentRect_styleMask_backing_defer(
@@ -217,7 +225,15 @@ define_class!(
             panel.center();
             panel.orderFrontRegardless();
 
-            let _ = app.runModalForWindow(&panel);
+            // Re-show if dismissed without a button choice (e.g. process killed).
+            loop {
+                DIALOG_RESULT.with(|r| *r.borrow_mut() = None);
+                let _ = app.runModalForWindow(&panel);
+                if DIALOG_RESULT.with(|r| r.borrow().is_some()) {
+                    break;
+                }
+                panel.orderFrontRegardless();
+            }
 
             app.setActivationPolicy(NSApplicationActivationPolicy::Prohibited);
             let _: () = unsafe { msg_send![&app, stop: None::<&AnyObject>] };
