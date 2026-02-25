@@ -190,11 +190,12 @@ define_class!(
             panel.setContentView(Some(&content));
 
             // Vertical stack for buttons. Height = ~32pt per button (24pt + 8pt spacing).
+            let button_width: f64 = 280.0;
             let button_height: f64 = 32.0;
             let stack_height = (choices.len() as f64 * button_height).max(160.0);
             let stack_frame = NSRect::new(
                 NSPoint::new(0.0, 0.0),
-                NSSize::new(280.0, stack_height),
+                NSSize::new(button_width, stack_height),
             );
             let stack_alloc = NSStackView::alloc(mtm);
             let stack: Retained<NSStackView> =
@@ -215,13 +216,28 @@ define_class!(
                 stack.addArrangedSubview(&btn);
             }
 
+            // Container to center the stack horizontally within the scroll area.
+            let scroll_width = content_rect.size.width - 40.0;
+            let scroll_height = content_rect.size.height - 40.0;
+            let doc_height = scroll_height.max(stack_height);
+            let stack_center_x = (scroll_width - button_width) / 2.0;
+            let container_frame = NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(scroll_width, doc_height),
+            );
+            let container_alloc = NSView::alloc(mtm);
+            let container: Retained<NSView> =
+                unsafe { msg_send![container_alloc, initWithFrame: container_frame] };
+            stack.setFrame(NSRect::new(
+                NSPoint::new(stack_center_x, doc_height - stack_height),
+                NSSize::new(button_width, stack_height),
+            ));
+            container.addSubview(&stack);
+
             // Scroll view: fill content (with insets for padding).
             let scroll_frame = NSRect::new(
                 NSPoint::new(20.0, 20.0),
-                NSSize::new(
-                    content_rect.size.width - 40.0,
-                    content_rect.size.height - 40.0,
-                ),
+                NSSize::new(scroll_width, scroll_height),
             );
             let scroll_alloc = NSScrollView::alloc(mtm);
             let scroll: Retained<NSScrollView> =
@@ -234,7 +250,7 @@ define_class!(
                     | NSAutoresizingMaskOptions::ViewMinYMargin
                     | NSAutoresizingMaskOptions::ViewMaxYMargin,
             );
-            scroll.setDocumentView(Some(&stack));
+            scroll.setDocumentView(Some(&container));
             scroll.setHasVerticalScroller(true);
             scroll.setHasHorizontalScroller(false);
             scroll.setAutohidesScrollers(true);
