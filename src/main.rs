@@ -966,14 +966,48 @@ fn cmd_workalias(args: &[String], timesheet: &Path) -> Result<(), String> {
             pattern
         ));
     }
+    let lines_vec: Vec<&str> = content.lines().collect();
     let mut replace_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     for (line_num, epoch, new_repl) in &matches_vec {
-        let orig_line = content.lines().nth(*line_num - 1).unwrap_or("");
-        let new_line = format!("START|{}|{}", epoch, new_repl);
-        println!("Original: {}", orig_line);
-        println!("Replaced: {}", new_line);
+        let orig_activity = lines_vec
+            .get(*line_num - 1)
+            .and_then(|l| parse_line(l))
+            .and_then(|ll| match ll {
+                LogLine::Start(_, a) => Some(a),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let end_epoch = lines_vec
+            .get(*line_num)
+            .and_then(|l| parse_line(l))
+            .and_then(|ll| match ll {
+                LogLine::Stop(stop_e) => Some(stop_e),
+                _ => None,
+            })
+            .unwrap_or(now);
+        let secs = end_epoch - epoch;
+        let duration_fmt = if secs >= 3600 {
+            format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+        } else if secs >= 60 {
+            format!("{}m", secs / 60)
+        } else {
+            format!("{}s", secs)
+        };
+        let dt = Local.timestamp_opt(*epoch, 0).single().unwrap_or_else(Local::now);
+        println!(
+            "Original:  {}  {:>8}  {}",
+            dt.format("%Y-%m-%d %H:%M:%S"),
+            duration_fmt,
+            orig_activity
+        );
+        println!(
+            "Replaced:  {}  {:>8}  {}",
+            dt.format("%Y-%m-%d %H:%M:%S"),
+            duration_fmt,
+            new_repl
+        );
         print!("Replace (y/n) ");
         stdout.flush().map_err(|e| e.to_string())?;
         let mut buf = String::new();
