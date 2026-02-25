@@ -7,8 +7,9 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, AnyThread, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSButton, NSImage, NSPanel, NSScrollView, NSStackView, NSStackViewDistribution,
-    NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSButton, NSImage, NSAutoresizingMaskOptions, NSPanel, NSScreen, NSScrollView, NSStackView,
+    NSStackViewDistribution, NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSString, NSSize};
 use std::cell::RefCell;
@@ -151,21 +152,21 @@ define_class!(
             let handler: Retained<TSReminderButtonHandler> = unsafe { msg_send![handler_alloc, init] };
             let sel_choice_clicked = objc2::sel!(choiceClicked:);
 
-            // Panel: 320x400 content, titled, closable.
-            let content_rect = NSRect::new(
-                NSPoint::new(0.0, 0.0),
-                NSSize::new(320.0, 400.0),
-            );
+            // Panel: full screen.
+            let screen_frame = NSScreen::mainScreen(mtm)
+                .map(|s| s.frame())
+                .unwrap_or_else(|| NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 600.0)));
             let style = NSWindowStyleMask::Titled; // No Closable: only button-clicks dismiss
             let panel_alloc = NSPanel::alloc(mtm);
             let panel: Retained<NSPanel> =
                 NSPanel::initWithContentRect_styleMask_backing_defer(
                     panel_alloc,
-                    content_rect,
+                    NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, 400.0)),
                     style,
                     NSBackingStoreType::Buffered,
                     false,
                 );
+            panel.setFrame_display(screen_frame, true);
             panel.setTitle(&NSString::from_str("What are you working on?"));
             unsafe { panel.setReleasedWhenClosed(false) };
             let panel_delegate_alloc = TSReminderPanelDelegate::alloc(mtm);
@@ -173,14 +174,19 @@ define_class!(
                 unsafe { msg_send![panel_delegate_alloc, init] };
             panel.setDelegate(Some(ProtocolObject::from_ref(&*panel_delegate)));
 
-            // Content view.
-            let content_frame = NSRect::new(
-                NSPoint::new(0.0, 0.0),
-                NSSize::new(320.0, 400.0),
-            );
+            // Content view: fill panel content area (resize with window).
+            let content_rect = panel.contentRectForFrameRect(screen_frame);
             let content_alloc = NSView::alloc(mtm);
             let content: Retained<NSView> =
-                unsafe { msg_send![content_alloc, initWithFrame: content_frame] };
+                unsafe { msg_send![content_alloc, initWithFrame: content_rect] };
+            content.setAutoresizingMask(
+                NSAutoresizingMaskOptions::ViewWidthSizable
+                    | NSAutoresizingMaskOptions::ViewHeightSizable
+                    | NSAutoresizingMaskOptions::ViewMinXMargin
+                    | NSAutoresizingMaskOptions::ViewMaxXMargin
+                    | NSAutoresizingMaskOptions::ViewMinYMargin
+                    | NSAutoresizingMaskOptions::ViewMaxYMargin,
+            );
             panel.setContentView(Some(&content));
 
             // Vertical stack for buttons. Height = ~32pt per button (24pt + 8pt spacing).
@@ -209,20 +215,30 @@ define_class!(
                 stack.addArrangedSubview(&btn);
             }
 
+            // Scroll view: fill content (with insets for padding).
             let scroll_frame = NSRect::new(
                 NSPoint::new(20.0, 20.0),
-                NSSize::new(280.0, 360.0),
+                NSSize::new(
+                    content_rect.size.width - 40.0,
+                    content_rect.size.height - 40.0,
+                ),
             );
             let scroll_alloc = NSScrollView::alloc(mtm);
             let scroll: Retained<NSScrollView> =
                 unsafe { msg_send![scroll_alloc, initWithFrame: scroll_frame] };
+            scroll.setAutoresizingMask(
+                NSAutoresizingMaskOptions::ViewWidthSizable
+                    | NSAutoresizingMaskOptions::ViewHeightSizable
+                    | NSAutoresizingMaskOptions::ViewMinXMargin
+                    | NSAutoresizingMaskOptions::ViewMaxXMargin
+                    | NSAutoresizingMaskOptions::ViewMinYMargin
+                    | NSAutoresizingMaskOptions::ViewMaxYMargin,
+            );
             scroll.setDocumentView(Some(&stack));
             scroll.setHasVerticalScroller(true);
             scroll.setHasHorizontalScroller(false);
             scroll.setAutohidesScrollers(true);
             content.addSubview(&scroll);
-            panel.setContentSize(NSSize::new(320.0, 400.0));
-            panel.center();
             panel.orderFrontRegardless();
 
             // Re-show if dismissed without a button choice (e.g. process killed).

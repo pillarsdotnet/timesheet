@@ -32,7 +32,7 @@
 //! | `restart`, `reminder` | Aliases for `interval`. |
 //! | `rotate`   | Rename log to `timesheet.YYMMDD`; add STOP first if last entry is START; append if same-day exists. |
 //! | `start`    | Record work start now; on macOS with no activity, shows reminder dialog to pick/enter; otherwise optional activity (default: misc/unspecified); starts reminder daemon. |
-//! | `started`  | Record a past start time; adjusts today's last START or inserts before today's STOP. |
+//! | `started`  | Record a past start time; removes later STARTs, then adjusts today's last or inserts before today's STOP. |
 //! | `stop`     | Record work stop (optional time); amends previous STOP if work already stopped; stops reminder daemon and shows "stopped" dialog when a stop is recorded (skipped during logout/shutdown). |
 //! | `timeoff`  | Show stop time for 8 h/day average; only requires a START entry (adds one if log empty or last is STOP). |
 //! | `uninstall` | Stop daemon, remove autostart hooks, optionally remove log files, remove binary and icon. |
@@ -791,6 +791,7 @@ fn parse_start_time(s: &str) -> Option<i64> {
 }
 
 /// Records a past start time; replaces today's last START or inserts before today's STOP if applicable.
+/// Removes START entries with a later start time (and their paired STOP) before adding the new entry.
 fn cmd_started(args: &[String], timesheet: &Path) -> Result<(), String> {
     let (start_time, activity) = match args.split_first() {
         Some((st, rest)) => (st.as_str(), rest.join(" ")),
@@ -809,6 +810,27 @@ fn cmd_started(args: &[String], timesheet: &Path) -> Result<(), String> {
     maybe_rotate_if_previous_week(timesheet)?;
     let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
     let content = fs::read_to_string(timesheet).unwrap_or_default();
+
+    // Remove START entries with later start time (and the STOP that pairs with them, to avoid orphans).
+    let mut kept: Vec<&str> = Vec::new();
+    let mut skip_next_stop = 0usize;
+    for line in content.lines() {
+        if let Some(LogLine::Start(e, _)) = parse_line(line) {
+            if e > epoch {
+                skip_next_stop += 1;
+                continue;
+            }
+        }
+        if skip_next_stop > 0 {
+            if parse_line(line).map(|ll| matches!(ll, LogLine::Stop(_))).unwrap_or(false) {
+                skip_next_stop = 0; // Skip the STOP that paired with the removed START(s)
+                continue;
+            }
+        }
+        kept.push(line);
+    }
+    let content = kept.join("\n") + if kept.is_empty() { "" } else { "\n" };
+
     let last = content.lines().rev().find(|l| !l.trim().is_empty());
     match last {
         Some(l) if l.starts_with("START|") => {
@@ -847,8 +869,8 @@ fn cmd_started(args: &[String], timesheet: &Path) -> Result<(), String> {
         _ => {}
     }
     let line = format!("START|{}|{}\n", epoch, activity);
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(timesheet).map_err(|e| e.to_string())?;
-    f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    let new_content = format!("{}{}", content, line);
+    fs::write(timesheet, new_content).map_err(|e| e.to_string())?;
     let dt = Local.timestamp_opt(epoch, 0).single().unwrap_or_else(Local::now);
     println!("Started: {} at {}", activity, dt.format("%a %b %d %H:%M:%S %Z %Y"));
     start_reminder_daemon_if_needed(timesheet);
@@ -1527,9 +1549,10 @@ style, or
 or
 .B HH:MM
 (today).
-If the last entry is START recorded today, replaces that START with the new time and activity.
-If the last entry is STOP recorded today and start time < stop time, inserts the new START before that STOP.
-Otherwise appends the new START; only adjusts entries made on the current day.
+First removes any START entries with a later start time (and their paired STOP).
+If the last remaining entry is START recorded today, replaces that START with the new time and activity.
+If the last remaining entry is STOP recorded today and start time < stop time, inserts the new START before that STOP.
+Otherwise appends the new START.
 .TP
 .B stop
 Record work stop at
@@ -3147,6 +3170,37 @@ mod tests {
         let content = fs::read_to_string(&ts).unwrap();
         assert!(content.contains("START|"));
         assert!(content.contains("manual"));
+    }
+
+    #[test]
+    fn test_cmd_started_removes_later_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = dir.path().join("timesheet.log");
+        let now = chrono::Local::now().timestamp();
+        let week_start = week_start_epoch(now);
+        // Log: early START (6:00), STOP (7:00), late START (10:00) - only "late" has start time > 7:00
+        let e_early = week_start + 6 * 3600;
+        let e_stop = week_start + 7 * 3600;
+        let e_late = week_start + 10 * 3600;
+        fs::write(
+            &ts,
+            format!("START|{}|early\nSTOP|{}\nSTART|{}|late\n", e_early, e_stop, e_late),
+        )
+        .unwrap();
+        let new_epoch = week_start + 7 * 3600;
+        let new_time = chrono::Local
+            .timestamp_opt(new_epoch, 0)
+            .single()
+            .unwrap()
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+        // Add START at 07:00 - should remove START|e_late (10:00 > 7:00)
+        let result = cmd_started(&[new_time, "new".to_string()], &ts);
+        assert!(result.is_ok());
+        let content = fs::read_to_string(&ts).unwrap();
+        assert!(content.contains("early"));
+        assert!(content.contains("new"));
+        assert!(!content.contains("late"));
     }
 
     #[test]
