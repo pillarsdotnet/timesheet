@@ -31,7 +31,7 @@
 //! | `rename`   | Same as `alias`. |
 //! | `restart`, `reminder` | Aliases for `interval`. |
 //! | `rotate`   | Rename log to `timesheet.YYMMDD`; add STOP first if last entry is START; append if same-day exists. |
-//! | `start`    | Record work start now; on macOS with no activity, shows reminder dialog to pick/enter; otherwise optional activity (default: misc/unspecified); starts reminder daemon. |
+//! | `start`    | Record work start now; on macOS with no activity, shows reminder dialog to pick/enter; otherwise optional activity (default: misc/unspecified); starts/restarts reminder daemon. |
 //! | `started`  | Record a past start time; removes later STARTs, then adjusts today's last or inserts before today's STOP. |
 //! | `stop`     | Record work stop (optional time); amends previous STOP if work already stopped; stops reminder daemon and shows "stopped" dialog when a stop is recorded (skipped during logout/shutdown). |
 //! | `timeoff`  | Show stop time for 8 h/day average; only requires a START entry (adds one if log empty or last is STOP). |
@@ -513,6 +513,8 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
     let mut f = fs::OpenOptions::new().create(true).append(true).open(timesheet).map_err(|e| e.to_string())?;
     f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
     println!("Started: {} at {}", activity, Local::now().format("%a %b %d %H:%M:%S %Z %Y"));
+    kill_reminder_daemon_if_running();
+    thread::sleep(Duration::from_millis(100));
     start_reminder_daemon_if_needed(timesheet);
     Ok(())
 }
@@ -1536,7 +1538,7 @@ shows the reminder dialog to pick or enter an activity.
 Otherwise optional
 .I activity
 (default: misc/unspecified). Appends a START line; does not modify existing entries.
-Also starts the reminder daemon if not already running.
+Starts or restarts the reminder daemon (resets the timer).
 .TP
 .B started
 Record a work start at a

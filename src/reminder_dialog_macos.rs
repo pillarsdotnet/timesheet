@@ -6,7 +6,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, AnyThread, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
+    NSEvent, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
     NSButton, NSImage, NSAutoresizingMaskOptions, NSPanel, NSScreen, NSScrollView, NSStackView,
     NSStackViewDistribution, NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowDelegate,
     NSWindowStyleMask,
@@ -61,6 +61,33 @@ pub fn run_native_reminder_dialog(choices: Vec<String>) -> Option<String> {
 
     DIALOG_RESULT.with(|r| r.borrow_mut().take())
 }
+
+// Content view that swallows all keystrokes; only mouse clicks and scrolling work.
+define_class!(
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "TSReminderContentView"]
+    struct TSReminderContentView;
+
+    impl TSReminderContentView {
+        #[unsafe(method(performKeyEquivalent:))]
+        fn perform_key_equivalent(&self, _event: &NSEvent) -> bool {
+            true
+        }
+        #[unsafe(method(keyDown:))]
+        fn key_down(&self, _event: &NSEvent) {}
+        #[unsafe(method(acceptsFirstResponder))]
+        fn accepts_first_responder(&self) -> bool {
+            true
+        }
+        #[unsafe(method(resignFirstResponder))]
+        fn resign_first_responder(&self) -> bool {
+            false
+        }
+    }
+
+    unsafe impl NSObjectProtocol for TSReminderContentView {}
+);
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -175,9 +202,10 @@ define_class!(
             panel.setDelegate(Some(ProtocolObject::from_ref(&*panel_delegate)));
 
             // Content view: fill panel content area (resize with window).
+            // TSReminderContentView swallows keystrokes; only mouse and scroll work.
             let content_rect = panel.contentRectForFrameRect(screen_frame);
-            let content_alloc = NSView::alloc(mtm);
-            let content: Retained<NSView> =
+            let content_alloc = TSReminderContentView::alloc(mtm);
+            let content: Retained<TSReminderContentView> =
                 unsafe { msg_send![content_alloc, initWithFrame: content_rect] };
             content.setAutoresizingMask(
                 NSAutoresizingMaskOptions::ViewWidthSizable
@@ -188,6 +216,7 @@ define_class!(
                     | NSAutoresizingMaskOptions::ViewMaxYMargin,
             );
             panel.setContentView(Some(&content));
+            panel.setInitialFirstResponder(Some(content.as_ref() as &NSView));
 
             // Vertical stack for buttons. Height = ~32pt per button (24pt + 8pt spacing).
             let button_width: f64 = 280.0;
