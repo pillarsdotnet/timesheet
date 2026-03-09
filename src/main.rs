@@ -578,8 +578,12 @@ fn resolve_list_input(arg: Option<&str>, timesheet: &Path) -> Result<PathBuf, St
 
 /// Records work start now; activity is optional. With no argument on macOS, shows the reminder dialog to pick/enter an activity.
 /// On other platforms or if the user declines, falls back to misc/unspecified.
+/// Ensures the reminder daemon is running at entry (so it stays running even when ts start is run at system startup and
+/// exits before the final start call), then restarts it after recording START to reset the timer.
 fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
     maybe_rotate_if_previous_week(timesheet)?;
+    // Start daemon early so it is running even when ts start is invoked at login (LaunchAgent) and exits quickly.
+    start_reminder_daemon_if_needed(timesheet);
     let activity = if args.is_empty() {
         #[cfg(all(target_os = "macos", not(test)))]
         {
@@ -588,6 +592,7 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
                 match show_reminder_prompt(&activities, Some(timesheet)) {
                     ReminderResult::Activity(a) => break a,
                     ReminderResult::DontBugMe => {
+                        kill_reminder_daemon_if_running();
                         return Ok(());
                     }
                     ReminderResult::ShowAgainImmediate => {} // re-show immediately
@@ -2500,7 +2505,7 @@ fn macos_run_in_user_session(exe: &str, exe_args: &[&str]) -> Command {
 #[cfg(target_os = "macos")]
 fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -> ReminderResult {
     let reminder_appeared = Local::now().timestamp();
-    let mut choices = vec!["Don't Bug Me".to_string()];
+    let mut choices = vec!["Stop Work".to_string()];
     for a in activities.iter().rev() {
         if !a.is_empty() && !choices.contains(a) {
             choices.push(a.clone());
@@ -2549,7 +2554,7 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
             _ => return NativeOutcome::Unavailable,
         };
         let s = String::from_utf8_lossy(&stdout).trim().to_string();
-        if s == "Don't Bug Me" {
+        if s == "Stop Work" {
             return NativeOutcome::Result(ReminderResult::DontBugMe);
         }
         if s == "Enter new activity..." {
@@ -2649,7 +2654,7 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
             if s == "false" {
                 return ReminderResult::TimeoutAddStop(reminder_appeared);
             }
-            if s == *"Don't Bug Me" {
+            if s == *"Stop Work" {
                 return ReminderResult::DontBugMe;
             }
             if s == "Enter new activity..." {
@@ -2667,7 +2672,7 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
 }
 
 /// Buttons-only dialog via SystemUIServer (one click = done; works from daemon).
-/// AppleScript display dialog allows at most 3 buttons, so we show: Don't Bug Me | first activity (least-recent) | Enter new activity...
+/// AppleScript display dialog allows at most 3 buttons, so we show: Stop Work | first activity (least-recent) | Enter new activity...
 #[cfg(target_os = "macos")]
 fn show_reminder_prompt_macos_systemui(choices: &[String], reminder_appeared: i64) -> ReminderResult {
     let stderr_mode = if env::var_os("TS_DEBUG").is_some() {
@@ -2677,10 +2682,10 @@ fn show_reminder_prompt_macos_systemui(choices: &[String], reminder_appeared: i6
     };
     let timeout_dur = Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS);
 
-    // AppleScript display dialog allows max 3 buttons. Build exactly 3: Don't Bug Me, (optional) first activity, Enter new activity...
+    // AppleScript display dialog allows max 3 buttons. Build exactly 3: Stop Work, (optional) first activity, Enter new activity...
     let three_buttons: Vec<&str> = {
         let mut b = Vec::with_capacity(3);
-        b.push("Don't Bug Me");
+        b.push("Stop Work");
         if choices.len() > 2 {
             b.push(choices[1].as_str());
         }
@@ -2693,7 +2698,7 @@ fn show_reminder_prompt_macos_systemui(choices: &[String], reminder_appeared: i6
         .collect::<Vec<_>>()
         .join(", ");
     let script = format!(
-        "tell application \"SystemUIServer\" to display dialog \"What are you working on?\" with title \"ts\" buttons {{{}}} default button \"Don't Bug Me\"",
+        "tell application \"SystemUIServer\" to display dialog \"What are you working on?\" with title \"ts\" buttons {{{}}} default button \"Stop Work\"",
         buttons_script
     );
     if let Ok(child) = macos_run_in_user_session("/usr/bin/osascript", &["-e", &script])
@@ -2709,7 +2714,7 @@ fn show_reminder_prompt_macos_systemui(choices: &[String], reminder_appeared: i6
                     let part = part.trim();
                     if let Some(rest) = part.strip_prefix("button returned:") {
                         let btn = rest.trim().trim_matches('"');
-                        if btn == "Don't Bug Me" {
+                        if btn == "Stop Work" {
                             return ReminderResult::DontBugMe;
                         }
                         if btn == "Enter new activity..." {
@@ -2752,7 +2757,7 @@ fn show_reminder_prompt_macos_systemui(choices: &[String], reminder_appeared: i6
                     if s == "false" {
                         return ReminderResult::TimeoutAddStop(reminder_appeared);
                     }
-                    if s == "Don't Bug Me" {
+                    if s == "Stop Work" {
                         return ReminderResult::DontBugMe;
                     }
                     if s != "Enter new activity..." {
@@ -2764,7 +2769,7 @@ fn show_reminder_prompt_macos_systemui(choices: &[String], reminder_appeared: i6
         }
     }
     // Text dialog for new activity or when list was cancelled.
-    let script = "tell application \"SystemUIServer\" to display dialog \"What are you working on?\" default answer \"\" with title \"ts\" buttons {\"Don't Bug Me\", \"OK\"} default button \"OK\"";
+    let script = "tell application \"SystemUIServer\" to display dialog \"What are you working on?\" default answer \"\" with title \"ts\" buttons {\"Stop Work\", \"OK\"} default button \"OK\"";
     let stderr2 = if env::var_os("TS_DEBUG").is_some() {
         Stdio::inherit()
     } else {
@@ -2787,7 +2792,7 @@ fn show_reminder_prompt_macos_systemui(choices: &[String], reminder_appeared: i6
                 let part = part.trim();
                 if let Some(rest) = part.strip_prefix("button returned:") {
                     let btn = rest.trim().trim_matches('"');
-                    if btn == "Don't Bug Me" {
+                    if btn == "Stop Work" {
                         return ReminderResult::DontBugMe;
                     }
                 }
