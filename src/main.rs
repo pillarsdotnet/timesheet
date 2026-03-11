@@ -723,7 +723,7 @@ fn process_log_for_report(lines: &[(usize, LogLine)], virtual_stop: Option<i64>)
 }
 
 /// Outputs the latest ten log entries with timestamps shown in local time. Optional arg selects file (same as list).
-/// Consecutive START entries with the same activity are collapsed (last timestamp kept); then the last 10 entries are shown.
+/// Consecutive START entries with the same activity are collapsed (first timestamp kept for aggregate duration); then the last 10 entries are shown.
 fn cmd_tail(tail_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
     let path = resolve_list_input(tail_arg, timesheet)?;
     if !path.exists() {
@@ -738,13 +738,13 @@ fn cmd_tail(tail_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
     let mut dedup: Vec<LogLine> = Vec::new();
     for ll in &entries {
         match ll {
-            LogLine::Start(epoch, activity) => {
+            LogLine::Start(_epoch, activity) => {
                 if let Some(LogLine::Start(_, prev_act)) = dedup.last() {
                     if prev_act == activity {
-                        dedup.pop();
+                        continue; // keep the first timestamp of the consecutive run
                     }
                 }
-                dedup.push(LogLine::Start(*epoch, activity.clone()));
+                dedup.push(ll.clone());
             }
             LogLine::Stop(epoch) => {
                 dedup.push(LogLine::Stop(*epoch));
