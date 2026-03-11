@@ -1565,7 +1565,7 @@ and
 .B reminder
 are aliases for
 .BR interval .
-Reminder daemon behavior: on timeout (no click), records STOP at reminder-appeared time and re-shows (window stays visible). Dismissed without choice (close, Escape) re-shows immediately. The "Enter new activity" dialog has no timeout; blank/cancelled re-shows the reminder. On system shutdown (SIGTERM), records STOP and exits.
+Reminder daemon behavior: on timeout (no click), records STOP at reminder-appeared time and brings the existing reminder window to the front of the window stack (does not launch a new prompt). Dismissed without choice (close, Escape) re-shows immediately. The "Enter new activity" dialog has no timeout; blank/cancelled re-shows the reminder. On system shutdown (SIGTERM), records STOP and exits.
 .TP
 .B list
 Plaintext report: percentage of time per activity (high to low), and hours per day of week (Sun\-Sat).
@@ -2502,6 +2502,20 @@ fn macos_run_in_user_session(exe: &str, exe_args: &[&str]) -> Command {
     c
 }
 
+/// On macOS, bring the reminder window (process with given PID) to the front of the window stack. Runs in user's GUI session.
+#[cfg(target_os = "macos")]
+fn macos_bring_reminder_window_to_front(pid: u32) {
+    let script = format!(
+        "tell application \"System Events\" to set frontmost of (first process whose unix id is {}) to true",
+        pid
+    );
+    let _ = macos_run_in_user_session("/usr/bin/osascript", &["-e", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
 #[cfg(target_os = "macos")]
 fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -> ReminderResult {
     let reminder_appeared = Local::now().timestamp();
@@ -2517,9 +2531,8 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
     let ts_debug = env::var_os("TS_DEBUG").is_some();
     enum NativeOutcome {
         Result(ReminderResult),
-        Dismissed,           // Child ran but returned empty; re-show immediately
-        Unavailable,         // Spawn failed; fall through to SystemUIServer
-        TimeoutAddStop(i64), // Timeout without click; add STOP at epoch, do not dismiss window
+        Dismissed,   // Child ran but returned empty; re-show immediately
+        Unavailable, // Spawn failed; fall through to SystemUIServer
     }
     let try_native = |use_launchctl: bool| -> NativeOutcome {
         let exe = match env::current_exe().ok() {
@@ -2537,7 +2550,7 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
             c.args(&args_ref);
             c
         };
-        let child = match cmd
+        let mut child = match cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(if ts_debug { Stdio::inherit() } else { Stdio::null() })
@@ -2548,22 +2561,36 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
         };
         let appeared = Local::now().timestamp();
         let timeout = Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS);
-        let stdout = match wait_with_timeout(child, timeout, false) {
-            WaitOutcome::Finished(Some(out)) => out,
-            WaitOutcome::TimedOut => return NativeOutcome::TimeoutAddStop(appeared),
-            _ => return NativeOutcome::Unavailable,
-        };
-        let s = String::from_utf8_lossy(&stdout).trim().to_string();
-        if s == "Stop Work" {
-            return NativeOutcome::Result(ReminderResult::DontBugMe);
+        let mut appended_stop_for_this_reminder = false;
+        loop {
+            match wait_with_timeout(child, timeout, false) {
+                WaitOutcome::Finished(Some(out)) => {
+                    let s = String::from_utf8_lossy(&out).trim().to_string();
+                    if s == "Stop Work" {
+                        return NativeOutcome::Result(ReminderResult::DontBugMe);
+                    }
+                    if s == "Enter new activity..." {
+                        return NativeOutcome::Result(ReminderResult::EnterNew);
+                    }
+                    if !s.is_empty() && choices.contains(&s) {
+                        return NativeOutcome::Result(ReminderResult::Activity(s));
+                    }
+                    return NativeOutcome::Dismissed;
+                }
+                WaitOutcome::Finished(None) => return NativeOutcome::Unavailable,
+                WaitOutcome::TimedOut => return NativeOutcome::Unavailable,
+                WaitOutcome::TimedOutWithChild(c) => {
+                    if !appended_stop_for_this_reminder {
+                        if let Some(ts) = timesheet {
+                            let _ = append_stop_entry(ts, appeared);
+                        }
+                        appended_stop_for_this_reminder = true;
+                    }
+                    macos_bring_reminder_window_to_front(c.id());
+                    child = c;
+                }
+            }
         }
-        if s == "Enter new activity..." {
-            return NativeOutcome::Result(ReminderResult::EnterNew);
-        }
-        if !s.is_empty() && choices.contains(&s) {
-            return NativeOutcome::Result(ReminderResult::Activity(s));
-        }
-        NativeOutcome::Dismissed
     };
 
     let handle_native = |res: ReminderResult| {
@@ -2579,23 +2606,11 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
     match try_native(true) {
         NativeOutcome::Result(res) => return handle_native(res),
         NativeOutcome::Dismissed => return ReminderResult::ShowAgainImmediate,
-        NativeOutcome::TimeoutAddStop(epoch) => {
-            if let Some(ts) = timesheet {
-                let _ = append_stop_entry(ts, epoch);
-            }
-            return ReminderResult::ShowAgainImmediate;
-        }
         NativeOutcome::Unavailable => {}
     }
     match try_native(false) {
         NativeOutcome::Result(res) => return handle_native(res),
         NativeOutcome::Dismissed => return ReminderResult::ShowAgainImmediate,
-        NativeOutcome::TimeoutAddStop(epoch) => {
-            if let Some(ts) = timesheet {
-                let _ = append_stop_entry(ts, epoch);
-            }
-            return ReminderResult::ShowAgainImmediate;
-        }
         NativeOutcome::Unavailable => {}
     }
     if ts_debug {
@@ -2667,6 +2682,7 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
         }
         WaitOutcome::Finished(None) => ReminderResult::TimeoutAddStop(reminder_appeared),
         WaitOutcome::TimedOut => ReminderResult::TimeoutAddStop(reminder_appeared),
+        WaitOutcome::TimedOutWithChild(_) => ReminderResult::TimeoutAddStop(reminder_appeared), // kill_on_timeout=true here
     };
     result
 }
@@ -2817,9 +2833,12 @@ fn escape_applescript_string(s: &str) -> String {
 }
 
 /// Wait for process to finish, or until timeout. Returns stdout if process exited normally.
+/// When kill_on_timeout is false and we time out, returns TimedOutWithChild so the caller can bring the window to front and wait again.
 enum WaitOutcome {
     Finished(Option<Vec<u8>>),
     TimedOut,
+    /// Child still running (not killed); caller can bring window to front and call wait_with_timeout again.
+    TimedOutWithChild(process::Child),
 }
 
 /// Wait for process to finish, or until timeout. If kill_on_timeout is false, the child is left running (not dismissed).
@@ -2842,8 +2861,9 @@ fn wait_with_timeout(mut child: process::Child, timeout: Duration, kill_on_timeo
         if start.elapsed() >= timeout {
             if kill_on_timeout {
                 let _ = child.kill();
+                return WaitOutcome::TimedOut;
             }
-            return WaitOutcome::TimedOut;
+            return WaitOutcome::TimedOutWithChild(child);
         }
         thread::sleep(check_interval);
     }
