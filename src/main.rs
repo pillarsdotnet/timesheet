@@ -1484,7 +1484,28 @@ to run at login and
 .B "ts stop"
 to run at logout or system shutdown. Optional
 .I interval
-(e.g.\ \&5s, 3m) sets the reminder interval and starts the daemon in this session; if the daemon is already running, it is restarted so the new interval takes effect immediately. On macOS uses LaunchAgents and a logout hook (so STOP is recorded on logout/shutdown); if the logout hook cannot be set (sudo required), the command to run manually is printed; once registered, later runs skip the prompt. On Linux uses systemd user services. With
+(e.g.\ \&5s, 3m) sets the reminder interval and starts the daemon in this session; if the daemon is already running, it is restarted so the new interval takes effect immediately.
+On macOS installs two LaunchAgents and a logout hook:
+.RS
+.TP
+\fBcom.ts.autostart.start\fR
+Runs
+.B "ts start"
+at login (RunAtLoad).
+.TP
+\fBcom.ts.autostart.session\fR
+Runs
+.B "ts \-\-session\-daemon"
+as a persistent launchd job; on logout/shutdown launchd sends it SIGTERM and waits up to 30 s (ExitTimeOut) for it to write the STOP entry and exit.
+.TP
+\fBLogoutHook\fR
+Runs as root before logout/shutdown and macOS blocks the shutdown sequence until it returns, providing a second guarantee that STOP is recorded. Uses
+.B "launchctl asuser"
+to invoke
+.B "ts stop"
+in the console user's launchd context. Requires sudo to register; if it cannot be set the command to run manually is printed.
+.RE
+On Linux uses systemd user services. With
 .I uninstall
 removes the registration.
 Without
@@ -1820,31 +1841,21 @@ fn do_autostart_install_macos() -> Result<(), String> {
     let support = PathBuf::from(&home).join("Library/Application Support/ts");
     fs::create_dir_all(&support).map_err(|e| format!("ts autostart: cannot create {}: {}", support.display(), e))?;
 
-    let script_path = support.join("autostart-session.sh");
-    let script = format!(
-        r#"#!/bin/sh
-trap 'TS_LOGOUT=1 exec "{}" stop' TERM
-while true; do sleep 3600; done
-"#,
-        exe_path.replace('"', "\\\"")
-    );
-    fs::write(&script_path, script).map_err(|e| format!("ts autostart: cannot write script: {}", e))?;
-    #[allow(clippy::disallowed_methods)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&script_path).map_err(|e| e.to_string())?.permissions();
-        perms.set_mode(0o700);
-        fs::set_permissions(&script_path, perms).map_err(|e| e.to_string())?;
-    }
+    // Remove old shell-script session wrapper if present (superseded by --session-daemon).
+    let _ = fs::remove_file(support.join("autostart-session.sh"));
 
-    // LogoutHook runs as root on logout/shutdown; run ts stop as the console user so STOP is recorded.
+    // LogoutHook runs as root on logout/shutdown and macOS waits for it to complete before
+    // proceeding, making it the most reliable mechanism for recording STOP. It uses
+    // `launchctl asuser` to run ts stop in the console user's launchd context (faster than
+    // `su -` because it does not spawn a full login shell).
     let logout_hook_path = support.join("logout-hook.sh");
     let exe_escaped = exe_path.replace('\\', "\\\\").replace('"', "\\\"");
     let logout_script = format!(
         r#"#!/bin/sh
-user=$(stat -f '%Su' /dev/console 2>/dev/null)
-[ -z "$user" ] && exit 0
-exec su - "$user" -c 'TS_LOGOUT=1 exec "$1" stop' _ "{}"
+uid=$(stat -f '%u' /dev/console 2>/dev/null)
+[ -z "$uid" ] && exit 0
+export TS_LOGOUT=1
+exec launchctl asuser "$uid" "{}" stop
 "#,
         exe_escaped
     );
@@ -1945,6 +1956,9 @@ exec su - "$user" -c 'TS_LOGOUT=1 exec "$1" stop' _ "{}"
 "#,
         exe_path.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
     );
+    // The session plist runs `ts --session-daemon` directly (no shell-script wrapper).
+    // ExitTimeOut tells launchd to wait up to 30 s after SIGTERM before sending SIGKILL,
+    // giving the daemon time to write the STOP entry and exit cleanly.
     let session_plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1955,13 +1969,16 @@ exec su - "$user" -c 'TS_LOGOUT=1 exec "$1" stop' _ "{}"
     <key>ProgramArguments</key>
     <array>
         <string>{}</string>
+        <string>--session-daemon</string>
     </array>
     <key>KeepAlive</key>
     <true/>
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
 </dict>
 </plist>
 "#,
-        script_path.to_string_lossy().replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+        exe_path.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
     );
 
     fs::create_dir_all(&agents).map_err(|e| format!("ts autostart: cannot create {}: {}", agents.display(), e))?;
@@ -1979,7 +1996,9 @@ exec su - "$user" -c 'TS_LOGOUT=1 exec "$1" stop' _ "{}"
         return Err("ts autostart: launchctl load session plist failed".to_string());
     }
     println!("Autostart installed: \"ts start\" runs at login, \"ts stop\" runs at logout/shutdown.");
-    println!("  Start: {}  Session (stop on exit): {}  LogoutHook: {}", start_plist_path.display(), session_plist_path.display(), logout_hook_path.display());
+    println!("  Start plist:   {}", start_plist_path.display());
+    println!("  Session plist: {}", session_plist_path.display());
+    println!("  Logout hook:   {}", logout_hook_path.display());
     println!("  To remove: ts autostart uninstall");
     Ok(())
 }
@@ -1991,7 +2010,6 @@ fn do_autostart_uninstall_macos() -> Result<(), String> {
     let start_plist_path = agents.join("com.ts.autostart.start.plist");
     let session_plist_path = agents.join("com.ts.autostart.session.plist");
     let support = PathBuf::from(&home).join("Library/Application Support/ts");
-    let script_path = support.join("autostart-session.sh");
     let logout_hook_path = support.join("logout-hook.sh");
 
     let _ = Command::new("launchctl").arg("unload").arg(&start_plist_path).output();
@@ -2001,7 +2019,7 @@ fn do_autostart_uninstall_macos() -> Result<(), String> {
         .output();
     let _ = fs::remove_file(&start_plist_path);
     let _ = fs::remove_file(&session_plist_path);
-    let _ = fs::remove_file(&script_path);
+    let _ = fs::remove_file(support.join("autostart-session.sh")); // legacy shell-script wrapper
     let _ = fs::remove_file(&logout_hook_path);
     let _ = fs::remove_file(support.join("logout-hook-registered"));
     println!("Autostart uninstalled.");
@@ -2336,6 +2354,43 @@ fn cmd_interval(args: &[String], timesheet: &Path) -> Result<(), String> {
 }
 
 /// Run the reminder daemon loop: sleep for configured interval, show "What are you working on?" prompt, handle response or timeout.
+/// Long-running session daemon that records a STOP entry when launchd sends SIGTERM
+/// (i.e. at logout or system shutdown). Installed as the `com.ts.autostart.session`
+/// LaunchAgent by `ts autostart`. Because this is a launchd job, launchd delivers a
+/// clean SIGTERM and waits for the process to exit (see ExitTimeOut in the plist) before
+/// proceeding with the shutdown sequence, making STOP recording reliable.
+fn run_session_daemon(timesheet: &Path) {
+    #[cfg(unix)]
+    {
+        // Block SIGTERM in the main thread; a dedicated sigwait thread handles it
+        // synchronously, so the STOP entry is written before process::exit is called.
+        let mut set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        unsafe {
+            sigemptyset(&mut set);
+            sigaddset(&mut set, SIGTERM);
+            pthread_sigmask(SIG_BLOCK, &set, std::ptr::null_mut());
+        }
+        let set_for_sigwait = set;
+        let ts_path = timesheet.to_path_buf();
+        thread::spawn(move || {
+            let mut sig: libc::c_int = 0;
+            if unsafe { sigwait(&set_for_sigwait, &mut sig) } == 0 && sig == SIGTERM {
+                // Write STOP only if a session is currently open (last line is START).
+                let content = fs::read_to_string(&ts_path).unwrap_or_default();
+                let last = content.lines().rev().find(|l| !l.trim().is_empty());
+                if last.and_then(parse_line).map(|ll| matches!(ll, LogLine::Start(_, _))).unwrap_or(false) {
+                    let _ = append_stop_entry(&ts_path, Local::now());
+                }
+                process::exit(0);
+            }
+        });
+    }
+    // Main thread: sleep indefinitely. The sigwait thread calls process::exit on SIGTERM.
+    loop {
+        thread::sleep(Duration::from_secs(3600));
+    }
+}
+
 fn run_reminder_daemon(timesheet: &Path) {
     #[cfg(unix)]
     {
@@ -2888,6 +2943,11 @@ fn main() {
 
     if cmd.as_deref() == Some("--reminder-daemon") {
         run_reminder_daemon(&timesheet);
+        process::exit(0);
+    }
+
+    if cmd.as_deref() == Some("--session-daemon") {
+        run_session_daemon(&timesheet);
         process::exit(0);
     }
 
