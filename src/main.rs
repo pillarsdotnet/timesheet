@@ -609,13 +609,13 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
     } else {
         args.join(" ")
     };
+    kill_reminder_daemon_if_running();
+    thread::sleep(Duration::from_millis(100));
     let now = Local::now().timestamp();
     let line = format!("{}|START|{}\n", format_epoch_iso8601(now), activity);
     let mut f = fs::OpenOptions::new().create(true).append(true).open(timesheet).map_err(|e| e.to_string())?;
     f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
     println!("Started: {} at {}", activity, Local::now().format("%a %b %d %H:%M:%S %Z %Y"));
-    kill_reminder_daemon_if_running();
-    thread::sleep(Duration::from_millis(100));
     start_reminder_daemon_if_needed(timesheet);
     Ok(())
 }
