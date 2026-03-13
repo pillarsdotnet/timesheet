@@ -674,6 +674,14 @@ fn cmd_stop(args: &[String], timesheet: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Returns the day-of-week index (0=Sunday … 6=Saturday) for a Unix timestamp in local time.
+fn epoch_to_local_dow(epoch: i64) -> usize {
+    Local.timestamp_opt(epoch, 0)
+        .single()
+        .map(|dt| dt.weekday().num_days_from_sunday() as usize)
+        .unwrap_or_else(|| ((epoch / 86400 + 4).rem_euclid(7)) as usize)
+}
+
 fn process_log_for_report(lines: &[(usize, LogLine)], virtual_stop: Option<i64>) -> (Vec<(String, f64, f64)>, Vec<f64>, bool) {
     let mut stack: Vec<(i64, String)> = Vec::new();
     let mut act_sec: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
@@ -686,8 +694,7 @@ fn process_log_for_report(lines: &[(usize, LogLine)], virtual_stop: Option<i64>)
                     let dur = *e - start_epoch;
                     if dur > 0 {
                         *act_sec.entry(start_act).or_insert(0) += dur;
-                        let days = (start_epoch / 86400) as i32;
-                        let dow = ((days + 4).rem_euclid(7)) as usize;
+                        let dow = epoch_to_local_dow(start_epoch);
                         dow_sec[dow] += dur as f64;
                     }
                 }
@@ -698,8 +705,7 @@ fn process_log_for_report(lines: &[(usize, LogLine)], virtual_stop: Option<i64>)
                     let dur = *e - start_epoch;
                     if dur > 0 {
                         *act_sec.entry(start_act).or_insert(0) += dur;
-                        let days = (start_epoch / 86400) as i32;
-                        let dow = ((days + 4).rem_euclid(7)) as usize;
+                        let dow = epoch_to_local_dow(start_epoch);
                         dow_sec[dow] += dur as f64;
                     }
                 }
@@ -711,8 +717,7 @@ fn process_log_for_report(lines: &[(usize, LogLine)], virtual_stop: Option<i64>)
             let dur = vstop - start_epoch;
             if dur > 0 {
                 *act_sec.entry(start_act).or_insert(0) += dur;
-                let days = (start_epoch / 86400) as i32;
-                let dow = ((days + 4).rem_euclid(7)) as usize;
+                let dow = epoch_to_local_dow(start_epoch);
                 dow_sec[dow] += dur as f64;
             }
         }
