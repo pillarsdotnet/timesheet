@@ -609,13 +609,24 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
     } else {
         args.join(" ")
     };
-    kill_reminder_daemon_if_running();
-    thread::sleep(Duration::from_millis(100));
     let now = Local::now().timestamp();
+    // Close any open session before starting a new one.
+    {
+        let content = fs::read_to_string(timesheet).unwrap_or_default();
+        let last = content.lines().rev().find(|l| !l.trim().is_empty());
+        if last.and_then(parse_line).map(|ll| matches!(ll, LogLine::Start(_, _))).unwrap_or(false) {
+            let stop_line = format!("{}|STOP\n", format_epoch_iso8601(now));
+            if let Ok(mut sf) = fs::OpenOptions::new().append(true).open(timesheet) {
+                let _ = sf.write_all(stop_line.as_bytes());
+            }
+        }
+    }
     let line = format!("{}|START|{}\n", format_epoch_iso8601(now), activity);
     let mut f = fs::OpenOptions::new().create(true).append(true).open(timesheet).map_err(|e| e.to_string())?;
     f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
     println!("Started: {} at {}", activity, Local::now().format("%a %b %d %H:%M:%S %Z %Y"));
+    kill_reminder_daemon_if_running();
+    thread::sleep(Duration::from_millis(100));
     start_reminder_daemon_if_needed(timesheet);
     Ok(())
 }
@@ -2219,8 +2230,10 @@ fn show_reminders_stopped_notification() {
     }
 }
 
-/// Kill the reminder daemon if running (read PID from file, send SIGTERM, remove PID file). No-op on non-Unix.
-/// Never kills the current process (avoids PID-reuse bug where stale PID file could point at us).
+/// Kill the reminder daemon if running (read PID from file, remove PID file, then send SIGTERM).
+/// Removing the PID file *before* signaling tells the daemon's SIGTERM handler that this is an
+/// intentional ts kill rather than a system shutdown, so it skips writing a STOP entry.
+/// No-op on non-Unix. Never kills the current process.
 fn kill_reminder_daemon_if_running() {
     #[cfg(not(unix))]
     return;
@@ -2238,6 +2251,9 @@ fn kill_reminder_daemon_if_running() {
                     return;
                 }
                 if is_pid_running(pid) {
+                    // Remove PID file before signaling: the daemon's SIGTERM handler checks for
+                    // the PID file to distinguish intentional kills from system shutdown.
+                    let _ = fs::remove_file(&pid_path);
                     ts_debug(&format!("kill_reminder: sending SIGTERM to {}", pid));
                     signal_pid(pid, SIGTERM);
                     thread::sleep(Duration::from_millis(150));
@@ -2245,6 +2261,8 @@ fn kill_reminder_daemon_if_running() {
                         ts_debug(&format!("kill_reminder: sending SIGKILL to {}", pid));
                         signal_pid(pid, SIGKILL);
                     }
+                    ts_debug("kill_reminder: done");
+                    return;
                 } else {
                     ts_debug("kill_reminder: process not running");
                 }
@@ -2377,7 +2395,18 @@ fn run_reminder_daemon(timesheet: &Path) {
         thread::spawn(move || {
             let mut sig: libc::c_int = 0;
             if unsafe { sigwait(&set_for_sigwait, &mut sig) } == 0 && sig == SIGTERM {
-                let _ = append_stop_entry(&timesheet_for_signal, Local::now().timestamp());
+                // Only write STOP on real system shutdown. kill_reminder_daemon_if_running()
+                // removes the PID file before sending SIGTERM, so if the file is gone (or no
+                // longer points to us) this is an intentional ts kill and we skip the STOP.
+                let my_pid = process::id();
+                let is_shutdown = fs::read_to_string(reminder_pid_path())
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .map(|p| p == my_pid)
+                    .unwrap_or(false);
+                if is_shutdown {
+                    let _ = append_stop_entry(&timesheet_for_signal, Local::now().timestamp());
+                }
                 process::exit(0);
             }
         });
