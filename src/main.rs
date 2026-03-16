@@ -50,7 +50,9 @@ use std::process::{self, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 #[cfg(unix)]
-use libc::{kill, pthread_sigmask, setpgid, sigaddset, sigemptyset, signal, sigwait, SIG_BLOCK, SIG_IGN, SIGHUP, SIGKILL, SIGTERM};
+use libc::{kill, pthread_sigmask, setpgid, setsid, sigaddset, sigemptyset, signal, sigwait, SIG_BLOCK, SIG_IGN, SIGHUP, SIGKILL, SIGTERM};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 #[cfg(target_os = "macos")]
 use libc::getuid;
 
@@ -1951,6 +1953,8 @@ exec launchctl asuser "$uid" "{}" stop
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <key>AbandonProcessGroup</key>
+    <true/>
 </dict>
 </plist>
 "#,
@@ -2278,29 +2282,28 @@ fn start_reminder_daemon_if_needed(_timesheet: &Path) {
         };
         let use_debug = env::var_os("TS_DEBUG").is_some();
         if use_debug {
-            ts_debug("start_reminder: TS_DEBUG set, spawning daemon directly (no nohup) so you see its output");
+            ts_debug("start_reminder: TS_DEBUG set, spawning daemon with inherited stdio");
         } else {
-            ts_debug(&format!("start_reminder: spawning nohup {}", exe.display()));
+            ts_debug(&format!("start_reminder: spawning {}", exe.display()));
         }
         let (stdout, stderr) = if use_debug {
             (Stdio::inherit(), Stdio::inherit())
         } else {
             (Stdio::null(), Stdio::null())
         };
-        let result = if use_debug {
+        // Use pre_exec to call setsid() in the child after fork but before exec.
+        // This places the reminder daemon in its own session before ts start exits,
+        // preventing launchd from killing it when the LaunchAgent's process group is cleaned up.
+        let result = unsafe {
             Command::new(&exe)
                 .arg("--reminder-daemon")
                 .stdin(Stdio::null())
                 .stdout(stdout)
                 .stderr(stderr)
-                .spawn()
-        } else {
-            Command::new("/usr/bin/nohup")
-                .arg(&exe)
-                .arg("--reminder-daemon")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .pre_exec(|| {
+                    setsid();
+                    Ok(())
+                })
                 .spawn()
         };
         match result {
@@ -2395,7 +2398,8 @@ fn run_reminder_daemon(timesheet: &Path) {
     #[cfg(unix)]
     {
         let _ = unsafe { signal(SIGHUP, SIG_IGN) };
-        // Detach from launchd job so we survive when the "ts start" RunAtLoad job exits (launchd kills child processes when the job's main process exits).
+        // Detach from any process group inherited from parent (belt-and-suspenders; setsid() in
+        // start_reminder_daemon_if_needed's pre_exec is the primary guard against launchd cleanup).
         let _ = unsafe { setpgid(0, 0) };
         // Block SIGTERM in main thread and spawn a handler that appends STOP on shutdown.
         let mut set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
