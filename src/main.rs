@@ -35,7 +35,7 @@
 //! | `restart`, `reminder` | Aliases for `interval`. |
 //! | `rotate`   | Rename log to `timesheet.YYMMDD`; add STOP first if last entry is START; append if same-day exists. |
 //! | `start`    | Record work start now; on macOS with no activity, shows reminder dialog to pick/enter; otherwise optional activity (default: misc/unspecified); starts/restarts reminder daemon. |
-//! | `started`  | Record a past start time; removes later STARTs, then adjusts today's last or inserts before today's STOP. |
+//! | `started`  | Record a past start time; inserts at the correct chronological position without discarding entries. |
 //! | `stop`     | Record work stop (optional time); amends previous STOP if work already stopped; stops reminder daemon and shows "stopped" dialog when a stop is recorded (skipped during logout/shutdown). |
 //! | `timeoff`  | Show stop time for 8 h/day average; only requires a START entry (adds one if log empty or last is STOP). |
 //! | `uninstall` | Stop daemon, remove autostart hooks, optionally remove log files, remove binary and icon. |
@@ -876,8 +876,8 @@ fn parse_start_time(s: &str) -> Option<DateTime<Local>> {
     None
 }
 
-/// Records a past start time; replaces today's last START or inserts before today's STOP if applicable.
-/// Removes START entries with a later start time (and their paired STOP) before adding the new entry.
+/// Records a past start time; inserts the new entry at the correct chronological position
+/// without discarding any existing entries.
 fn cmd_started(args: &[String], timesheet: &Path) -> Result<(), String> {
     let (start_time, activity) = match args.split_first() {
         Some((st, rest)) => (st.as_str(), rest.join(" ")),
@@ -894,60 +894,30 @@ fn cmd_started(args: &[String], timesheet: &Path) -> Result<(), String> {
     };
     let start_dt = parse_start_time(start_time).ok_or_else(|| format!("ts started: could not parse start time: {}", start_time))?;
     maybe_rotate_if_previous_week(timesheet)?;
-    let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
     let content = fs::read_to_string(timesheet).unwrap_or_default();
+    let new_entry = format!("{}|START|{}", start_dt.to_rfc3339(), activity);
 
-    // Remove START entries with later start time (and the STOP that pairs with them, to avoid orphans).
-    let mut kept: Vec<&str> = Vec::new();
-    let mut skip_next_stop = 0usize;
+    let mut result: Vec<&str> = Vec::new();
+    let mut inserted = false;
     for line in content.lines() {
-        if let Some(LogLine::Start(e, _)) = parse_line(line) {
-            if e > start_dt {
-                skip_next_stop += 1;
-                continue;
+        if !inserted {
+            if let Some(ll) = parse_line(line) {
+                let line_dt = match &ll {
+                    LogLine::Start(dt, _) => *dt,
+                    LogLine::Stop(dt) => *dt,
+                };
+                if line_dt > start_dt {
+                    result.push(&new_entry);
+                    inserted = true;
+                }
             }
         }
-        if skip_next_stop > 0 {
-            if parse_line(line).map(|ll| matches!(ll, LogLine::Stop(_))).unwrap_or(false) {
-                skip_next_stop = 0; // Skip the STOP that paired with the removed START(s)
-                continue;
-            }
-        }
-        kept.push(line);
+        result.push(line);
     }
-    let content = kept.join("\n") + if kept.is_empty() { "" } else { "\n" };
-
-    let last = content.lines().rev().find(|l| !l.trim().is_empty());
-    match last.and_then(parse_line) {
-        Some(LogLine::Start(last_start_dt, _)) => {
-            let start_date = last_start_dt.format("%Y-%m-%d").to_string();
-            if start_date == today {
-                let lines: Vec<&str> = content.lines().collect();
-                let without_last = if lines.is_empty() { String::new() } else { lines[..lines.len() - 1].join("\n") + "\n" };
-                let new_content = format!("{}{}|START|{}\n", without_last, start_dt.to_rfc3339(), activity);
-                fs::write(timesheet, new_content).map_err(|e| e.to_string())?;
-                println!("Started: {} at {}", activity, start_dt.format("%a %b %d %H:%M:%S %Z %Y"));
-                start_reminder_daemon_if_needed(timesheet);
-                return Ok(());
-            }
-        }
-        Some(LogLine::Stop(last_stop_dt)) => {
-            let stop_date = last_stop_dt.format("%Y-%m-%d").to_string();
-            if start_dt < last_stop_dt && stop_date == today {
-                let lines: Vec<&str> = content.lines().collect();
-                let last = lines.last().copied().unwrap_or("");
-                let without_last = if lines.is_empty() { String::new() } else { lines[..lines.len() - 1].join("\n") + "\n" };
-                let new_content = format!("{}{}|START|{}\n{}\n", without_last, start_dt.to_rfc3339(), activity, last);
-                fs::write(timesheet, new_content).map_err(|e| e.to_string())?;
-                println!("Started: {} at {}", activity, start_dt.format("%a %b %d %H:%M:%S %Z %Y"));
-                start_reminder_daemon_if_needed(timesheet);
-                return Ok(());
-            }
-        }
-        _ => {}
+    if !inserted {
+        result.push(&new_entry);
     }
-    let line = format!("{}|START|{}\n", start_dt.to_rfc3339(), activity);
-    let new_content = format!("{}{}", content, line);
+    let new_content = result.join("\n") + "\n";
     fs::write(timesheet, new_content).map_err(|e| e.to_string())?;
     println!("Started: {} at {}", activity, start_dt.format("%a %b %d %H:%M:%S %Z %Y"));
     start_reminder_daemon_if_needed(timesheet);
@@ -1651,10 +1621,8 @@ style, or
 or
 .B HH:MM
 (today).
-First removes any START entries with a later start time (and their paired STOP).
-If the last remaining entry is START recorded today, replaces that START with the new time and activity.
-If the last remaining entry is STOP recorded today and start time < stop time, inserts the new START before that STOP.
-Otherwise appends the new START.
+Inserts the new START entry at the correct chronological position.
+No existing entries are discarded.
 .TP
 .B stop
 Record work stop at
@@ -3517,12 +3485,11 @@ mod tests {
     }
 
     #[test]
-    fn test_cmd_started_removes_later_entries() {
+    fn test_cmd_started_inserts_chronologically() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("timesheet.log");
         let now = chrono::Local::now().timestamp();
         let week_start = week_start(Local.timestamp_opt(now, 0).single().unwrap());
-        // Log: early START (6:00), STOP (7:00), late START (10:00) - only "late" has start time > 7:00
         let e_early = week_start.timestamp() + 6 * 3600;
         let e_stop = week_start.timestamp() + 7 * 3600;
         let e_late = week_start.timestamp() + 10 * 3600;
@@ -3536,20 +3503,24 @@ mod tests {
             ),
         )
         .unwrap();
-        let new_epoch = week_start.timestamp() + 7 * 3600;
+        let new_epoch = week_start.timestamp() + 8 * 3600;
         let new_time = chrono::Local
             .timestamp_opt(new_epoch, 0)
             .single()
             .unwrap()
             .format("%Y-%m-%d %H:%M")
             .to_string();
-        // Add START at 07:00 - should remove START|e_late (10:00 > 7:00)
-        let result = cmd_started(&[new_time, "new".to_string()], &log_path);
+        let result = cmd_started(&[new_time, "mid".to_string()], &log_path);
         assert!(result.is_ok());
         let content = fs::read_to_string(&log_path).unwrap();
         assert!(content.contains("early"));
-        assert!(content.contains("new"));
-        assert!(!content.contains("late"));
+        assert!(content.contains("mid"));
+        assert!(content.contains("late"));
+        let early_pos = content.find("early").unwrap();
+        let mid_pos = content.find("mid").unwrap();
+        let late_pos = content.find("late").unwrap();
+        assert!(early_pos < mid_pos, "early should come before mid");
+        assert!(mid_pos < late_pos, "mid should come before late");
     }
 
     #[test]
