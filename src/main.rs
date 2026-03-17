@@ -743,7 +743,7 @@ fn cmd_tail(tail_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
         if let LogLine::Start(dt, _) = ll {
             let end = last_ten.get(i + 1).and_then(|n| match n {
                 LogLine::Stop(e) => Some(*e),
-                LogLine::Start(_, _) => None,
+                LogLine::Start(e, _) => Some(*e),
             }).unwrap_or(now);
             let secs = (end - *dt).num_seconds();
             let duration_fmt = if secs >= 3600 {
@@ -761,7 +761,7 @@ fn cmd_tail(tail_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
             LogLine::Start(dt, activity) => {
                 let end = last_ten.get(i + 1).and_then(|n| match n {
                     LogLine::Stop(e) => Some(*e),
-                    LogLine::Start(_, _) => None,
+                    LogLine::Start(e, _) => Some(*e),
                 }).unwrap_or(now);
                 let secs = (end - *dt).num_seconds();
                 let duration_fmt = if secs >= 3600 {
