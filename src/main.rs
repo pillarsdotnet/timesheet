@@ -213,9 +213,13 @@ fn week_start(now: DateTime<Local>) -> DateTime<Local> {
 }
 
 /// Parses a timestamp field: strict ISO 8601 (RFC 3339) only.
+/// The wall-clock time in the stored offset is treated as local time without
+/// any conversion through UTC.
 fn parse_timestamp_field(s: &str) -> Option<DateTime<Local>> {
     let s = s.trim();
-    DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.with_timezone(&Local))
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .and_then(|dt| dt.naive_local().and_local_timezone(Local).single())
 }
 
 /// A single parsed line from the timesheet log.
@@ -2978,10 +2982,10 @@ mod tests {
 
     #[test]
     fn test_parse_line_start() {
-        let line = "2023-11-14T22:13:20Z|START|coding";
+        let line = "2023-11-14T22:13:20-05:00|START|coding";
         let parsed = parse_line(line);
         if let Some(LogLine::Start(dt, a)) = parsed {
-            assert_eq!(dt.timestamp(), 1700000000);
+            assert_eq!(dt.naive_local(), chrono::NaiveDateTime::parse_from_str("2023-11-14T22:13:20", "%Y-%m-%dT%H:%M:%S").unwrap());
             assert_eq!(a, "coding");
         } else {
             panic!("expected Some(Start)");
@@ -2990,10 +2994,10 @@ mod tests {
 
     #[test]
     fn test_parse_line_start_empty_activity() {
-        let line = "2023-11-14T22:13:20Z|START|";
+        let line = "2023-11-14T22:13:20-05:00|START|";
         let parsed = parse_line(line);
         if let Some(LogLine::Start(dt, a)) = parsed {
-            assert_eq!(dt.timestamp(), 1700000000);
+            assert_eq!(dt.naive_local(), chrono::NaiveDateTime::parse_from_str("2023-11-14T22:13:20", "%Y-%m-%dT%H:%M:%S").unwrap());
             assert!(a.is_empty());
         } else {
             panic!("expected Some(Start)");
@@ -3002,10 +3006,10 @@ mod tests {
 
     #[test]
     fn test_parse_line_start_activity_with_pipe() {
-        let line = "2023-11-14T22:13:20Z|START|misc|unspecified";
+        let line = "2023-11-14T22:13:20-05:00|START|misc|unspecified";
         let parsed = parse_line(line);
         if let Some(LogLine::Start(dt, a)) = parsed {
-            assert_eq!(dt.timestamp(), 1700000000);
+            assert_eq!(dt.naive_local(), chrono::NaiveDateTime::parse_from_str("2023-11-14T22:13:20", "%Y-%m-%dT%H:%M:%S").unwrap());
             assert_eq!(a, "misc|unspecified");
         } else {
             panic!("expected Some(Start)");
@@ -3014,10 +3018,10 @@ mod tests {
 
     #[test]
     fn test_parse_line_stop() {
-        let line = "2023-11-14T23:13:20Z|STOP";
+        let line = "2023-11-14T23:13:20-05:00|STOP";
         let parsed = parse_line(line);
         if let Some(LogLine::Stop(dt)) = parsed {
-            assert_eq!(dt.timestamp(), 1700003600);
+            assert_eq!(dt.naive_local(), chrono::NaiveDateTime::parse_from_str("2023-11-14T23:13:20", "%Y-%m-%dT%H:%M:%S").unwrap());
         } else {
             panic!("expected Some(Stop)");
         }
@@ -3028,15 +3032,14 @@ mod tests {
         let line_start = "2026-03-06T14:30:00-08:00|START|coding";
         if let Some(LogLine::Start(dt, a)) = parse_line(line_start) {
             assert_eq!(a, "coding");
-            let expected = chrono::DateTime::parse_from_rfc3339("2026-03-06T14:30:00-08:00").unwrap().with_timezone(&Local);
-            assert_eq!(dt.timestamp(), expected.timestamp());
+            // Wall-clock time is preserved from the stored offset without UTC conversion.
+            assert_eq!(dt.naive_local(), chrono::NaiveDateTime::parse_from_str("2026-03-06T14:30:00", "%Y-%m-%dT%H:%M:%S").unwrap());
         } else {
             panic!("expected Some(Start)");
         }
         let line_stop = "2026-03-06T18:45:00-08:00|STOP";
         if let Some(LogLine::Stop(dt)) = parse_line(line_stop) {
-            let expected = chrono::DateTime::parse_from_rfc3339("2026-03-06T18:45:00-08:00").unwrap().with_timezone(&Local);
-            assert_eq!(dt.timestamp(), expected.timestamp());
+            assert_eq!(dt.naive_local(), chrono::NaiveDateTime::parse_from_str("2026-03-06T18:45:00", "%Y-%m-%dT%H:%M:%S").unwrap());
         } else {
             panic!("expected Some(Stop)");
         }
@@ -3055,10 +3058,10 @@ mod tests {
 
     #[test]
     fn test_parse_line_whitespace_trimmed() {
-        let line = "  2023-11-14T22:13:20Z|START|  x  ";
+        let line = "  2023-11-14T22:13:20-05:00|START|  x  ";
         let parsed = parse_line(line);
         if let Some(LogLine::Start(dt, activity)) = parsed {
-            assert_eq!(dt.timestamp(), 1700000000);
+            assert_eq!(dt.naive_local(), chrono::NaiveDateTime::parse_from_str("2023-11-14T22:13:20", "%Y-%m-%dT%H:%M:%S").unwrap());
             assert_eq!(activity, "  x");
         } else {
             panic!("expected Some(Start)");
