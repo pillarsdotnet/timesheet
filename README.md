@@ -1,6 +1,6 @@
 # Timesheet
 
-Copyright (c) 2025 Robert August Vincent II <pillarsdotnet@gmail.com>  
+Copyright (c) 2025 Robert August Vincent II <pillarsdotnet@gmail.com>
 Co-author: Cursor-AI.
 
 CLI for tracking work start/stop and reporting time by activity and by day of week.
