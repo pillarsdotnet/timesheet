@@ -1021,10 +1021,87 @@ fn cmd_timeoff(timesheet: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Interactively replace activity text in this week's START entries; pattern is a regex, prompt Replace (y/n) per match.
+/// Interactively replace activity text in this week's START entries.
+/// Searches literally first; if nothing matches and the search text is a valid regex, falls back to regex replacement.
+/// Prompts Replace (y/n/a) per match.
 /// Used by both `alias` and `rename` subcommands.
+struct WorkaliasMatch {
+    line_num: usize,
+    dt: DateTime<Local>,
+    replacement: String,
+}
+
+fn should_replace_workalias_match(input: &str, replace_all: &mut bool) -> bool {
+    if *replace_all {
+        return true;
+    }
+
+    match input.trim().to_ascii_lowercase().as_str() {
+        "y" => true,
+        "a" => {
+            *replace_all = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn collect_workalias_matches_with<F>(
+    content: &str,
+    week_start_dt: DateTime<Local>,
+    week_end: DateTime<Local>,
+    replacer: F,
+) -> Vec<WorkaliasMatch>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut matches_vec = Vec::new();
+
+    for (i, line) in content.lines().enumerate() {
+        if let Some(LogLine::Start(dt, activity)) = parse_line(line) {
+            if dt >= week_start_dt && dt <= week_end {
+                if let Some(updated_activity) = replacer(&activity) {
+                    matches_vec.push(WorkaliasMatch {
+                        line_num: i + 1,
+                        dt,
+                        replacement: updated_activity,
+                    });
+                }
+            }
+        }
+    }
+
+    matches_vec
+}
+
+fn collect_workalias_matches(
+    content: &str,
+    week_start_dt: DateTime<Local>,
+    week_end: DateTime<Local>,
+    search_text: &str,
+    replacement: &str,
+) -> Vec<WorkaliasMatch> {
+    let literal_matches = collect_workalias_matches_with(content, week_start_dt, week_end, |activity| {
+        activity
+            .contains(search_text)
+            .then(|| activity.replace(search_text, replacement))
+    });
+    if !literal_matches.is_empty() {
+        return literal_matches;
+    }
+
+    let Ok(re) = Regex::new(search_text) else {
+        return Vec::new();
+    };
+
+    collect_workalias_matches_with(content, week_start_dt, week_end, |activity| {
+        re.is_match(activity)
+            .then(|| re.replace_all(activity, replacement).into_owned())
+    })
+}
+
 fn cmd_workalias(args: &[String], timesheet: &Path) -> Result<(), String> {
-    let (pattern, replacement) = match args {
+    let (search_text, replacement) = match args {
         [p, r, ..] => (p.as_str(), r.to_string()),
         _ => {
             eprintln!("Usage: ts alias <pattern> <replacement>");
@@ -1038,29 +1115,31 @@ fn cmd_workalias(args: &[String], timesheet: &Path) -> Result<(), String> {
     let now = Local::now();
     let week_start_dt = week_start(now);
     let week_end = week_start_dt + chrono::Duration::weeks(1) - chrono::Duration::seconds(1);
-    let re = Regex::new(pattern).map_err(|e| format!("invalid pattern: {}", e))?;
     let content = fs::read_to_string(timesheet).map_err(|e| e.to_string())?;
-    let mut matches_vec: Vec<(usize, DateTime<Local>, String)> = Vec::new();
-    for (i, line) in content.lines().enumerate() {
-        if let Some(LogLine::Start(dt, activity)) = parse_line(line) {
-            if dt >= week_start_dt && dt <= week_end && re.is_match(&activity) {
-                matches_vec.push((i + 1, dt, replacement.clone()));
-            }
-        }
-    }
+    let matches_vec = collect_workalias_matches(
+        &content,
+        week_start_dt,
+        week_end,
+        search_text,
+        &replacement,
+    );
     if matches_vec.is_empty() {
         return Err(format!(
             "ts alias: no activities matching \"{}\" found for this week.",
-            pattern
+            search_text
         ));
     }
     let lines_vec: Vec<&str> = content.lines().collect();
-    let mut replace_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut replace_lines: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
-    for (line_num, dt, new_repl) in &matches_vec {
+    let mut replace_all = false;
+    for workalias_match in &matches_vec {
+        let line_num = workalias_match.line_num;
+        let dt = workalias_match.dt;
+        let new_repl = &workalias_match.replacement;
         let orig_activity = lines_vec
-            .get(*line_num - 1)
+            .get(line_num - 1)
             .and_then(|l| parse_line(l))
             .and_then(|ll| match ll {
                 LogLine::Start(_, a) => Some(a),
@@ -1068,13 +1147,13 @@ fn cmd_workalias(args: &[String], timesheet: &Path) -> Result<(), String> {
             })
             .unwrap_or_default();
         let end_dt = lines_vec
-            .get(*line_num)
+            .get(line_num)
             .and_then(|l| parse_line(l))
             .map(|ll| match ll {
                 LogLine::Start(e, _) | LogLine::Stop(e) => e,
             })
             .unwrap_or(now);
-        let secs = (end_dt - *dt).num_seconds();
+        let secs = (end_dt - dt).num_seconds();
         let duration_fmt = if secs >= 3600 {
             format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
         } else if secs >= 60 {
@@ -1094,13 +1173,17 @@ fn cmd_workalias(args: &[String], timesheet: &Path) -> Result<(), String> {
             duration_fmt,
             new_repl
         );
-        print!("Replace (y/n) ");
+        if replace_all {
+            replace_lines.insert(line_num, new_repl.clone());
+            continue;
+        }
+        print!("Replace (y/n/a) ");
         stdout.flush().map_err(|e| e.to_string())?;
         let mut buf = String::new();
         if stdin.lock().read_line(&mut buf).is_ok()
-            && buf.trim().eq_ignore_ascii_case("y")
+            && should_replace_workalias_match(&buf, &mut replace_all)
         {
-            replace_lines.insert(*line_num);
+            replace_lines.insert(line_num, new_repl.clone());
         }
     }
     if replace_lines.is_empty() {
@@ -1109,11 +1192,11 @@ fn cmd_workalias(args: &[String], timesheet: &Path) -> Result<(), String> {
     let mut out = String::new();
     for (i, line) in content.lines().enumerate() {
         let line_no = i + 1;
-        let should_replace = replace_lines.contains(&line_no);
-        if should_replace {
+        if let Some(new_activity) = replace_lines.get(&line_no) {
             if let Some(LogLine::Start(dt, activity)) = parse_line(line) {
-                if dt >= week_start_dt && dt <= week_end && re.is_match(&activity) {
-                    out.push_str(&format!("{}|START|{}\n", dt.to_rfc3339(), replacement));
+                if dt >= week_start_dt && dt <= week_end {
+                    let _ = activity;
+                    out.push_str(&format!("{}|START|{}\n", dt.to_rfc3339(), new_activity));
                     continue;
                 }
             }
@@ -1455,15 +1538,21 @@ The report uses these pairs to compute duration and attribute time to activity a
 .B alias
 Interactively replace activity text in START entries from the current week.
 .I pattern
-is a regex;
+is matched literally first;
+.I pattern
+is treated as a regex only if no literal matches are found and it compiles as a valid regex;
 .I replacement
 is the replacement string.
 For each match, prompts
-.B Replace\ (y/n);
+.B Replace\ (y/n/a);
 .B y
 or
 .B Y
 applies the replacement. Errors if no matches this week.
+.B a
+or
+.B A
+applies the current replacement and all remaining matches without prompting again.
 .TP
 .B autostart
 [\fIinterval\fR]
@@ -3603,6 +3692,91 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no activities matching"));
+    }
+
+    #[test]
+    fn test_collect_workalias_matches_prefers_literal_replacement() {
+        let now = chrono::Local::now().timestamp();
+        let week_start = week_start(Local.timestamp_opt(now, 0).single().unwrap());
+        let content = format!(
+            "{}|START|api.v1\n{}|STOP\n{}|START|plain text\n{}|STOP\n",
+            fmt_ts(week_start.timestamp()),
+            fmt_ts(week_start.timestamp() + 60),
+            fmt_ts(week_start.timestamp() + 120),
+            fmt_ts(week_start.timestamp() + 180)
+        );
+
+        let matches_vec = collect_workalias_matches(&content, week_start, week_start + chrono::Duration::weeks(1) - chrono::Duration::seconds(1), ".", "-");
+
+        assert_eq!(matches_vec.len(), 1);
+        assert_eq!(matches_vec[0].replacement, "api-v1");
+    }
+
+    #[test]
+    fn test_collect_workalias_matches_falls_back_to_regex() {
+        let now = chrono::Local::now().timestamp();
+        let week_start = week_start(Local.timestamp_opt(now, 0).single().unwrap());
+        let content = format!(
+            "{}|START|feature 123\n{}|STOP\n",
+            fmt_ts(week_start.timestamp()),
+            fmt_ts(week_start.timestamp() + 60)
+        );
+
+        let matches_vec = collect_workalias_matches(
+            &content,
+            week_start,
+            week_start + chrono::Duration::weeks(1) - chrono::Duration::seconds(1),
+            "\\d+",
+            "456",
+        );
+
+        assert_eq!(matches_vec.len(), 1);
+        assert_eq!(matches_vec[0].replacement, "feature 456");
+    }
+
+    #[test]
+    fn test_collect_workalias_matches_invalid_regex_without_literal_match() {
+        let now = chrono::Local::now().timestamp();
+        let week_start = week_start(Local.timestamp_opt(now, 0).single().unwrap());
+        let content = format!(
+            "{}|START|feature 123\n{}|STOP\n",
+            fmt_ts(week_start.timestamp()),
+            fmt_ts(week_start.timestamp() + 60)
+        );
+
+        let matches_vec = collect_workalias_matches(
+            &content,
+            week_start,
+            week_start + chrono::Duration::weeks(1) - chrono::Duration::seconds(1),
+            "[",
+            "456",
+        );
+
+        assert!(matches_vec.is_empty());
+    }
+
+    #[test]
+    fn test_should_replace_workalias_match_accepts_replace_all() {
+        let mut replace_all = false;
+
+        assert!(should_replace_workalias_match("a\n", &mut replace_all));
+        assert!(replace_all);
+    }
+
+    #[test]
+    fn test_should_replace_workalias_match_auto_replaces_after_replace_all() {
+        let mut replace_all = true;
+
+        assert!(should_replace_workalias_match("n\n", &mut replace_all));
+        assert!(replace_all);
+    }
+
+    #[test]
+    fn test_should_replace_workalias_match_skips_other_inputs() {
+        let mut replace_all = false;
+
+        assert!(!should_replace_workalias_match("n\n", &mut replace_all));
+        assert!(!replace_all);
     }
 
     #[test]
