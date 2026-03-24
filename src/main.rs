@@ -742,43 +742,38 @@ fn cmd_tail(tail_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
     }
     let last_ten: Vec<&LogLine> = dedup.iter().rev().take(10).rev().collect();
     let now = Local::now();
+    let fmt_duration = |secs: i64| -> String {
+        if secs >= 3600 {
+            format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+        } else if secs >= 60 {
+            format!("{}m", secs / 60)
+        } else {
+            format!("{}s", secs)
+        }
+    };
+    let duration_for = |i: usize, ll: &&LogLine| -> String {
+        let dt = match ll {
+            LogLine::Start(dt, _) => dt,
+            LogLine::Stop(dt) => dt,
+        };
+        let end = last_ten.get(i + 1).and_then(|n| match n {
+            LogLine::Stop(e) => Some(*e),
+            LogLine::Start(e, _) => Some(*e),
+        }).unwrap_or(now);
+        fmt_duration((end - *dt).num_seconds())
+    };
     let mut max_duration_width = 0usize;
     for (i, ll) in last_ten.iter().enumerate() {
-        if let LogLine::Start(dt, _) = ll {
-            let end = last_ten.get(i + 1).and_then(|n| match n {
-                LogLine::Stop(e) => Some(*e),
-                LogLine::Start(e, _) => Some(*e),
-            }).unwrap_or(now);
-            let secs = (end - *dt).num_seconds();
-            let duration_fmt = if secs >= 3600 {
-                format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
-            } else if secs >= 60 {
-                format!("{}m", secs / 60)
-            } else {
-                format!("{}s", secs)
-            };
-            max_duration_width = max_duration_width.max(duration_fmt.len());
-        }
+        max_duration_width = max_duration_width.max(duration_for(i, ll).len());
     }
     for (i, ll) in last_ten.iter().enumerate() {
+        let dur = duration_for(i, ll);
         match ll {
             LogLine::Start(dt, activity) => {
-                let end = last_ten.get(i + 1).and_then(|n| match n {
-                    LogLine::Stop(e) => Some(*e),
-                    LogLine::Start(e, _) => Some(*e),
-                }).unwrap_or(now);
-                let secs = (end - *dt).num_seconds();
-                let duration_fmt = if secs >= 3600 {
-                    format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
-                } else if secs >= 60 {
-                    format!("{}m", secs / 60)
-                } else {
-                    format!("{}s", secs)
-                };
-                println!("START  {}  {:>width$}  {}", dt.format("%Y-%m-%d %H:%M:%S"), duration_fmt, activity, width = max_duration_width);
+                println!("START  {}  {:>width$}  {}", dt.format("%Y-%m-%d %H:%M:%S"), dur, activity, width = max_duration_width);
             }
             LogLine::Stop(dt) => {
-                println!("STOP   {}", dt.format("%Y-%m-%d %H:%M:%S"));
+                println!("STOP   {}  {:>width$}", dt.format("%Y-%m-%d %H:%M:%S"), dur, width = max_duration_width);
             }
         }
     }
@@ -1549,7 +1544,8 @@ files in the timesheet log directory to current format (timestamp first, ISO 860
 .TP
 .B tail
 Output the latest ten log entries; timestamps are shown in local time.
-START lines include a duration (until the next STOP, or current time if none).
+Each entry includes a duration: for START, time until the next different event or current time;
+for STOP, time until the next START or current time.
 Consecutive START entries with the same activity are collapsed (last timestamp kept), then the last 10 entries are shown.
 Optional
 .I file_or_extension
