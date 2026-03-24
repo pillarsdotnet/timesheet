@@ -565,6 +565,24 @@ fn resolve_list_input(arg: Option<&str>, timesheet: &Path) -> Result<PathBuf, St
 /// exits before the final start call), then restarts it after recording START to reset the timer.
 fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
     maybe_rotate_if_previous_week(timesheet)?;
+    // Guard against shutdown/reload race: if auto-invoked (no args) and the last log
+    // entry is a very recent STOP, skip — launchd is re-firing RunAtLoad during shutdown,
+    // not a genuine login.
+    if args.is_empty() {
+        let content = fs::read_to_string(timesheet).unwrap_or_default();
+        let last = content.lines().rev().find(|l| !l.trim().is_empty());
+        if let Some(LogLine::Stop(dt)) = last.and_then(parse_line) {
+            let age = Local::now().signed_duration_since(dt).num_seconds();
+            if age >= 0 && age < 60 {
+                if env::var_os("TS_DEBUG").is_some() {
+                    let _ = std::io::stderr().write_all(
+                        b"ts: skipping start: last STOP was <60s ago (shutdown/reload guard)\n",
+                    );
+                }
+                return Ok(());
+            }
+        }
+    }
     // Start daemon early so it is running even when ts start is invoked at login (LaunchAgent) and exits quickly.
     start_reminder_daemon_if_needed(timesheet);
     let activity = if args.is_empty() {
@@ -1462,7 +1480,8 @@ On macOS installs two LaunchAgents and a logout hook:
 \fBcom.ts.autostart.start\fR
 Runs
 .B "ts start"
-at login (RunAtLoad).
+at login (RunAtLoad, limited to Aqua sessions).
+A shutdown guard skips the start if the last log entry is a STOP less than 60\ s old.
 .TP
 \fBcom.ts.autostart.session\fR
 Runs
@@ -1921,6 +1940,8 @@ exec launchctl asuser "$uid" "{}" stop
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
     <key>AbandonProcessGroup</key>
     <true/>
 </dict>
