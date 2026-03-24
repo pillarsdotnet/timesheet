@@ -6,12 +6,14 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, AnyThread, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSEvent, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSButton, NSImage, NSAutoresizingMaskOptions, NSPanel, NSScreen, NSScrollView, NSStackView,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
+    NSBackingStoreType, NSButton, NSEvent, NSImage, NSPanel, NSScreen, NSScrollView, NSStackView,
     NSStackViewDistribution, NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowDelegate,
     NSWindowStyleMask,
 };
-use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSString, NSSize};
+use objc2_foundation::{
+    NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+};
 use std::cell::RefCell;
 use std::path::PathBuf;
 
@@ -22,7 +24,6 @@ const NS_USER_INTERFACE_LAYOUT_ORIENTATION_VERTICAL: NSUserInterfaceLayoutOrient
 thread_local! {
     static DIALOG_RESULT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
-
 
 static CHOICES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 /// Icon path for dock (ts-icon.svg/png next to exe, or assets/icon.svg when running from repo).
@@ -42,10 +43,13 @@ pub fn run_native_reminder_dialog(choices: Vec<String>) -> Option<String> {
             .and_then(|dir| {
                 let next_to = [dir.join("ts-icon.svg"), dir.join("ts-icon.png")];
                 let dev = dir.join("..").join("assets").join("icon.svg");
-                next_to
-                    .into_iter()
-                    .find(|p| p.exists())
-                    .or_else(|| if dev.exists() { Some(dev) } else { None })
+                next_to.into_iter().find(|p| p.exists()).or_else(|| {
+                    if dev.exists() {
+                        Some(dev)
+                    } else {
+                        None
+                    }
+                })
             }),
     );
 
@@ -176,7 +180,8 @@ define_class!(
 
             // Create handler for button clicks.
             let handler_alloc = TSReminderButtonHandler::alloc(mtm);
-            let handler: Retained<TSReminderButtonHandler> = unsafe { msg_send![handler_alloc, init] };
+            let handler: Retained<TSReminderButtonHandler> =
+                unsafe { msg_send![handler_alloc, init] };
             let sel_choice_clicked = objc2::sel!(choiceClicked:);
 
             // Panel: full screen.
@@ -185,14 +190,13 @@ define_class!(
                 .unwrap_or_else(|| NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 600.0)));
             let style = NSWindowStyleMask::Titled; // No Closable: only button-clicks dismiss
             let panel_alloc = NSPanel::alloc(mtm);
-            let panel: Retained<NSPanel> =
-                NSPanel::initWithContentRect_styleMask_backing_defer(
-                    panel_alloc,
-                    NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, 400.0)),
-                    style,
-                    NSBackingStoreType::Buffered,
-                    false,
-                );
+            let panel: Retained<NSPanel> = NSPanel::initWithContentRect_styleMask_backing_defer(
+                panel_alloc,
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, 400.0)),
+                style,
+                NSBackingStoreType::Buffered,
+                false,
+            );
             panel.setFrame_display(screen_frame, true);
             panel.setTitle(&NSString::from_str("What are you working on?"));
             unsafe { panel.setReleasedWhenClosed(false) };

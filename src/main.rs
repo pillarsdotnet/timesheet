@@ -41,20 +41,23 @@
 //! | `uninstall` | Stop daemon, remove autostart hooks, optionally remove log files, remove binary and icon. |
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime};
+#[cfg(target_os = "macos")]
+use libc::getuid;
+#[cfg(unix)]
+use libc::{
+    kill, pthread_sigmask, setpgid, setsid, sigaddset, sigemptyset, signal, sigwait, SIGHUP,
+    SIGKILL, SIGTERM, SIG_BLOCK, SIG_IGN,
+};
 use regex::Regex;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::thread;
 use std::time::Duration;
-#[cfg(unix)]
-use libc::{kill, pthread_sigmask, setpgid, setsid, sigaddset, sigemptyset, signal, sigwait, SIG_BLOCK, SIG_IGN, SIGHUP, SIGKILL, SIGTERM};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-#[cfg(target_os = "macos")]
-use libc::getuid;
 
 #[cfg(target_os = "macos")]
 mod reminder_dialog_macos;
@@ -68,7 +71,13 @@ const EMBEDDED_ICON_SVG: &[u8] = include_bytes!("../assets/icon.svg");
 
 /// Weekday names for the list report (Sunday first).
 const DAY_NAMES: [&str; 7] = [
-    "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
 ];
 
 /// Truncate hours to two decimal places (discard fractions beyond the second decimal).
@@ -159,7 +168,8 @@ fn activities_this_week_most_recent_first(timesheet: &Path) -> Vec<String> {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    let mut by_activity: std::collections::HashMap<String, DateTime<Local>> = std::collections::HashMap::new();
+    let mut by_activity: std::collections::HashMap<String, DateTime<Local>> =
+        std::collections::HashMap::new();
     for line in content.lines() {
         if let Some(LogLine::Start(dt, activity)) = parse_line(line) {
             if dt >= week_start_dt && dt <= week_end {
@@ -262,7 +272,7 @@ fn max_dt_in_log(path: &Path) -> Option<DateTime<Local>> {
     for line in content.lines() {
         match parse_line(line) {
             Some(LogLine::Start(dt, _)) | Some(LogLine::Stop(dt)) => {
-                if max.map_or(true, |m| dt > m) {
+                if max.is_none_or(|m| dt > m) {
                     max = Some(dt);
                 }
             }
@@ -280,10 +290,10 @@ fn date_range_in_log(path: &Path) -> Option<(NaiveDate, NaiveDate)> {
     for line in content.lines() {
         match parse_line(line) {
             Some(LogLine::Start(dt, _)) | Some(LogLine::Stop(dt)) => {
-                if min_dt.map_or(true, |m| dt < m) {
+                if min_dt.is_none_or(|m| dt < m) {
                     min_dt = Some(dt);
                 }
-                if max_dt.map_or(true, |m| dt > m) {
+                if max_dt.is_none_or(|m| dt > m) {
                     max_dt = Some(dt);
                 }
             }
@@ -305,20 +315,33 @@ fn do_rotate(timesheet: &Path) -> Result<(), String> {
     }
     let content = fs::read_to_string(timesheet).map_err(|e| e.to_string())?;
     let last = content.lines().rev().find(|l| !l.trim().is_empty());
-    if last.and_then(parse_line).map(|ll| matches!(ll, LogLine::Start(..))).unwrap_or(false) {
+    if last
+        .and_then(parse_line)
+        .map(|ll| matches!(ll, LogLine::Start(..)))
+        .unwrap_or(false)
+    {
         let now = Local::now();
-        let mut f = fs::OpenOptions::new().append(true).open(timesheet).map_err(|e| e.to_string())?;
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(timesheet)
+            .map_err(|e| e.to_string())?;
         f.write_all(format!("{}|STOP\n", now.to_rfc3339()).as_bytes())
             .map_err(|e| e.to_string())?;
     }
     let max_dt = max_dt_in_log(timesheet).ok_or("ts rotate: no valid entries in timesheet.")?;
     let stamp = max_dt.format("%y%m%d").to_string();
     let parent = timesheet.parent().ok_or("ts rotate: no parent dir")?;
-    let stem = timesheet.file_stem().and_then(|s| s.to_str()).unwrap_or("timesheet");
+    let stem = timesheet
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("timesheet");
     let dest = parent.join(format!("{}.{}", stem, stamp));
     let content = fs::read_to_string(timesheet).map_err(|e| e.to_string())?;
     if dest.exists() {
-        let mut f = fs::OpenOptions::new().append(true).open(&dest).map_err(|e| e.to_string())?;
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(&dest)
+            .map_err(|e| e.to_string())?;
         f.write_all(content.as_bytes()).map_err(|e| e.to_string())?;
         fs::remove_file(timesheet).map_err(|e| e.to_string())?;
         println!("Appended to {}", dest.display());
@@ -384,11 +407,14 @@ fn cmd_migrate(timesheet: &Path) -> Result<(), String> {
         }
     }
     for path in &files {
-        let content = fs::read_to_string(path).map_err(|e| format!("ts migrate: read {}: {}", path.display(), e))?;
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("ts migrate: read {}: {}", path.display(), e))?;
         let mut out = String::new();
         for line in content.lines() {
             let new_line = match migrate_parse_line(line) {
-                Some(LogLine::Start(dt, activity)) => format!("{}|START|{}\n", dt.to_rfc3339(), activity),
+                Some(LogLine::Start(dt, activity)) => {
+                    format!("{}|START|{}\n", dt.to_rfc3339(), activity)
+                }
                 Some(LogLine::Stop(dt)) => format!("{}|STOP\n", dt.to_rfc3339()),
                 None => {
                     if line.is_empty() {
@@ -400,7 +426,8 @@ fn cmd_migrate(timesheet: &Path) -> Result<(), String> {
             };
             out.push_str(&new_line);
         }
-        fs::write(path, &out).map_err(|e| format!("ts migrate: write {}: {}", path.display(), e))?;
+        fs::write(path, &out)
+            .map_err(|e| format!("ts migrate: write {}: {}", path.display(), e))?;
         println!("Migrated {}", path.display());
     }
     if files.is_empty() {
@@ -442,8 +469,13 @@ fn resolve_list_input(arg: Option<&str>, timesheet: &Path) -> Result<PathBuf, St
         for e in entries.flatten() {
             let p = e.path();
             if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("timesheet.") && name != "timesheet.log"
-                    && name.as_bytes().get(10).map(|&b| b.is_ascii_digit()).unwrap_or(false)
+                if name.starts_with("timesheet.")
+                    && name != "timesheet.log"
+                    && name
+                        .as_bytes()
+                        .get(10)
+                        .map(|&b| b.is_ascii_digit())
+                        .unwrap_or(false)
                 {
                     candidates.push(p);
                 }
@@ -573,7 +605,7 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
         let last = content.lines().rev().find(|l| !l.trim().is_empty());
         if let Some(LogLine::Stop(dt)) = last.and_then(parse_line) {
             let age = Local::now().signed_duration_since(dt).num_seconds();
-            if age >= 0 && age < 60 {
+            if (0..60).contains(&age) {
                 if env::var_os("TS_DEBUG").is_some() {
                     let _ = std::io::stderr().write_all(
                         b"ts: skipping start: last STOP was <60s ago (shutdown/reload guard)\n",
@@ -601,7 +633,9 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
                         let _ = append_stop_entry(timesheet, dt);
                         // re-show immediately
                     }
-                    ReminderResult::EnterNew => unreachable!("show_reminder_prompt converts EnterNew to Activity"),
+                    ReminderResult::EnterNew => {
+                        unreachable!("show_reminder_prompt converts EnterNew to Activity")
+                    }
                 }
             }
         }
@@ -615,7 +649,11 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
     {
         let content = fs::read_to_string(timesheet).unwrap_or_default();
         let last = content.lines().rev().find(|l| !l.trim().is_empty());
-        if last.and_then(parse_line).map(|ll| matches!(ll, LogLine::Start(_, _))).unwrap_or(false) {
+        if last
+            .and_then(parse_line)
+            .map(|ll| matches!(ll, LogLine::Start(_, _)))
+            .unwrap_or(false)
+        {
             let stop_line = format!("{}|STOP\n", now.to_rfc3339());
             if let Ok(mut sf) = fs::OpenOptions::new().append(true).open(timesheet) {
                 let _ = sf.write_all(stop_line.as_bytes());
@@ -623,9 +661,17 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
         }
     }
     let line = format!("{}|START|{}\n", now.to_rfc3339(), activity);
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(timesheet).map_err(|e| e.to_string())?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(timesheet)
+        .map_err(|e| e.to_string())?;
     f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
-    println!("Started: {} at {}", activity, Local::now().format("%a %b %d %H:%M:%S %Z %Y"));
+    println!(
+        "Started: {} at {}",
+        activity,
+        Local::now().format("%a %b %d %H:%M:%S %Z %Y")
+    );
     kill_reminder_daemon_if_running();
     thread::sleep(Duration::from_millis(100));
     start_reminder_daemon_if_needed(timesheet);
@@ -638,11 +684,16 @@ fn cmd_stop(args: &[String], timesheet: &Path) -> Result<(), String> {
     maybe_rotate_if_previous_week(timesheet)?;
     let content = fs::read_to_string(timesheet).unwrap_or_default();
     let last = content.lines().rev().find(|l| !l.trim().is_empty());
-    if last.and_then(parse_line).map(|ll| matches!(ll, LogLine::Stop(_))).unwrap_or(false) {
+    if last
+        .and_then(parse_line)
+        .map(|ll| matches!(ll, LogLine::Stop(_)))
+        .unwrap_or(false)
+    {
         let Some(t) = args.first().map(String::as_str) else {
             return Ok(());
         };
-        let stop_dt = parse_start_time(t).ok_or_else(|| format!("ts stop: could not parse stop time: {}", t))?;
+        let stop_dt = parse_start_time(t)
+            .ok_or_else(|| format!("ts stop: could not parse stop time: {}", t))?;
         let lines: Vec<&str> = content.lines().collect();
         let without_last = if lines.is_empty() {
             String::new()
@@ -659,11 +710,16 @@ fn cmd_stop(args: &[String], timesheet: &Path) -> Result<(), String> {
         return Ok(());
     }
     let stop_dt = match args.first().map(String::as_str) {
-        Some(t) => parse_start_time(t).ok_or_else(|| format!("ts stop: could not parse stop time: {}", t))?,
+        Some(t) => parse_start_time(t)
+            .ok_or_else(|| format!("ts stop: could not parse stop time: {}", t))?,
         None => Local::now(),
     };
     let line = format!("{}|STOP\n", stop_dt.to_rfc3339());
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(timesheet).map_err(|e| e.to_string())?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(timesheet)
+        .map_err(|e| e.to_string())?;
     f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
     if is_reminder_daemon_running() {
         show_reminders_stopped_notification();
@@ -673,7 +729,10 @@ fn cmd_stop(args: &[String], timesheet: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn process_log_for_report(lines: &[(usize, LogLine)], virtual_stop: Option<DateTime<Local>>) -> (Vec<(String, f64, f64)>, Vec<f64>, bool) {
+fn process_log_for_report(
+    lines: &[(usize, LogLine)],
+    virtual_stop: Option<DateTime<Local>>,
+) -> (Vec<(String, f64, f64)>, Vec<f64>, bool) {
     let mut stack: Vec<(DateTime<Local>, String)> = Vec::new();
     let mut act_sec: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut dow_sec: [f64; 7] = [0.0; 7];
@@ -738,10 +797,7 @@ fn cmd_tail(tail_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
         return Ok(());
     }
     let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let entries: Vec<LogLine> = content
-        .lines()
-        .filter_map(|line| parse_line(line))
-        .collect();
+    let entries: Vec<LogLine> = content.lines().filter_map(parse_line).collect();
     let mut dedup: Vec<LogLine> = Vec::new();
     for ll in &entries {
         match ll {
@@ -774,10 +830,13 @@ fn cmd_tail(tail_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
             LogLine::Start(dt, _) => dt,
             LogLine::Stop(dt) => dt,
         };
-        let end = last_ten.get(i + 1).and_then(|n| match n {
-            LogLine::Stop(e) => Some(*e),
-            LogLine::Start(e, _) => Some(*e),
-        }).unwrap_or(now);
+        let end = last_ten
+            .get(i + 1)
+            .map(|n| match n {
+                LogLine::Stop(e) => *e,
+                LogLine::Start(e, _) => *e,
+            })
+            .unwrap_or(now);
         fmt_duration((end - *dt).num_seconds())
     };
     let mut max_duration_width = 0usize;
@@ -788,10 +847,21 @@ fn cmd_tail(tail_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
         let dur = duration_for(i, ll);
         match ll {
             LogLine::Start(dt, activity) => {
-                println!("START  {}  {:>width$}  {}", dt.format("%Y-%m-%d %H:%M:%S"), dur, activity, width = max_duration_width);
+                println!(
+                    "START  {}  {:>width$}  {}",
+                    dt.format("%Y-%m-%d %H:%M:%S"),
+                    dur,
+                    activity,
+                    width = max_duration_width
+                );
             }
             LogLine::Stop(dt) => {
-                println!("STOP   {}  {:>width$}", dt.format("%Y-%m-%d %H:%M:%S"), dur, width = max_duration_width);
+                println!(
+                    "STOP   {}  {:>width$}",
+                    dt.format("%Y-%m-%d %H:%M:%S"),
+                    dur,
+                    width = max_duration_width
+                );
             }
         }
     }
@@ -816,7 +886,10 @@ fn cmd_list(list_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
         }
     }
     let is_current = list_arg.is_none() || list_arg == Some("log");
-    let last_start = lines.iter().rev().find(|(_, l)| matches!(l, LogLine::Start(_, _)));
+    let last_start = lines
+        .iter()
+        .rev()
+        .find(|(_, l)| matches!(l, LogLine::Start(_, _)));
     let virtual_stop = if is_current && last_start.is_some() {
         Some(Local::now())
     } else {
@@ -888,7 +961,11 @@ fn parse_start_time(s: &str) -> Option<DateTime<Local>> {
         return today.and_time(t).and_local_timezone(Local).single();
     }
     if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        return d.and_hms_opt(0, 0, 0).unwrap().and_local_timezone(Local).single();
+        return d
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .single();
     }
     None
 }
@@ -909,7 +986,8 @@ fn cmd_started(args: &[String], timesheet: &Path) -> Result<(), String> {
     } else {
         activity
     };
-    let start_dt = parse_start_time(start_time).ok_or_else(|| format!("ts started: could not parse start time: {}", start_time))?;
+    let start_dt = parse_start_time(start_time)
+        .ok_or_else(|| format!("ts started: could not parse start time: {}", start_time))?;
     maybe_rotate_if_previous_week(timesheet)?;
     let content = fs::read_to_string(timesheet).unwrap_or_default();
     let new_entry = format!("{}|START|{}", start_dt.to_rfc3339(), activity);
@@ -936,7 +1014,11 @@ fn cmd_started(args: &[String], timesheet: &Path) -> Result<(), String> {
     }
     let new_content = result.join("\n") + "\n";
     fs::write(timesheet, new_content).map_err(|e| e.to_string())?;
-    println!("Started: {} at {}", activity, start_dt.format("%a %b %d %H:%M:%S %Z %Y"));
+    println!(
+        "Started: {} at {}",
+        activity,
+        start_dt.format("%a %b %d %H:%M:%S %Z %Y")
+    );
     start_reminder_daemon_if_needed(timesheet);
     Ok(())
 }
@@ -948,7 +1030,9 @@ fn cmd_timeoff(timesheet: &Path) -> Result<(), String> {
     let needs_start = if timesheet.exists() {
         let content = fs::read_to_string(timesheet).unwrap_or_default();
         let last = content.lines().rev().find(|l| !l.trim().is_empty());
-        last.and_then(parse_line).map(|ll| matches!(ll, LogLine::Stop(_))).unwrap_or(true) // empty or last is STOP -> need START
+        last.and_then(parse_line)
+            .map(|ll| matches!(ll, LogLine::Stop(_)))
+            .unwrap_or(true) // empty or last is STOP -> need START
     } else {
         true
     };
@@ -958,7 +1042,11 @@ fn cmd_timeoff(timesheet: &Path) -> Result<(), String> {
         }
         let now = Local::now();
         let line = format!("{}|START|misc/unspecified\n", now.to_rfc3339());
-        let mut f = fs::OpenOptions::new().create(true).append(true).open(timesheet).map_err(|e| e.to_string())?;
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(timesheet)
+            .map_err(|e| e.to_string())?;
         f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
     }
     let content = fs::read_to_string(timesheet).unwrap_or_default();
@@ -1081,11 +1169,12 @@ fn collect_workalias_matches(
     search_text: &str,
     replacement: &str,
 ) -> Vec<WorkaliasMatch> {
-    let literal_matches = collect_workalias_matches_with(content, week_start_dt, week_end, |activity| {
-        activity
-            .contains(search_text)
-            .then(|| activity.replace(search_text, replacement))
-    });
+    let literal_matches =
+        collect_workalias_matches_with(content, week_start_dt, week_end, |activity| {
+            activity
+                .contains(search_text)
+                .then(|| activity.replace(search_text, replacement))
+        });
     if !literal_matches.is_empty() {
         return literal_matches;
     }
@@ -1116,13 +1205,8 @@ fn cmd_workalias(args: &[String], timesheet: &Path) -> Result<(), String> {
     let week_start_dt = week_start(now);
     let week_end = week_start_dt + chrono::Duration::weeks(1) - chrono::Duration::seconds(1);
     let content = fs::read_to_string(timesheet).map_err(|e| e.to_string())?;
-    let matches_vec = collect_workalias_matches(
-        &content,
-        week_start_dt,
-        week_end,
-        search_text,
-        &replacement,
-    );
+    let matches_vec =
+        collect_workalias_matches(&content, week_start_dt, week_end, search_text, &replacement);
     if matches_vec.is_empty() {
         return Err(format!(
             "ts alias: no activities matching \"{}\" found for this week.",
@@ -1130,7 +1214,8 @@ fn cmd_workalias(args: &[String], timesheet: &Path) -> Result<(), String> {
         ));
     }
     let lines_vec: Vec<&str> = content.lines().collect();
-    let mut replace_lines: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    let mut replace_lines: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut replace_all = false;
@@ -1219,7 +1304,8 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
     let dest = if let Some(d) = dest_dir {
         let p = PathBuf::from(d);
         if !p.exists() {
-            fs::create_dir_all(&p).map_err(|e| format!("ts install: cannot create directory {}: {}", d, e))?;
+            fs::create_dir_all(&p)
+                .map_err(|e| format!("ts install: cannot create directory {}: {}", d, e))?;
         }
         if !p.is_dir() || !is_writable(&p) {
             return Err(format!("ts install: directory is not writable: {}", d));
@@ -1239,7 +1325,9 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
                 break;
             }
         }
-        found.ok_or("ts install: no writable directory on PATH. Specify an installation directory.")?
+        found.ok_or(
+            "ts install: no writable directory on PATH. Specify an installation directory.",
+        )?
     };
     let src = script_dir.join("ts");
     let src_exe = if script_dir == exe.parent().unwrap_or(Path::new(".")) {
@@ -1262,7 +1350,9 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&dest_file).map_err(|e| e.to_string())?.permissions();
+        let mut perms = fs::metadata(&dest_file)
+            .map_err(|e| e.to_string())?
+            .permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&dest_file, perms).map_err(|e| e.to_string())?;
     }
@@ -1306,7 +1396,9 @@ fn uninstall_autostart_hooks() -> Result<(), String> {
 fn cmd_uninstall(args: &[String]) -> Result<(), String> {
     let _ = args;
     let exe = env::current_exe().map_err(|e| e.to_string())?;
-    let install_dir = exe.parent().ok_or("ts uninstall: could not determine install directory")?;
+    let install_dir = exe
+        .parent()
+        .ok_or("ts uninstall: could not determine install directory")?;
 
     println!("Uninstalling ts from {} ...", install_dir.display());
 
@@ -1338,7 +1430,11 @@ fn cmd_uninstall(args: &[String]) -> Result<(), String> {
         if !log_files.is_empty() {
             println!(
                 "Timesheet log files: {}",
-                log_files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+                log_files
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             print!("Remove timesheet log files? [y/N] ");
             let _ = io::stdout().flush();
@@ -1357,7 +1453,8 @@ fn cmd_uninstall(args: &[String]) -> Result<(), String> {
 
     let icon_path = install_dir.join("ts-icon.svg");
     if icon_path.exists() {
-        fs::remove_file(&icon_path).map_err(|e| format!("ts uninstall: could not remove icon: {}", e))?;
+        fs::remove_file(&icon_path)
+            .map_err(|e| format!("ts uninstall: could not remove icon: {}", e))?;
         println!("Removed {}", icon_path.display());
     }
 
@@ -1368,7 +1465,9 @@ fn cmd_uninstall(args: &[String]) -> Result<(), String> {
 }
 
 fn is_writable(p: &Path) -> bool {
-    fs::metadata(p).map(|m| !m.permissions().readonly()).unwrap_or(false)
+    fs::metadata(p)
+        .map(|m| !m.permissions().readonly())
+        .unwrap_or(false)
 }
 
 /// Rebuild from a local directory or clone: run `cargo build --release` then install to current binary's dir.
@@ -1392,7 +1491,8 @@ fn cmd_rebuild(args: &[String]) -> Result<(), String> {
         if !p.is_dir() {
             return Err(format!("ts rebuild: not a directory: {}", p.display()));
         }
-        p.canonicalize().map_err(|e| format!("ts rebuild: {}: {}", p.display(), e))?
+        p.canonicalize()
+            .map_err(|e| format!("ts rebuild: {}: {}", p.display(), e))?
     };
 
     let cargo_toml = build_dir.join("Cargo.toml");
@@ -1434,7 +1534,10 @@ fn cmd_rebuild(args: &[String]) -> Result<(), String> {
     #[cfg(windows)]
     let exe = build_dir.join("target/release/ts.exe");
     if !exe.exists() {
-        return Err(format!("ts rebuild: binary not found after build: {}", exe.display()));
+        return Err(format!(
+            "ts rebuild: binary not found after build: {}",
+            exe.display()
+        ));
     }
 
     let status = Command::new(&exe)
@@ -1844,9 +1947,7 @@ fn cmd_help() -> Result<(), String> {
             )
         })?;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(man.as_bytes())
-            .map_err(|e| e.to_string())?;
+        stdin.write_all(man.as_bytes()).map_err(|e| e.to_string())?;
     }
     let _ = child.wait();
     Ok(())
@@ -1878,9 +1979,9 @@ fn cmd_autostart(args: &[String]) -> Result<(), String> {
         if !interval_set {
             start_reminder_daemon_if_needed(&timesheet_path());
             let secs = get_reminder_interval_secs();
-            if secs >= 3600 && secs % 3600 == 0 {
+            if secs >= 3600 && secs.is_multiple_of(3600) {
                 println!("Reminder interval: {}h", secs / 3600);
-            } else if secs >= 60 && secs % 60 == 0 {
+            } else if secs >= 60 && secs.is_multiple_of(60) {
                 println!("Reminder interval: {}m", secs / 60);
             } else {
                 println!("Reminder interval: {}s", secs);
@@ -1917,7 +2018,8 @@ fn do_autostart_install_macos() -> Result<(), String> {
     let home = env::var_os("HOME").ok_or("ts autostart: HOME not set")?;
     let agents = PathBuf::from(&home).join("Library/LaunchAgents");
     let support = PathBuf::from(&home).join("Library/Application Support/ts");
-    fs::create_dir_all(&support).map_err(|e| format!("ts autostart: cannot create {}: {}", support.display(), e))?;
+    fs::create_dir_all(&support)
+        .map_err(|e| format!("ts autostart: cannot create {}: {}", support.display(), e))?;
 
     // Remove old shell-script session wrapper if present (superseded by --session-daemon).
     let _ = fs::remove_file(support.join("autostart-session.sh"));
@@ -1937,11 +2039,14 @@ exec launchctl asuser "$uid" "{}" stop
 "#,
         exe_escaped
     );
-    fs::write(&logout_hook_path, logout_script).map_err(|e| format!("ts autostart: cannot write logout hook: {}", e))?;
+    fs::write(&logout_hook_path, logout_script)
+        .map_err(|e| format!("ts autostart: cannot write logout hook: {}", e))?;
     #[allow(clippy::disallowed_methods)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&logout_hook_path).map_err(|e| e.to_string())?.permissions();
+        let mut perms = fs::metadata(&logout_hook_path)
+            .map_err(|e| e.to_string())?
+            .permissions();
         perms.set_mode(0o700);
         fs::set_permissions(&logout_hook_path, perms).map_err(|e| e.to_string())?;
     }
@@ -2000,12 +2105,21 @@ exec launchctl asuser "$uid" "{}" stop
             let answer = line.trim().to_lowercase();
             if answer == "y" || answer == "yes" {
                 if !Command::new("sudo")
-                    .args(["defaults", "write", "com.apple.loginwindow", "LogoutHook", logout_hook_path.to_string_lossy().as_ref()])
+                    .args([
+                        "defaults",
+                        "write",
+                        "com.apple.loginwindow",
+                        "LogoutHook",
+                        logout_hook_path.to_string_lossy().as_ref(),
+                    ])
                     .status()
                     .map_err(|e| e.to_string())?
                     .success()
                 {
-                    return Err("ts autostart: logout hook command failed (sudo may have been cancelled).".to_string());
+                    return Err(
+                        "ts autostart: logout hook command failed (sudo may have been cancelled)."
+                            .to_string(),
+                    );
                 }
                 if fs::write(&marker_path, "").is_err() {
                     eprintln!("  Warning: could not save registration state; you may be prompted again next time.");
@@ -2036,7 +2150,11 @@ exec launchctl asuser "$uid" "{}" stop
 </dict>
 </plist>
 "#,
-        exe_path.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+        exe_path
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
     );
     // The session plist runs `ts --session-daemon` directly (no shell-script wrapper).
     // ExitTimeOut tells launchd to wait up to 30 s after SIGTERM before sending SIGKILL,
@@ -2060,24 +2178,51 @@ exec launchctl asuser "$uid" "{}" stop
 </dict>
 </plist>
 "#,
-        exe_path.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+        exe_path
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
     );
 
-    fs::create_dir_all(&agents).map_err(|e| format!("ts autostart: cannot create {}: {}", agents.display(), e))?;
+    fs::create_dir_all(&agents)
+        .map_err(|e| format!("ts autostart: cannot create {}: {}", agents.display(), e))?;
     let start_plist_path = agents.join("com.ts.autostart.start.plist");
     let session_plist_path = agents.join("com.ts.autostart.session.plist");
-    fs::write(&start_plist_path, &start_plist).map_err(|e| format!("ts autostart: cannot write plist: {}", e))?;
-    fs::write(&session_plist_path, &session_plist).map_err(|e| format!("ts autostart: cannot write plist: {}", e))?;
+    fs::write(&start_plist_path, &start_plist)
+        .map_err(|e| format!("ts autostart: cannot write plist: {}", e))?;
+    fs::write(&session_plist_path, &session_plist)
+        .map_err(|e| format!("ts autostart: cannot write plist: {}", e))?;
 
-    let _ = Command::new("launchctl").arg("unload").arg(&start_plist_path).output();
-    let _ = Command::new("launchctl").arg("unload").arg(&session_plist_path).output();
-    if !Command::new("launchctl").arg("load").arg(&start_plist_path).status().map_err(|e| e.to_string())?.success() {
+    let _ = Command::new("launchctl")
+        .arg("unload")
+        .arg(&start_plist_path)
+        .output();
+    let _ = Command::new("launchctl")
+        .arg("unload")
+        .arg(&session_plist_path)
+        .output();
+    if !Command::new("launchctl")
+        .arg("load")
+        .arg(&start_plist_path)
+        .status()
+        .map_err(|e| e.to_string())?
+        .success()
+    {
         return Err("ts autostart: launchctl load start plist failed".to_string());
     }
-    if !Command::new("launchctl").arg("load").arg(&session_plist_path).status().map_err(|e| e.to_string())?.success() {
+    if !Command::new("launchctl")
+        .arg("load")
+        .arg(&session_plist_path)
+        .status()
+        .map_err(|e| e.to_string())?
+        .success()
+    {
         return Err("ts autostart: launchctl load session plist failed".to_string());
     }
-    println!("Autostart installed: \"ts start\" runs at login, \"ts stop\" runs at logout/shutdown.");
+    println!(
+        "Autostart installed: \"ts start\" runs at login, \"ts stop\" runs at logout/shutdown."
+    );
     println!("  Start plist:   {}", start_plist_path.display());
     println!("  Session plist: {}", session_plist_path.display());
     println!("  Logout hook:   {}", logout_hook_path.display());
@@ -2094,8 +2239,14 @@ fn do_autostart_uninstall_macos() -> Result<(), String> {
     let support = PathBuf::from(&home).join("Library/Application Support/ts");
     let logout_hook_path = support.join("logout-hook.sh");
 
-    let _ = Command::new("launchctl").arg("unload").arg(&start_plist_path).output();
-    let _ = Command::new("launchctl").arg("unload").arg(&session_plist_path).output();
+    let _ = Command::new("launchctl")
+        .arg("unload")
+        .arg(&start_plist_path)
+        .output();
+    let _ = Command::new("launchctl")
+        .arg("unload")
+        .arg(&session_plist_path)
+        .output();
     let _ = Command::new("sudo")
         .args(["defaults", "delete", "com.apple.loginwindow", "LogoutHook"])
         .output();
@@ -2114,9 +2265,17 @@ fn do_autostart_install_linux() -> Result<(), String> {
     let exe_path = exe.to_string_lossy();
     let config = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env::var_os("HOME").ok_or("ts autostart: HOME not set")?).join(".config"));
+        .unwrap_or_else(|| {
+            PathBuf::from(env::var_os("HOME").ok_or("ts autostart: HOME not set")?).join(".config")
+        });
     let user_units = config.join("systemd/user");
-    fs::create_dir_all(&user_units).map_err(|e| format!("ts autostart: cannot create {}: {}", user_units.display(), e))?;
+    fs::create_dir_all(&user_units).map_err(|e| {
+        format!(
+            "ts autostart: cannot create {}: {}",
+            user_units.display(),
+            e
+        )
+    })?;
 
     let start_unit = format!(
         r#"[Unit]
@@ -2145,8 +2304,10 @@ WantedBy=default.target
 
     let start_path = user_units.join("ts-autostart-start.service");
     let session_path = user_units.join("ts-autostart-session.service");
-    fs::write(&start_path, &start_unit).map_err(|e| format!("ts autostart: cannot write unit: {}", e))?;
-    fs::write(&session_path, &session_unit).map_err(|e| format!("ts autostart: cannot write unit: {}", e))?;
+    fs::write(&start_path, &start_unit)
+        .map_err(|e| format!("ts autostart: cannot write unit: {}", e))?;
+    fs::write(&session_path, &session_unit)
+        .map_err(|e| format!("ts autostart: cannot write unit: {}", e))?;
 
     if !Command::new("systemctl")
         .args(["--user", "daemon-reload"])
@@ -2172,8 +2333,14 @@ WantedBy=default.target
     {
         return Err("ts autostart: systemctl enable session service failed".to_string());
     }
-    println!("Autostart installed: \"ts start\" runs at login, \"ts stop\" runs at logout/shutdown.");
-    println!("  Units: {}  {}", start_path.display(), session_path.display());
+    println!(
+        "Autostart installed: \"ts start\" runs at login, \"ts stop\" runs at logout/shutdown."
+    );
+    println!(
+        "  Units: {}  {}",
+        start_path.display(),
+        session_path.display()
+    );
     println!("  To remove: ts autostart uninstall");
     Ok(())
 }
@@ -2188,8 +2355,12 @@ fn do_autostart_uninstall_linux() -> Result<(), String> {
     let start_path = user_units.join("ts-autostart-start.service");
     let session_path = user_units.join("ts-autostart-session.service");
 
-    let _ = Command::new("systemctl").args(["--user", "disable", "--now", "ts-autostart-start.service"]).output();
-    let _ = Command::new("systemctl").args(["--user", "disable", "--now", "ts-autostart-session.service"]).output();
+    let _ = Command::new("systemctl")
+        .args(["--user", "disable", "--now", "ts-autostart-start.service"])
+        .output();
+    let _ = Command::new("systemctl")
+        .args(["--user", "disable", "--now", "ts-autostart-session.service"])
+        .output();
     let _ = fs::remove_file(&start_path);
     let _ = fs::remove_file(&session_path);
     println!("Autostart uninstalled.");
@@ -2277,7 +2448,10 @@ fn show_reminders_stopped_notification() {
     #[cfg(target_os = "linux")]
     {
         let _ = Command::new("notify-send")
-            .args(["--app-name=Timesheet", "Timesheet reminders have been stopped."])
+            .args([
+                "--app-name=Timesheet",
+                "Timesheet reminders have been stopped.",
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -2386,7 +2560,10 @@ fn start_reminder_daemon_if_needed(_timesheet: &Path) {
         };
         match result {
             Ok(child) => {
-                ts_debug(&format!("start_reminder: spawned daemon pid {}", child.id()));
+                ts_debug(&format!(
+                    "start_reminder: spawned daemon pid {}",
+                    child.id()
+                ));
                 drop(child);
             }
             Err(e) => {
@@ -2420,12 +2597,16 @@ fn cmd_interval(args: &[String], timesheet: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    fs::write(&path, secs.to_string()).map_err(|e| format!("ts interval: cannot write config: {}", e))?;
+    fs::write(&path, secs.to_string())
+        .map_err(|e| format!("ts interval: cannot write config: {}", e))?;
     kill_reminder_daemon_if_running();
     thread::sleep(Duration::from_millis(100));
     start_reminder_daemon_if_needed(timesheet);
     if secs % 3600 == 0 && secs >= 3600 {
-        println!("Reminder interval set to {}h. Daemon restarted.", secs / 3600);
+        println!(
+            "Reminder interval set to {}h. Daemon restarted.",
+            secs / 3600
+        );
     } else if secs % 60 == 0 && secs >= 60 {
         println!("Reminder interval set to {}m. Daemon restarted.", secs / 60);
     } else {
@@ -2459,7 +2640,11 @@ fn run_session_daemon(timesheet: &Path) {
                 // Write STOP only if a session is currently open (last line is START).
                 let content = fs::read_to_string(&ts_path).unwrap_or_default();
                 let last = content.lines().rev().find(|l| !l.trim().is_empty());
-                if last.and_then(parse_line).map(|ll| matches!(ll, LogLine::Start(_, _))).unwrap_or(false) {
+                if last
+                    .and_then(parse_line)
+                    .map(|ll| matches!(ll, LogLine::Start(_, _)))
+                    .unwrap_or(false)
+                {
                     let _ = append_stop_entry(&ts_path, Local::now());
                 }
                 process::exit(0);
@@ -2534,10 +2719,12 @@ fn run_reminder_daemon(timesheet: &Path) {
             ReminderResult::Activity(activity) => {
                 let _ = append_start_entry(timesheet, &activity);
             }
-            ReminderResult::EnterNew => unreachable!("show_reminder_prompt converts EnterNew to Activity"),
+            ReminderResult::EnterNew => {
+                unreachable!("show_reminder_prompt converts EnterNew to Activity")
+            }
             ReminderResult::ShowAgainImmediate => {} // dismissed without choice; re-show immediately
-                    ReminderResult::TimeoutAddStop(dt) => {
-                        let _ = append_stop_entry(timesheet, dt);
+            ReminderResult::TimeoutAddStop(dt) => {
+                let _ = append_stop_entry(timesheet, dt);
                 // Do not dismiss reminder window; continue loop to re-show
             }
         }
@@ -2598,13 +2785,14 @@ fn prompt_enter_activity_macos(ts_debug: bool) -> Option<String> {
         let child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(if ts_debug { Stdio::inherit() } else { Stdio::null() })
+            .stderr(if ts_debug {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
             .spawn()
             .ok()?;
-        let out = match wait_no_timeout(child) {
-            Some(o) => o,
-            None => return None,
-        };
+        let out = wait_no_timeout(child)?;
         let activity = String::from_utf8_lossy(&out).trim().to_string();
         if activity.is_empty() {
             None
@@ -2678,7 +2866,11 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
         let mut child = match cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(if ts_debug { Stdio::inherit() } else { Stdio::null() })
+            .stderr(if ts_debug {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
             .spawn()
         {
             Ok(c) => c,
@@ -2723,9 +2915,9 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
             if let Some(activity) = prompt_enter_activity_macos(ts_debug) {
                 return ReminderResult::Activity(activity);
             }
-            return ReminderResult::ShowAgainImmediate;
+            ReminderResult::ShowAgainImmediate
         } else {
-            return res;
+            res
         }
     };
     match try_native(true) {
@@ -2747,7 +2939,9 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
     // SystemUIServer can show dialogs from background processes (daemon). Try it first (with list of activities).
     match show_reminder_prompt_macos_systemui(&choices, reminder_appeared) {
         ReminderResult::DontBugMe => return ReminderResult::DontBugMe,
-        ReminderResult::Activity(ref a) if !a.is_empty() => return ReminderResult::Activity(a.clone()),
+        ReminderResult::Activity(ref a) if !a.is_empty() => {
+            return ReminderResult::Activity(a.clone())
+        }
         ReminderResult::TimeoutAddStop(epoch) => {
             if let Some(ts) = timesheet {
                 let _ = append_stop_entry(ts, epoch);
@@ -2815,7 +3009,10 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
 /// Buttons-only dialog via SystemUIServer (one click = done; works from daemon).
 /// AppleScript display dialog allows at most 3 buttons, so we show: Stop Work | first activity (least-recent) | Enter new activity...
 #[cfg(target_os = "macos")]
-fn show_reminder_prompt_macos_systemui(choices: &[String], reminder_appeared: DateTime<Local>) -> ReminderResult {
+fn show_reminder_prompt_macos_systemui(
+    choices: &[String],
+    reminder_appeared: DateTime<Local>,
+) -> ReminderResult {
     let stderr_mode = if env::var_os("TS_DEBUG").is_some() {
         Stdio::inherit()
     } else {
@@ -2925,30 +3122,27 @@ fn show_reminder_prompt_macos_systemui(choices: &[String], reminder_appeared: Da
         Ok(c) => c,
         Err(_) => return ReminderResult::TimeoutAddStop(reminder_appeared),
     };
-    match wait_with_timeout(child, timeout_dur, true) {
-        WaitOutcome::Finished(Some(stdout)) => {
-            let s = String::from_utf8_lossy(&stdout).trim().to_string();
-            let mut activity_from_text: Option<String> = None;
-            for part in s.split(',') {
-                let part = part.trim();
-                if let Some(rest) = part.strip_prefix("button returned:") {
-                    let btn = rest.trim().trim_matches('"');
-                    if btn == "Stop Work" {
-                        return ReminderResult::DontBugMe;
-                    }
-                }
-                if let Some(rest) = part.strip_prefix("text returned:") {
-                    let activity = rest.trim().trim_matches('"').trim();
-                    if !activity.is_empty() {
-                        activity_from_text = Some(activity.to_string());
-                    }
+    if let WaitOutcome::Finished(Some(stdout)) = wait_with_timeout(child, timeout_dur, true) {
+        let s = String::from_utf8_lossy(&stdout).trim().to_string();
+        let mut activity_from_text: Option<String> = None;
+        for part in s.split(',') {
+            let part = part.trim();
+            if let Some(rest) = part.strip_prefix("button returned:") {
+                let btn = rest.trim().trim_matches('"');
+                if btn == "Stop Work" {
+                    return ReminderResult::DontBugMe;
                 }
             }
-            if let Some(activity) = activity_from_text {
-                return ReminderResult::Activity(activity);
+            if let Some(rest) = part.strip_prefix("text returned:") {
+                let activity = rest.trim().trim_matches('"').trim();
+                if !activity.is_empty() {
+                    activity_from_text = Some(activity.to_string());
+                }
             }
         }
-        _ => {}
+        if let Some(activity) = activity_from_text {
+            return ReminderResult::Activity(activity);
+        }
     }
     ReminderResult::TimeoutAddStop(reminder_appeared)
 }
@@ -2967,7 +3161,11 @@ enum WaitOutcome {
 }
 
 /// Wait for process to finish, or until timeout. If kill_on_timeout is false, the child is left running (not dismissed).
-fn wait_with_timeout(mut child: process::Child, timeout: Duration, kill_on_timeout: bool) -> WaitOutcome {
+fn wait_with_timeout(
+    mut child: process::Child,
+    timeout: Duration,
+    kill_on_timeout: bool,
+) -> WaitOutcome {
     let start = std::time::Instant::now();
     let check_interval = Duration::from_millis(100);
     loop {
@@ -3091,7 +3289,11 @@ mod tests {
         let line = "2023-11-14T22:13:20-05:00|START|coding";
         let parsed = parse_line(line);
         if let Some(LogLine::Start(dt, a)) = parsed {
-            assert_eq!(dt.naive_local(), chrono::NaiveDateTime::parse_from_str("2023-11-14T22:13:20", "%Y-%m-%dT%H:%M:%S").unwrap());
+            assert_eq!(
+                dt.naive_local(),
+                chrono::NaiveDateTime::parse_from_str("2023-11-14T22:13:20", "%Y-%m-%dT%H:%M:%S")
+                    .unwrap()
+            );
             assert_eq!(a, "coding");
         } else {
             panic!("expected Some(Start)");
@@ -3103,7 +3305,11 @@ mod tests {
         let line = "2023-11-14T22:13:20-05:00|START|";
         let parsed = parse_line(line);
         if let Some(LogLine::Start(dt, a)) = parsed {
-            assert_eq!(dt.naive_local(), chrono::NaiveDateTime::parse_from_str("2023-11-14T22:13:20", "%Y-%m-%dT%H:%M:%S").unwrap());
+            assert_eq!(
+                dt.naive_local(),
+                chrono::NaiveDateTime::parse_from_str("2023-11-14T22:13:20", "%Y-%m-%dT%H:%M:%S")
+                    .unwrap()
+            );
             assert!(a.is_empty());
         } else {
             panic!("expected Some(Start)");
@@ -3115,7 +3321,11 @@ mod tests {
         let line = "2023-11-14T22:13:20-05:00|START|misc|unspecified";
         let parsed = parse_line(line);
         if let Some(LogLine::Start(dt, a)) = parsed {
-            assert_eq!(dt.naive_local(), chrono::NaiveDateTime::parse_from_str("2023-11-14T22:13:20", "%Y-%m-%dT%H:%M:%S").unwrap());
+            assert_eq!(
+                dt.naive_local(),
+                chrono::NaiveDateTime::parse_from_str("2023-11-14T22:13:20", "%Y-%m-%dT%H:%M:%S")
+                    .unwrap()
+            );
             assert_eq!(a, "misc|unspecified");
         } else {
             panic!("expected Some(Start)");
@@ -3127,7 +3337,11 @@ mod tests {
         let line = "2023-11-14T23:13:20-05:00|STOP";
         let parsed = parse_line(line);
         if let Some(LogLine::Stop(dt)) = parsed {
-            assert_eq!(dt.naive_local(), chrono::NaiveDateTime::parse_from_str("2023-11-14T23:13:20", "%Y-%m-%dT%H:%M:%S").unwrap());
+            assert_eq!(
+                dt.naive_local(),
+                chrono::NaiveDateTime::parse_from_str("2023-11-14T23:13:20", "%Y-%m-%dT%H:%M:%S")
+                    .unwrap()
+            );
         } else {
             panic!("expected Some(Stop)");
         }
@@ -3139,13 +3353,21 @@ mod tests {
         if let Some(LogLine::Start(dt, a)) = parse_line(line_start) {
             assert_eq!(a, "coding");
             // Wall-clock time is preserved from the stored offset without UTC conversion.
-            assert_eq!(dt.naive_local(), chrono::NaiveDateTime::parse_from_str("2026-03-06T14:30:00", "%Y-%m-%dT%H:%M:%S").unwrap());
+            assert_eq!(
+                dt.naive_local(),
+                chrono::NaiveDateTime::parse_from_str("2026-03-06T14:30:00", "%Y-%m-%dT%H:%M:%S")
+                    .unwrap()
+            );
         } else {
             panic!("expected Some(Start)");
         }
         let line_stop = "2026-03-06T18:45:00-08:00|STOP";
         if let Some(LogLine::Stop(dt)) = parse_line(line_stop) {
-            assert_eq!(dt.naive_local(), chrono::NaiveDateTime::parse_from_str("2026-03-06T18:45:00", "%Y-%m-%dT%H:%M:%S").unwrap());
+            assert_eq!(
+                dt.naive_local(),
+                chrono::NaiveDateTime::parse_from_str("2026-03-06T18:45:00", "%Y-%m-%dT%H:%M:%S")
+                    .unwrap()
+            );
         } else {
             panic!("expected Some(Stop)");
         }
@@ -3167,7 +3389,11 @@ mod tests {
         let line = "  2023-11-14T22:13:20-05:00|START|  x  ";
         let parsed = parse_line(line);
         if let Some(LogLine::Start(dt, activity)) = parsed {
-            assert_eq!(dt.naive_local(), chrono::NaiveDateTime::parse_from_str("2023-11-14T22:13:20", "%Y-%m-%dT%H:%M:%S").unwrap());
+            assert_eq!(
+                dt.naive_local(),
+                chrono::NaiveDateTime::parse_from_str("2023-11-14T22:13:20", "%Y-%m-%dT%H:%M:%S")
+                    .unwrap()
+            );
             assert_eq!(activity, "  x");
         } else {
             panic!("expected Some(Start)");
@@ -3187,7 +3413,9 @@ mod tests {
     #[test]
     fn test_timesheet_path_uses_home() {
         let path = timesheet_path();
-        assert!(path.ends_with("Documents/timesheet.log") || path.ends_with("Documents\\timesheet.log"));
+        assert!(
+            path.ends_with("Documents/timesheet.log") || path.ends_with("Documents\\timesheet.log")
+        );
     }
 
     #[test]
@@ -3377,13 +3605,12 @@ mod tests {
         fs::File::create(&log_path).unwrap();
         let later = dir.path().join("timesheet.250301");
         // Epochs on 2025-02-19 and 2025-03-02 so the file's date range includes 2025-02-19
-        fs::write(
-            &later,
-            "START|1739984400|a\nSTOP|1740891600\n",
-        )
-            .unwrap(); // 2025-02-19 12:00 UTC, 2025-03-02 00:00 UTC
+        fs::write(&later, "START|1739984400|a\nSTOP|1740891600\n").unwrap(); // 2025-02-19 12:00 UTC, 2025-03-02 00:00 UTC
         let out = resolve_list_input(Some("250219"), &log_path).unwrap();
-        assert_eq!(out, later, "ts list 250219 should use log that contains that date");
+        assert_eq!(
+            out, later,
+            "ts list 250219 should use log that contains that date"
+        );
     }
 
     #[test]
@@ -3395,7 +3622,10 @@ mod tests {
         let later = dir.path().join("timesheet.260220");
         fs::File::create(&later).unwrap(); // empty or no 2025-02-19 in content
         let out = resolve_list_input(Some("2/19"), &log_path).unwrap();
-        assert_eq!(out, later, "ts list 2/19 should fall back to file with extension date on or after that day");
+        assert_eq!(
+            out, later,
+            "ts list 2/19 should fall back to file with extension date on or after that day"
+        );
     }
 
     #[test]
@@ -3486,7 +3716,12 @@ mod tests {
         assert!(result.is_ok());
         let content = fs::read_to_string(&log_path).unwrap();
         let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
-        assert_eq!(lines.len(), 2, "expected START and STOP lines, got: {:?}", lines);
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected START and STOP lines, got: {:?}",
+            lines
+        );
         assert!(lines[0].contains("|START|"));
         assert!(lines[1].contains("|STOP"));
     }
@@ -3510,7 +3745,10 @@ mod tests {
         let result = cmd_stop(&[], &log_path);
         assert!(result.is_ok());
         let after = fs::read_to_string(&log_path).unwrap();
-        assert_eq!(before, after, "ts stop should not change file when last entry is STOP and no time given");
+        assert_eq!(
+            before, after,
+            "ts stop should not change file when last entry is STOP and no time given"
+        );
     }
 
     #[test]
@@ -3536,12 +3774,17 @@ mod tests {
         let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[1].contains("|STOP"));
-        let new_epoch = parse_line(lines[1]).and_then(|ll| match ll {
-            LogLine::Stop(e) => Some(e),
-            _ => None,
-        }).unwrap();
+        let new_epoch = parse_line(lines[1])
+            .and_then(|ll| match ll {
+                LogLine::Stop(e) => Some(e),
+                _ => None,
+            })
+            .unwrap();
         let expected = parse_start_time(new_time).unwrap();
-        assert_eq!(new_epoch, expected, "last STOP should be amended to the given time");
+        assert_eq!(
+            new_epoch, expected,
+            "last STOP should be amended to the given time"
+        );
     }
 
     #[test]
@@ -3662,10 +3905,7 @@ mod tests {
     fn test_cmd_workalias_no_timesheet() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("timesheet.log");
-        let result = cmd_workalias(
-            &["coding".to_string(), "dev".to_string()],
-            &log_path,
-        );
+        let result = cmd_workalias(&["coding".to_string(), "dev".to_string()], &log_path);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no timesheet data"));
     }
@@ -3686,10 +3926,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let result = cmd_workalias(
-            &["nonexistent".to_string(), "repl".to_string()],
-            &log_path,
-        );
+        let result = cmd_workalias(&["nonexistent".to_string(), "repl".to_string()], &log_path);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no activities matching"));
     }
@@ -3706,7 +3943,13 @@ mod tests {
             fmt_ts(week_start.timestamp() + 180)
         );
 
-        let matches_vec = collect_workalias_matches(&content, week_start, week_start + chrono::Duration::weeks(1) - chrono::Duration::seconds(1), ".", "-");
+        let matches_vec = collect_workalias_matches(
+            &content,
+            week_start,
+            week_start + chrono::Duration::weeks(1) - chrono::Duration::seconds(1),
+            ".",
+            "-",
+        );
 
         assert_eq!(matches_vec.len(), 1);
         assert_eq!(matches_vec[0].replacement, "api-v1");
