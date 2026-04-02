@@ -40,7 +40,7 @@
 //! | `timeoff`  | Show stop time for 8 h/day average; only requires a START entry (adds one if log empty or last is STOP). |
 //! | `uninstall` | Stop daemon, remove autostart hooks, optionally remove log files, remove binary and icon. |
 
-use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat};
 #[cfg(target_os = "macos")]
 use libc::getuid;
 #[cfg(unix)]
@@ -83,6 +83,21 @@ const DAY_NAMES: [&str; 7] = [
 /// Truncate hours to two decimal places (discard fractions beyond the second decimal).
 fn trunc2(h: f64) -> f64 {
     (h * 100.0).trunc() / 100.0
+}
+
+/// Formats a log timestamp using the canonical on-disk representation.
+fn format_log_timestamp(dt: DateTime<Local>) -> String {
+    dt.to_rfc3339_opts(SecondsFormat::Micros, false)
+}
+
+/// Formats a START log line without the trailing newline.
+fn format_start_log_entry(dt: DateTime<Local>, activity: &str) -> String {
+    format!("{}|START|{}", format_log_timestamp(dt), activity)
+}
+
+/// Formats a STOP log line without the trailing newline.
+fn format_stop_log_entry(dt: DateTime<Local>) -> String {
+    format!("{}|STOP", format_log_timestamp(dt))
 }
 
 /// Returns the default timesheet path: `$HOME/Documents/timesheet.log`, or `./Documents/timesheet.log` if `HOME` is unset.
@@ -186,7 +201,7 @@ fn activities_this_week_most_recent_first(timesheet: &Path) -> Vec<String> {
 fn append_start_entry(timesheet: &Path, activity: &str) -> Result<(), String> {
     maybe_rotate_if_previous_week(timesheet)?;
     let now = Local::now();
-    let line = format!("{}|START|{}\n", now.to_rfc3339(), activity);
+    let line = format!("{}\n", format_start_log_entry(now, activity));
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -199,7 +214,7 @@ fn append_start_entry(timesheet: &Path, activity: &str) -> Result<(), String> {
 /// Append a STOP log entry at the given datetime (used by reminder daemon on timeout/shutdown). Calls maybe_rotate first.
 fn append_stop_entry(timesheet: &Path, dt: DateTime<Local>) -> Result<(), String> {
     maybe_rotate_if_previous_week(timesheet)?;
-    let line = format!("{}|STOP\n", dt.to_rfc3339());
+    let line = format!("{}\n", format_stop_log_entry(dt));
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -325,7 +340,7 @@ fn do_rotate(timesheet: &Path) -> Result<(), String> {
             .append(true)
             .open(timesheet)
             .map_err(|e| e.to_string())?;
-        f.write_all(format!("{}|STOP\n", now.to_rfc3339()).as_bytes())
+        f.write_all(format!("{}\n", format_stop_log_entry(now)).as_bytes())
             .map_err(|e| e.to_string())?;
     }
     let max_dt = max_dt_in_log(timesheet).ok_or("ts rotate: no valid entries in timesheet.")?;
@@ -413,9 +428,9 @@ fn cmd_migrate(timesheet: &Path) -> Result<(), String> {
         for line in content.lines() {
             let new_line = match migrate_parse_line(line) {
                 Some(LogLine::Start(dt, activity)) => {
-                    format!("{}|START|{}\n", dt.to_rfc3339(), activity)
+                    format!("{}\n", format_start_log_entry(dt, &activity))
                 }
-                Some(LogLine::Stop(dt)) => format!("{}|STOP\n", dt.to_rfc3339()),
+                Some(LogLine::Stop(dt)) => format!("{}\n", format_stop_log_entry(dt)),
                 None => {
                     if line.is_empty() {
                         String::new()
@@ -654,13 +669,13 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
             .map(|ll| matches!(ll, LogLine::Start(_, _)))
             .unwrap_or(false)
         {
-            let stop_line = format!("{}|STOP\n", now.to_rfc3339());
+            let stop_line = format!("{}\n", format_stop_log_entry(now));
             if let Ok(mut sf) = fs::OpenOptions::new().append(true).open(timesheet) {
                 let _ = sf.write_all(stop_line.as_bytes());
             }
         }
     }
-    let line = format!("{}|START|{}\n", now.to_rfc3339(), activity);
+    let line = format!("{}\n", format_start_log_entry(now, &activity));
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -700,7 +715,7 @@ fn cmd_stop(args: &[String], timesheet: &Path) -> Result<(), String> {
         } else {
             lines[..lines.len() - 1].join("\n") + "\n"
         };
-        let new_content = format!("{}{}|STOP\n", without_last, stop_dt.to_rfc3339());
+        let new_content = format!("{}{}\n", without_last, format_stop_log_entry(stop_dt));
         fs::write(timesheet, &new_content).map_err(|e| e.to_string())?;
         if is_reminder_daemon_running() {
             show_reminders_stopped_notification();
@@ -714,7 +729,7 @@ fn cmd_stop(args: &[String], timesheet: &Path) -> Result<(), String> {
             .ok_or_else(|| format!("ts stop: could not parse stop time: {}", t))?,
         None => Local::now(),
     };
-    let line = format!("{}|STOP\n", stop_dt.to_rfc3339());
+    let line = format!("{}\n", format_stop_log_entry(stop_dt));
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -990,7 +1005,7 @@ fn cmd_started(args: &[String], timesheet: &Path) -> Result<(), String> {
         .ok_or_else(|| format!("ts started: could not parse start time: {}", start_time))?;
     maybe_rotate_if_previous_week(timesheet)?;
     let content = fs::read_to_string(timesheet).unwrap_or_default();
-    let new_entry = format!("{}|START|{}", start_dt.to_rfc3339(), activity);
+    let new_entry = format_start_log_entry(start_dt, &activity);
 
     let mut result: Vec<&str> = Vec::new();
     let mut inserted = false;
@@ -1041,7 +1056,7 @@ fn cmd_timeoff(timesheet: &Path) -> Result<(), String> {
             let _ = fs::create_dir_all(parent);
         }
         let now = Local::now();
-        let line = format!("{}|START|misc/unspecified\n", now.to_rfc3339());
+        let line = format!("{}\n", format_start_log_entry(now, "misc/unspecified"));
         let mut f = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -1281,7 +1296,7 @@ fn cmd_workalias(args: &[String], timesheet: &Path) -> Result<(), String> {
             if let Some(LogLine::Start(dt, activity)) = parse_line(line) {
                 if dt >= week_start_dt && dt <= week_end {
                     let _ = activity;
-                    out.push_str(&format!("{}|START|{}\n", dt.to_rfc3339(), new_activity));
+                    out.push_str(&format!("{}\n", format_start_log_entry(dt, new_activity)));
                     continue;
                 }
             }
@@ -3281,7 +3296,7 @@ mod tests {
 
     /// Helper: format epoch as RFC3339 for log file content (replaces format_epoch_iso8601 in tests).
     fn fmt_ts(epoch: i64) -> String {
-        Local.timestamp_opt(epoch, 0).single().unwrap().to_rfc3339()
+        format_log_timestamp(Local.timestamp_opt(epoch, 0).single().unwrap())
     }
 
     #[test]
@@ -3834,6 +3849,39 @@ mod tests {
         let content = fs::read_to_string(&log_path).unwrap();
         assert!(content.contains("|START|"));
         assert!(content.contains("manual"));
+    }
+
+    #[test]
+    fn test_cmd_started_uses_canonical_timestamp_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        let input = "2025-02-20 10:00".to_string();
+
+        let result = cmd_started(&[input.clone(), "manual".to_string()], &log_path);
+
+        assert!(result.is_ok());
+        let content = fs::read_to_string(&log_path).unwrap();
+        let expected_dt = parse_start_time(&input).unwrap();
+        let expected_line = format!("{}\n", format_start_log_entry(expected_dt, "manual"));
+        assert_eq!(content, expected_line);
+    }
+
+    #[test]
+    fn test_cmd_migrate_normalizes_timestamp_precision() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        fs::write(
+            &log_path,
+            "2026-03-30T14:30:00-04:00|START|manual\n2026-03-30T15:21:48.022092-04:00|STOP\n",
+        )
+        .unwrap();
+
+        let result = cmd_migrate(&log_path);
+
+        assert!(result.is_ok());
+        let content = fs::read_to_string(&log_path).unwrap();
+        assert!(content.contains("2026-03-30T14:30:00.000000-04:00|START|manual\n"));
+        assert!(content.contains("2026-03-30T15:21:48.022092-04:00|STOP\n"));
     }
 
     #[test]
