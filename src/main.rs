@@ -28,6 +28,7 @@
 //! | `interval` | Set or show reminder daemon interval (e.g. 3, 3m, 100s, 1h30m). |
 //! | `list`     | Report % per activity and hours per weekday; optional file/extension arg. |
 //! | `migrate`  | Convert all timesheet.* files in the log directory to strict ISO 8601 timestamps. |
+//! | `sprint`   | Report % per activity and hours per weekday across the current log plus the most recently rotated log. |
 //! | `tail`     | Last 10 log entries with timestamps in local time; optional file/extension arg. |
 //! | `manpage`  | Output Unix manual page in groff format to stdout. |
 //! | `rebuild`  | Build from local dir or clone; then install to current binary's directory. |
@@ -256,6 +257,9 @@ enum LogLine {
     Stop(DateTime<Local>),
 }
 
+type ParsedLogLines = Vec<(usize, LogLine)>;
+type CurrentTask = Option<(DateTime<Local>, String)>;
+
 /// Parses a log line into `LogLine::Start(dt, activity)` or `LogLine::Stop(dt)`; returns `None` if not a valid START/STOP line.
 /// Format: timestamp (ISO 8601) is the first field, then START|activity or STOP.
 fn parse_line(s: &str) -> Option<LogLine> {
@@ -268,6 +272,34 @@ fn parse_line(s: &str) -> Option<LogLine> {
         "STOP" => Some(LogLine::Stop(dt)),
         _ => None,
     }
+}
+
+fn log_line_dt(line: &LogLine) -> DateTime<Local> {
+    match line {
+        LogLine::Start(dt, _) | LogLine::Stop(dt) => *dt,
+    }
+}
+
+fn parse_log_lines(content: &str) -> ParsedLogLines {
+    let mut lines = Vec::new();
+    for (i, line) in content.lines().enumerate() {
+        if let Some(parsed) = parse_line(line) {
+            lines.push((i + 1, parsed));
+        }
+    }
+    lines
+}
+
+fn read_log_lines(path: &Path) -> Result<ParsedLogLines, String> {
+    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    Ok(parse_log_lines(&content))
+}
+
+fn last_start_entry(lines: &[(usize, LogLine)]) -> CurrentTask {
+    lines.iter().rev().find_map(|(_, line)| match line {
+        LogLine::Start(dt, activity) => Some((*dt, activity.clone())),
+        LogLine::Stop(_) => None,
+    })
 }
 
 /// DateTime from the last START or STOP line in the file, or `None` if empty/unreadable.
@@ -606,6 +638,70 @@ fn resolve_list_input(arg: Option<&str>, timesheet: &Path) -> Result<PathBuf, St
     Err(format!("ts list: no timesheet matches \"{}\".", list_arg))
 }
 
+fn rotated_timesheet_files(timesheet: &Path) -> Vec<PathBuf> {
+    let Some(ts_dir) = timesheet.parent() else {
+        return Vec::new();
+    };
+    let mut rotated = Vec::new();
+    if let Ok(entries) = fs::read_dir(ts_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("timesheet.")
+                    && name != "timesheet.log"
+                    && name
+                        .as_bytes()
+                        .get(10)
+                        .map(|&b| b.is_ascii_digit())
+                        .unwrap_or(false)
+                {
+                    rotated.push(path);
+                }
+            }
+        }
+    }
+    rotated
+}
+
+fn latest_rotated_timesheet(timesheet: &Path) -> Option<PathBuf> {
+    let mut rotated = rotated_timesheet_files(timesheet);
+    rotated.sort_by_key(|path| {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_string()
+    });
+    rotated.pop()
+}
+
+fn sprint_report_data(timesheet: &Path) -> Result<(ParsedLogLines, CurrentTask), String> {
+    let latest_rotated = latest_rotated_timesheet(timesheet);
+    let mut combined = Vec::new();
+    let mut combined_index = 1usize;
+
+    if let Some(path) = latest_rotated {
+        for (_, line) in read_log_lines(&path)? {
+            combined.push((combined_index, line));
+            combined_index += 1;
+        }
+    }
+
+    let current_task = if timesheet.exists() {
+        let current_lines = read_log_lines(timesheet)?;
+        let current_task = last_start_entry(&current_lines);
+        for (_, line) in current_lines {
+            combined.push((combined_index, line));
+            combined_index += 1;
+        }
+        current_task
+    } else {
+        None
+    };
+
+    combined.sort_by_key(|(_, line)| log_line_dt(line));
+    Ok((combined, current_task))
+}
+
 /// Records work start now; activity is optional. With no argument on macOS, shows the reminder dialog to pick/enter an activity.
 /// On other platforms or if the user declines, falls back to misc/unspecified.
 /// Ensures the reminder daemon is running at entry (so it stays running even when ts start is run at system startup and
@@ -803,6 +899,47 @@ fn process_log_for_report(
     (by_act, dow_hr, work_in_progress)
 }
 
+fn print_report(
+    lines: &[(usize, LogLine)],
+    virtual_stop: Option<DateTime<Local>>,
+    current_task: CurrentTask,
+) -> Result<(), String> {
+    let (by_act, dow_hr, work_in_progress) = process_log_for_report(lines, virtual_stop);
+    if by_act.is_empty() {
+        println!("No work recorded.");
+        return Ok(());
+    }
+    for (act, pct, hr) in &by_act {
+        println!("{:.1}%  {:.2}h  {}", pct, hr, act);
+    }
+    for (i, name) in DAY_NAMES.iter().enumerate() {
+        println!("{}  {:.2}", name, dow_hr.get(i).copied().unwrap_or(0.0));
+    }
+    let total_hr: f64 = dow_hr.iter().map(|&h| trunc2(h)).sum();
+    println!("Total  {:.2}", trunc2(total_hr));
+    if work_in_progress {
+        if let Some((start_dt, activity)) = current_task {
+            let now = Local::now();
+            let dur_sec = (now - start_dt).num_seconds();
+            let dur_min = dur_sec / 60;
+            let dur_hr = dur_min / 60;
+            let dur_rem = dur_min % 60;
+            let duration_fmt = if dur_hr > 0 {
+                format!("{}h {}m", dur_hr, dur_rem)
+            } else {
+                format!("{}m", dur_min)
+            };
+            println!(
+                "\nCurrent Task: {}, started {}, worked {}",
+                activity,
+                start_dt.format("%a %b %d %H:%M:%S %Z %Y"),
+                duration_fmt
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Outputs the latest ten log entries with timestamps shown in local time. Optional arg selects file (same as list).
 /// Consecutive START entries with the same activity are collapsed (first timestamp kept for aggregate duration); then the last 10 entries are shown.
 fn cmd_tail(tail_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
@@ -893,57 +1030,30 @@ fn cmd_list(list_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
         println!("No timesheet data found.");
         return Ok(());
     }
-    let content = fs::read_to_string(&list_input).map_err(|e| e.to_string())?;
-    let mut lines: Vec<(usize, LogLine)> = Vec::new();
-    for (i, line) in content.lines().enumerate() {
-        if let Some(ll) = parse_line(line) {
-            lines.push((i + 1, ll));
-        }
-    }
+    let lines = read_log_lines(&list_input)?;
     let is_current = list_arg.is_none() || list_arg == Some("log");
-    let last_start = lines
-        .iter()
-        .rev()
-        .find(|(_, l)| matches!(l, LogLine::Start(_, _)));
-    let virtual_stop = if is_current && last_start.is_some() {
+    let current_task = if is_current {
+        last_start_entry(&lines)
+    } else {
+        None
+    };
+    let virtual_stop = if is_current && current_task.is_some() {
         Some(Local::now())
     } else {
         None
     };
-    let (by_act, dow_hr, work_in_progress) = process_log_for_report(&lines, virtual_stop);
-    if by_act.is_empty() {
-        println!("No work recorded.");
+    print_report(&lines, virtual_stop, current_task)
+}
+
+fn cmd_sprint(timesheet: &Path) -> Result<(), String> {
+    let latest_rotated = latest_rotated_timesheet(timesheet);
+    if !timesheet.exists() && latest_rotated.is_none() {
+        println!("No timesheet data found.");
         return Ok(());
     }
-    for (act, pct, hr) in &by_act {
-        println!("{:.1}%  {:.2}h  {}", pct, hr, act);
-    }
-    for (i, name) in DAY_NAMES.iter().enumerate() {
-        println!("{}  {:.2}", name, dow_hr.get(i).copied().unwrap_or(0.0));
-    }
-    let total_hr: f64 = dow_hr.iter().map(|&h| trunc2(h)).sum();
-    println!("Total  {:.2}", trunc2(total_hr));
-    if is_current && work_in_progress {
-        if let Some((_, LogLine::Start(start_dt, activity))) = last_start {
-            let now = Local::now();
-            let dur_sec = (now - *start_dt).num_seconds();
-            let dur_min = dur_sec / 60;
-            let dur_hr = dur_min / 60;
-            let dur_rem = dur_min % 60;
-            let duration_fmt = if dur_hr > 0 {
-                format!("{}h {}m", dur_hr, dur_rem)
-            } else {
-                format!("{}m", dur_min)
-            };
-            println!(
-                "\nCurrent Task: {}, started {}, worked {}",
-                activity,
-                start_dt.format("%a %b %d %H:%M:%S %Z %Y"),
-                duration_fmt
-            );
-        }
-    }
-    Ok(())
+    let (lines, current_task) = sprint_report_data(timesheet)?;
+    let virtual_stop = current_task.as_ref().map(|_| Local::now());
+    print_report(&lines, virtual_stop, current_task)
 }
 
 /// Parses a start-time string into a DateTime<Local>; tries strict ISO 8601 first, then several other formats (e.g. `%Y-%m-%d %H:%M`, `%H:%M`, `%I:%M %p`).
@@ -1598,6 +1708,8 @@ ts \- timesheet CLI (start, stop, list, report by activity and weekday)
 .B ts list
 .RI [ file_or_extension ]
 .PP
+.B ts sprint
+.PP
 .B ts tail
 .RI [ file_or_extension ]
 .PP
@@ -1762,6 +1874,17 @@ and shows current task, start time, and duration.
 Optional
 .I file_or_extension
 selects an alternate log path or extension filter.
+.TP
+.B sprint
+Plaintext report like
+.BR list ,
+but combines the current
+.B timesheet.log
+with the most recently rotated
+.B timesheet.YYMMDD
+file before calculating the activity and weekday totals.
+If work is in progress in the current log, uses a virtual STOP at current time
+and shows current task, start time, and duration.
 .TP
 .B migrate
 Convert all
@@ -3266,6 +3389,7 @@ fn main() {
         Some("stop") => cmd_stop(&rest, &timesheet),
         Some("stopped") => cmd_stop(&rest, &timesheet),
         Some("list") => cmd_list(rest.first().map(String::as_str), &timesheet),
+        Some("sprint") => cmd_sprint(&timesheet),
         Some("tail") => cmd_tail(rest.first().map(String::as_str), &timesheet),
         Some("started") => cmd_started(&rest, &timesheet),
         Some("timeoff") => cmd_timeoff(&timesheet),
@@ -3641,6 +3765,75 @@ mod tests {
             out, later,
             "ts list 2/19 should fall back to file with extension date on or after that day"
         );
+    }
+
+    #[test]
+    fn test_latest_rotated_timesheet_returns_most_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        fs::File::create(&log_path).unwrap();
+        let older = dir.path().join("timesheet.260220");
+        let newer = dir.path().join("timesheet.260227");
+        fs::File::create(&older).unwrap();
+        fs::File::create(&newer).unwrap();
+
+        let out = latest_rotated_timesheet(&log_path).unwrap();
+
+        assert_eq!(out, newer);
+    }
+
+    #[test]
+    fn test_sprint_report_data_uses_current_and_latest_rotated_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        let latest = dir.path().join("timesheet.260227");
+        let older = dir.path().join("timesheet.260220");
+
+        fs::write(
+            &older,
+            format!(
+                "{}|START|older\n{}|STOP\n",
+                fmt_ts(1730000000),
+                fmt_ts(1730003600)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &latest,
+            format!(
+                "{}|START|recent\n{}|STOP\n",
+                fmt_ts(1730086400),
+                fmt_ts(1730090000)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &log_path,
+            format!(
+                "{}|START|current\n{}|STOP\n",
+                fmt_ts(1730172800),
+                fmt_ts(1730176400)
+            ),
+        )
+        .unwrap();
+
+        let (lines, current_task) = sprint_report_data(&log_path).unwrap();
+        let (by_act, _, work_in_progress) = process_log_for_report(&lines, None);
+
+        assert!(!work_in_progress);
+        assert!(current_task.is_some());
+        assert_eq!(by_act.len(), 2);
+        assert!(by_act.iter().any(|(activity, _, _)| activity == "recent"));
+        assert!(by_act.iter().any(|(activity, _, _)| activity == "current"));
+        assert!(!by_act.iter().any(|(activity, _, _)| activity == "older"));
+    }
+
+    #[test]
+    fn test_cmd_sprint_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        let result = cmd_sprint(&log_path);
+        assert!(result.is_ok());
     }
 
     #[test]
