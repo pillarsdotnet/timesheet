@@ -67,6 +67,9 @@ mod reminder_dialog_macos;
 /// Default path segment under `$HOME` for the timesheet log file.
 const DEFAULT_TIMESHEET: &str = "Documents/timesheet.log";
 
+/// Canonical source repository for this project.
+const CANONICAL_SOURCE_URL: &str = "https://github.com/pillarsdotnet/timesheet";
+
 /// Icon for macOS reminder dock; embedded so "ts install" can write it without the repo.
 #[cfg(target_os = "macos")]
 const EMBEDDED_ICON_SVG: &[u8] = include_bytes!("../assets/icon.svg");
@@ -2079,11 +2082,21 @@ fn cmd_manpage() -> Result<(), String> {
 
 /// Show the man page in a pager using groff (ts manpage | groff -man -Tascii | less).
 /// If groff is not available, pages the raw groff source with less.
+fn help_prelude() -> String {
+    format!("{}\n\n", CANONICAL_SOURCE_URL)
+}
+
 fn cmd_help() -> Result<(), String> {
     let man = manpage_content();
+    let prelude = help_prelude();
 
     let child = Command::new("sh")
-        .args(["-c", "groff -man -Tascii 2>/dev/null | less -R"])
+        .args([
+            "-c",
+            "{ printf '%s' \"$1\"; groff -man -Tascii 2>/dev/null; } | less -R",
+            "sh",
+            &prelude,
+        ])
         .stdin(Stdio::piped())
         .spawn();
 
@@ -2108,6 +2121,9 @@ fn cmd_help() -> Result<(), String> {
             )
         })?;
     if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(prelude.as_bytes())
+            .map_err(|e| e.to_string())?;
         stdin.write_all(man.as_bytes()).map_err(|e| e.to_string())?;
     }
     let _ = child.wait();
@@ -3444,6 +3460,11 @@ mod tests {
     /// Helper: format epoch as RFC3339 for log file content (replaces format_epoch_iso8601 in tests).
     fn fmt_ts(epoch: i64) -> String {
         format_log_timestamp(Local.timestamp_opt(epoch, 0).single().unwrap())
+    }
+
+    #[test]
+    fn test_help_prelude_starts_with_canonical_source_url() {
+        assert_eq!(help_prelude(), format!("{}\n\n", CANONICAL_SOURCE_URL));
     }
 
     #[test]
