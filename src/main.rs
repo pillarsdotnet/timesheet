@@ -51,6 +51,7 @@ use libc::{
 };
 use regex::Regex;
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufRead, Write};
 #[cfg(unix)]
@@ -903,20 +904,41 @@ fn print_report(
     lines: &[(usize, LogLine)],
     virtual_stop: Option<DateTime<Local>>,
     current_task: CurrentTask,
+    include_day_totals: bool,
 ) -> Result<(), String> {
+    print!(
+        "{}",
+        render_report(lines, virtual_stop, current_task, include_day_totals)
+    );
+    Ok(())
+}
+
+fn render_report(
+    lines: &[(usize, LogLine)],
+    virtual_stop: Option<DateTime<Local>>,
+    current_task: CurrentTask,
+    include_day_totals: bool,
+) -> String {
     let (by_act, dow_hr, work_in_progress) = process_log_for_report(lines, virtual_stop);
     if by_act.is_empty() {
-        println!("No work recorded.");
-        return Ok(());
+        return "No work recorded.\n".to_string();
     }
+    let mut out = String::new();
     for (act, pct, hr) in &by_act {
-        println!("{:.1}%  {:.2}h  {}", pct, hr, act);
+        let _ = writeln!(out, "{:.1}%  {:.2}h  {}", pct, hr, act);
     }
-    for (i, name) in DAY_NAMES.iter().enumerate() {
-        println!("{}  {:.2}", name, dow_hr.get(i).copied().unwrap_or(0.0));
+    if include_day_totals {
+        for (i, name) in DAY_NAMES.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "{}  {:.2}",
+                name,
+                dow_hr.get(i).copied().unwrap_or(0.0)
+            );
+        }
+        let total_hr: f64 = dow_hr.iter().map(|&h| trunc2(h)).sum();
+        let _ = writeln!(out, "Total  {:.2}", trunc2(total_hr));
     }
-    let total_hr: f64 = dow_hr.iter().map(|&h| trunc2(h)).sum();
-    println!("Total  {:.2}", trunc2(total_hr));
     if work_in_progress {
         if let Some((start_dt, activity)) = current_task {
             let now = Local::now();
@@ -929,7 +951,8 @@ fn print_report(
             } else {
                 format!("{}m", dur_min)
             };
-            println!(
+            let _ = writeln!(
+                out,
                 "\nCurrent Task: {}, started {}, worked {}",
                 activity,
                 start_dt.format("%a %b %d %H:%M:%S %Z %Y"),
@@ -937,7 +960,7 @@ fn print_report(
             );
         }
     }
-    Ok(())
+    out
 }
 
 /// Outputs the latest ten log entries with timestamps shown in local time. Optional arg selects file (same as list).
@@ -1042,7 +1065,7 @@ fn cmd_list(list_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
     } else {
         None
     };
-    print_report(&lines, virtual_stop, current_task)
+    print_report(&lines, virtual_stop, current_task, true)
 }
 
 fn cmd_sprint(timesheet: &Path) -> Result<(), String> {
@@ -1053,7 +1076,7 @@ fn cmd_sprint(timesheet: &Path) -> Result<(), String> {
     }
     let (lines, current_task) = sprint_report_data(timesheet)?;
     let virtual_stop = current_task.as_ref().map(|_| Local::now());
-    print_report(&lines, virtual_stop, current_task)
+    print_report(&lines, virtual_stop, current_task, false)
 }
 
 /// Parses a start-time string into a DateTime<Local>; tries strict ISO 8601 first, then several other formats (e.g. `%Y-%m-%d %H:%M`, `%H:%M`, `%I:%M %p`).
@@ -3862,6 +3885,22 @@ mod tests {
         assert_eq!(by_act.len(), 1);
         assert_eq!(by_act[0].0, "x");
         assert!((by_act[0].1 - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_render_report_can_omit_day_totals() {
+        let dt1 = Local.timestamp_opt(1000, 0).single().unwrap();
+        let dt2 = Local.timestamp_opt(4600, 0).single().unwrap();
+        let lines = vec![
+            (1, LogLine::Start(dt1, "coding".to_string())),
+            (2, LogLine::Stop(dt2)),
+        ];
+
+        let rendered = render_report(&lines, None, None, false);
+
+        assert!(rendered.contains("100.0%  1.00h  coding"));
+        assert!(!rendered.contains("Sunday"));
+        assert!(!rendered.contains("Total  "));
     }
 
     #[test]
