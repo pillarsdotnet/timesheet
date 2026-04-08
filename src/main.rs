@@ -26,7 +26,7 @@
 //! | `help`     | Show the man page in a pager (groff -man -Tascii \| less). |
 //! | `install`  | Copy binary and icon to a directory on PATH (icon embedded on macOS). |
 //! | `interval` | Set or show reminder daemon interval (e.g. 3, 3m, 100s, 1h30m). |
-//! | `list`     | Report % per activity and hours per weekday; optional file/extension arg. |
+//! | `list`     | Report % per activity and hours per weekday; optional file/extension arg, date, or negative rotated-log index. |
 //! | `migrate`  | Convert all timesheet.* files in the log directory to strict ISO 8601 timestamps. |
 //! | `sprint`   | Report % per activity and hours per weekday across the current log plus the most recently rotated log. |
 //! | `tail`     | Last 10 log entries with timestamps in local time; optional file/extension arg. |
@@ -492,9 +492,14 @@ fn cmd_migrate(timesheet: &Path) -> Result<(), String> {
 /// - Empty / `None` → current timesheet.
 /// - `"log"` → current timesheet.
 /// - Existing path → that path.
+/// - Negative integer (when enabled) → nth most recently rotated timesheet (`-1` is latest, `-2` is previous, etc.).
 /// - Otherwise: match by extension in the timesheet directory (e.g. `260220`, `20260220`, `0220`, `2/20`).
 ///   Returns an error if zero or multiple files match.
-fn resolve_list_input(arg: Option<&str>, timesheet: &Path) -> Result<PathBuf, String> {
+fn resolve_list_input_impl(
+    arg: Option<&str>,
+    timesheet: &Path,
+    allow_negative_rotated_index: bool,
+) -> Result<PathBuf, String> {
     let list_arg = match arg {
         Some(a) => a,
         None => {
@@ -509,6 +514,17 @@ fn resolve_list_input(arg: Option<&str>, timesheet: &Path) -> Result<PathBuf, St
     }
     if list_arg == "log" {
         return Ok(timesheet.to_path_buf());
+    }
+    if allow_negative_rotated_index {
+        if let Ok(index) = list_arg.parse::<i32>() {
+            if index < 0 {
+                let rotated_index = (-index - 1) as usize;
+                if let Some(path) = nth_latest_rotated_timesheet(timesheet, rotated_index) {
+                    return Ok(path);
+                }
+                return Err(format!("ts list: no timesheet matches \"{}\".", list_arg));
+            }
+        }
     }
     let ts_dir = timesheet.parent().ok_or("no parent")?;
     let base = ts_dir.join("timesheet");
@@ -642,6 +658,14 @@ fn resolve_list_input(arg: Option<&str>, timesheet: &Path) -> Result<PathBuf, St
     Err(format!("ts list: no timesheet matches \"{}\".", list_arg))
 }
 
+fn resolve_list_input(arg: Option<&str>, timesheet: &Path) -> Result<PathBuf, String> {
+    resolve_list_input_impl(arg, timesheet, true)
+}
+
+fn resolve_tail_input(arg: Option<&str>, timesheet: &Path) -> Result<PathBuf, String> {
+    resolve_list_input_impl(arg, timesheet, false)
+}
+
 fn rotated_timesheet_files(timesheet: &Path) -> Vec<PathBuf> {
     let Some(ts_dir) = timesheet.parent() else {
         return Vec::new();
@@ -667,7 +691,7 @@ fn rotated_timesheet_files(timesheet: &Path) -> Vec<PathBuf> {
     rotated
 }
 
-fn latest_rotated_timesheet(timesheet: &Path) -> Option<PathBuf> {
+fn sorted_rotated_timesheet_files(timesheet: &Path) -> Vec<PathBuf> {
     let mut rotated = rotated_timesheet_files(timesheet);
     rotated.sort_by_key(|path| {
         path.extension()
@@ -675,7 +699,18 @@ fn latest_rotated_timesheet(timesheet: &Path) -> Option<PathBuf> {
             .unwrap_or("")
             .to_string()
     });
-    rotated.pop()
+    rotated
+}
+
+fn nth_latest_rotated_timesheet(timesheet: &Path, index: usize) -> Option<PathBuf> {
+    sorted_rotated_timesheet_files(timesheet)
+        .into_iter()
+        .rev()
+        .nth(index)
+}
+
+fn latest_rotated_timesheet(timesheet: &Path) -> Option<PathBuf> {
+    nth_latest_rotated_timesheet(timesheet, 0)
 }
 
 fn sprint_report_data(timesheet: &Path) -> Result<(ParsedLogLines, CurrentTask), String> {
@@ -969,7 +1004,7 @@ fn render_report(
 /// Outputs the latest ten log entries with timestamps shown in local time. Optional arg selects file (same as list).
 /// Consecutive START entries with the same activity are collapsed (first timestamp kept for aggregate duration); then the last 10 entries are shown.
 fn cmd_tail(tail_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
-    let path = resolve_list_input(tail_arg, timesheet)?;
+    let path = resolve_tail_input(tail_arg, timesheet)?;
     if !path.exists() {
         println!("No timesheet data found.");
         return Ok(());
@@ -1046,7 +1081,7 @@ fn cmd_tail(tail_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Prints report: % per activity and hours per weekday; optional arg selects file (e.g. `log`, `0220`, path).
+/// Prints report: % per activity and hours per weekday; optional arg selects file (e.g. `log`, `0220`, `-1`, path).
 fn cmd_list(list_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
     if env::var_os("TS_DEBUG").is_some() {
         let _ = std::io::stderr().write_all(b"ts: cmd_list entered\n");
@@ -1900,6 +1935,12 @@ and shows current task, start time, and duration.
 Optional
 .I file_or_extension
 selects an alternate log path or extension filter.
+If it is a negative integer,
+.B -1
+selects the most recently rotated
+.BR timesheet.YYMMDD ,
+.B -2
+the one before that, and so on.
 .TP
 .B sprint
 Plaintext report like
@@ -1924,8 +1965,7 @@ for STOP, time until the next START or current time.
 Consecutive START entries with the same activity are collapsed (last timestamp kept), then the last 10 entries are shown.
 Optional
 .I file_or_extension
-selects an alternate log path or extension (same as
-.BR list ).
+selects an alternate log path, extension, or date match.
 .TP
 .B manpage
 Write this manual page in groff format to stdout. Example:
@@ -3768,6 +3808,66 @@ mod tests {
         fs::File::create(&rotated).unwrap();
         let out = resolve_list_input(Some("0220"), &log_path).unwrap();
         assert_eq!(out, rotated);
+    }
+
+    #[test]
+    fn test_resolve_list_input_negative_one_returns_latest_rotated() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        fs::File::create(&log_path).unwrap();
+        let older = dir.path().join("timesheet.260220");
+        let newer = dir.path().join("timesheet.260227");
+        fs::File::create(&older).unwrap();
+        fs::File::create(&newer).unwrap();
+
+        let out = resolve_list_input(Some("-1"), &log_path).unwrap();
+
+        assert_eq!(out, newer);
+    }
+
+    #[test]
+    fn test_resolve_list_input_negative_two_returns_previous_rotated() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        fs::File::create(&log_path).unwrap();
+        let oldest = dir.path().join("timesheet.260213");
+        let older = dir.path().join("timesheet.260220");
+        let newer = dir.path().join("timesheet.260227");
+        fs::File::create(&oldest).unwrap();
+        fs::File::create(&older).unwrap();
+        fs::File::create(&newer).unwrap();
+
+        let out = resolve_list_input(Some("-2"), &log_path).unwrap();
+
+        assert_eq!(out, older);
+    }
+
+    #[test]
+    fn test_resolve_list_input_negative_out_of_range_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        fs::File::create(&log_path).unwrap();
+        let only = dir.path().join("timesheet.260227");
+        fs::File::create(&only).unwrap();
+
+        let result = resolve_list_input(Some("-2"), &log_path);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no timesheet matches"));
+    }
+
+    #[test]
+    fn test_resolve_tail_input_negative_integer_still_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        fs::File::create(&log_path).unwrap();
+        let rotated = dir.path().join("timesheet.260227");
+        fs::File::create(&rotated).unwrap();
+
+        let result = resolve_tail_input(Some("-1"), &log_path);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no timesheet matches"));
     }
 
     #[test]
