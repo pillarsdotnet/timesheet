@@ -8,8 +8,8 @@ use objc2::{define_class, msg_send, AnyThread, MainThreadMarker, MainThreadOnly}
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
     NSBackingStoreType, NSButton, NSEvent, NSImage, NSPanel, NSScreen, NSScrollView, NSStackView,
-    NSStackViewDistribution, NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowDelegate,
-    NSWindowStyleMask,
+    NSStackViewDistribution, NSTextField, NSUserInterfaceLayoutOrientation, NSView, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -23,6 +23,7 @@ const NS_USER_INTERFACE_LAYOUT_ORIENTATION_VERTICAL: NSUserInterfaceLayoutOrient
 
 thread_local! {
     static DIALOG_RESULT: RefCell<Option<String>> = const { RefCell::new(None) };
+    static INPUT_CONFIRMED: RefCell<bool> = const { RefCell::new(false) };
 }
 
 static CHOICES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -138,6 +139,140 @@ define_class!(
     unsafe impl NSObjectProtocol for TSReminderPanelDelegate {}
     unsafe impl NSWindowDelegate for TSReminderPanelDelegate {}
 );
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "TSReminderInputButtonHandler"]
+    struct TSReminderInputButtonHandler;
+
+    impl TSReminderInputButtonHandler {
+        #[unsafe(method(confirmInput:))]
+        fn confirm_input(&self, _sender: Option<&NSButton>) {
+            INPUT_CONFIRMED.with(|confirmed| *confirmed.borrow_mut() = true);
+            let app = NSApplication::sharedApplication(MainThreadMarker::new().unwrap());
+            app.stopModal();
+        }
+
+        #[unsafe(method(cancelInput:))]
+        fn cancel_input(&self, _sender: Option<&NSButton>) {
+            INPUT_CONFIRMED.with(|confirmed| *confirmed.borrow_mut() = false);
+            let app = NSApplication::sharedApplication(MainThreadMarker::new().unwrap());
+            app.stopModal();
+        }
+    }
+
+    unsafe impl NSObjectProtocol for TSReminderInputButtonHandler {}
+);
+
+fn centered_rect(screen_frame: NSRect, width: f64, height: f64) -> NSRect {
+    let x = screen_frame.origin.x + (screen_frame.size.width - width) / 2.0;
+    let y = screen_frame.origin.y + (screen_frame.size.height - height) / 2.0;
+    NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
+}
+
+fn run_native_enter_activity_dialog(mtm: MainThreadMarker, app: &NSApplication) -> Option<String> {
+    INPUT_CONFIRMED.with(|confirmed| *confirmed.borrow_mut() = false);
+
+    let screen_frame = NSScreen::mainScreen(mtm)
+        .map(|s| s.frame())
+        .unwrap_or_else(|| NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 600.0)));
+    let panel_alloc = NSPanel::alloc(mtm);
+    let panel: Retained<NSPanel> = NSPanel::initWithContentRect_styleMask_backing_defer(
+        panel_alloc,
+        centered_rect(screen_frame, 520.0, 160.0),
+        NSWindowStyleMask::Titled,
+        NSBackingStoreType::Buffered,
+        false,
+    );
+    panel.setTitle(&NSString::from_str("Enter activity"));
+    unsafe { panel.setReleasedWhenClosed(false) };
+
+    let content_rect = panel.contentRectForFrameRect(panel.frame());
+    let content_alloc = NSView::alloc(mtm);
+    let content: Retained<NSView> =
+        unsafe { msg_send![content_alloc, initWithFrame: content_rect] };
+    panel.setContentView(Some(&content));
+
+    let label_alloc = NSTextField::alloc(mtm);
+    let label: Retained<NSTextField> = unsafe {
+        msg_send![
+            label_alloc,
+            initWithFrame: NSRect::new(NSPoint::new(20.0, 108.0), NSSize::new(480.0, 22.0))
+        ]
+    };
+    let prompt = NSString::from_str("Enter activity:");
+    let _: () = unsafe { msg_send![&*label, setStringValue: &*prompt] };
+    label.setEditable(false);
+    label.setSelectable(false);
+    label.setBezeled(false);
+    label.setBordered(false);
+    label.setDrawsBackground(false);
+    content.addSubview(&label);
+
+    let input_alloc = NSTextField::alloc(mtm);
+    let input: Retained<NSTextField> = unsafe {
+        msg_send![
+            input_alloc,
+            initWithFrame: NSRect::new(NSPoint::new(20.0, 64.0), NSSize::new(480.0, 28.0))
+        ]
+    };
+    input.setEditable(true);
+    input.setSelectable(true);
+    let placeholder = NSString::from_str("Paste or type the activity name");
+    input.setPlaceholderString(Some(&placeholder));
+    content.addSubview(&input);
+
+    let handler_alloc = TSReminderInputButtonHandler::alloc(mtm);
+    let handler: Retained<TSReminderInputButtonHandler> = unsafe { msg_send![handler_alloc, init] };
+
+    let cancel = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            &NSString::from_str("Cancel"),
+            Some(handler.as_ref() as &AnyObject),
+            Some(objc2::sel!(cancelInput:)),
+            mtm,
+        )
+    };
+    cancel.setFrame(NSRect::new(
+        NSPoint::new(330.0, 20.0),
+        NSSize::new(80.0, 30.0),
+    ));
+    content.addSubview(&cancel);
+
+    let ok = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            &NSString::from_str("OK"),
+            Some(handler.as_ref() as &AnyObject),
+            Some(objc2::sel!(confirmInput:)),
+            mtm,
+        )
+    };
+    ok.setFrame(NSRect::new(
+        NSPoint::new(420.0, 20.0),
+        NSSize::new(80.0, 30.0),
+    ));
+    content.addSubview(&ok);
+
+    panel.setInitialFirstResponder(Some(input.as_ref() as &NSView));
+    let _: () = unsafe { msg_send![&panel, makeKeyAndOrderFront: None::<&AnyObject>] };
+    unsafe { input.selectText(None) };
+    let _ = app.runModalForWindow(&panel);
+    let _: () = unsafe { msg_send![&panel, orderOut: None::<&AnyObject>] };
+
+    if !INPUT_CONFIRMED.with(|confirmed| *confirmed.borrow()) {
+        return None;
+    }
+
+    let value: Retained<NSString> = unsafe { msg_send![&*input, stringValue] };
+    let activity = value.to_string();
+    let activity = activity.trim().to_string();
+    if activity.is_empty() {
+        None
+    } else {
+        Some(activity)
+    }
+}
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -294,10 +429,18 @@ define_class!(
             loop {
                 DIALOG_RESULT.with(|r| *r.borrow_mut() = None);
                 let _ = app.runModalForWindow(&panel);
-                if DIALOG_RESULT.with(|r| r.borrow().is_some()) {
-                    break;
+                match DIALOG_RESULT.with(|r| r.borrow().clone()) {
+                    Some(selected) if selected == "Enter new activity..." => {
+                        let _: () = unsafe { msg_send![&panel, orderOut: None::<&AnyObject>] };
+                        if let Some(activity) = run_native_enter_activity_dialog(mtm, &app) {
+                            DIALOG_RESULT.with(|r| *r.borrow_mut() = Some(activity));
+                            break;
+                        }
+                        panel.orderFrontRegardless();
+                    }
+                    Some(_) => break,
+                    None => panel.orderFrontRegardless(),
                 }
-                panel.orderFrontRegardless();
             }
 
             app.setActivationPolicy(NSApplicationActivationPolicy::Prohibited);
