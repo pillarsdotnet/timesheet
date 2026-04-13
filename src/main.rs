@@ -2973,6 +2973,20 @@ enum ReminderResult {
     TimeoutAddStop(DateTime<Local>),
 }
 
+fn parse_native_reminder_dialog_output(output: &str) -> Option<ReminderResult> {
+    let output = output.trim();
+    if output.is_empty() {
+        return None;
+    }
+    if output == "Stop Work" {
+        return Some(ReminderResult::DontBugMe);
+    }
+    if output == "Enter new activity..." {
+        return Some(ReminderResult::EnterNew);
+    }
+    Some(ReminderResult::Activity(output.to_string()))
+}
+
 /// Show "What are you working on?" prompt; returns user choice or timeout. Platform-specific (macOS: osascript).
 /// timesheet: used when appending STOP on timeout (reminder daemon / ts start).
 fn show_reminder_prompt(activities: &[String], timesheet: Option<&Path>) -> ReminderResult {
@@ -3100,14 +3114,8 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
             match wait_with_timeout(child, timeout, false) {
                 WaitOutcome::Finished(Some(out)) => {
                     let s = String::from_utf8_lossy(&out).trim().to_string();
-                    if s == "Stop Work" {
-                        return NativeOutcome::Result(ReminderResult::DontBugMe);
-                    }
-                    if s == "Enter new activity..." {
-                        return NativeOutcome::Result(ReminderResult::EnterNew);
-                    }
-                    if !s.is_empty() && choices.contains(&s) {
-                        return NativeOutcome::Result(ReminderResult::Activity(s));
+                    if let Some(result) = parse_native_reminder_dialog_output(&s) {
+                        return NativeOutcome::Result(result);
                     }
                     return NativeOutcome::Dismissed;
                 }
@@ -4070,6 +4078,27 @@ mod tests {
         assert!(result.is_ok());
         let content = fs::read_to_string(&log_path).unwrap();
         assert!(content.contains("misc/unspecified"));
+    }
+
+    #[test]
+    fn test_parse_native_reminder_dialog_output_accepts_new_activity() {
+        match parse_native_reminder_dialog_output("brand new task") {
+            Some(ReminderResult::Activity(activity)) => assert_eq!(activity, "brand new task"),
+            _ => panic!("expected activity result"),
+        }
+    }
+
+    #[test]
+    fn test_parse_native_reminder_dialog_output_handles_special_buttons() {
+        assert!(matches!(
+            parse_native_reminder_dialog_output("Stop Work"),
+            Some(ReminderResult::DontBugMe)
+        ));
+        assert!(matches!(
+            parse_native_reminder_dialog_output("Enter new activity..."),
+            Some(ReminderResult::EnterNew)
+        ));
+        assert!(parse_native_reminder_dialog_output("   ").is_none());
     }
 
     #[test]
