@@ -179,21 +179,38 @@ fn parse_interval_duration(s: &str) -> Result<u64, String> {
     Ok(total_secs)
 }
 
-/// Activities from the current week's START entries, most-recently logged first (by last occurrence).
-fn activities_this_week_most_recent_first(timesheet: &Path) -> Vec<String> {
-    let now = Local::now();
-    let week_start_dt = week_start(now);
-    let week_end = week_start_dt + chrono::Duration::weeks(1) - chrono::Duration::seconds(1);
-    let content = match fs::read_to_string(timesheet) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
+/// Activities from the current timesheet plus the most recently rotated timesheet,
+/// limited to START entries from the last 7 days and sorted most-recent first.
+fn reminder_activities_most_recent_first(timesheet: &Path) -> Vec<String> {
+    reminder_activities_most_recent_first_at(timesheet, Local::now())
+}
+
+fn reminder_activities_most_recent_first_at(timesheet: &Path, now: DateTime<Local>) -> Vec<String> {
+    let cutoff = now - chrono::Duration::days(7);
     let mut by_activity: std::collections::HashMap<String, DateTime<Local>> =
         std::collections::HashMap::new();
-    for line in content.lines() {
-        if let Some(LogLine::Start(dt, activity)) = parse_line(line) {
-            if dt >= week_start_dt && dt <= week_end {
-                by_activity.insert(activity.clone(), dt);
+
+    let mut sources = Vec::with_capacity(2);
+    if let Some(path) = latest_rotated_timesheet(timesheet) {
+        sources.push(path);
+    }
+    sources.push(timesheet.to_path_buf());
+
+    for path in sources {
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in content.lines() {
+            if let Some(LogLine::Start(dt, activity)) = parse_line(line) {
+                if dt >= cutoff && dt <= now {
+                    let replace = by_activity
+                        .get(&activity)
+                        .map(|existing| dt > *existing)
+                        .unwrap_or(true);
+                    if replace {
+                        by_activity.insert(activity, dt);
+                    }
+                }
             }
         }
     }
@@ -770,7 +787,7 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
     let activity = if args.is_empty() {
         #[cfg(all(target_os = "macos", not(test)))]
         {
-            let activities = activities_this_week_most_recent_first(timesheet);
+            let activities = reminder_activities_most_recent_first(timesheet);
             loop {
                 match show_reminder_prompt(&activities, Some(timesheet)) {
                     ReminderResult::Activity(a) => break a,
@@ -2927,7 +2944,7 @@ fn run_reminder_daemon(timesheet: &Path) {
         thread::sleep(Duration::from_secs(interval_secs));
         ts_debug("reminder daemon: showing prompt");
 
-        let activities = activities_this_week_most_recent_first(timesheet);
+        let activities = reminder_activities_most_recent_first(timesheet);
         match show_reminder_prompt(&activities, Some(timesheet)) {
             ReminderResult::DontBugMe => {
                 show_reminders_stopped_notification();
@@ -3932,6 +3949,48 @@ mod tests {
         let out = latest_rotated_timesheet(&log_path).unwrap();
 
         assert_eq!(out, newer);
+    }
+
+    #[test]
+    fn test_reminder_activities_use_current_and_latest_rotated_from_last_7_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        let latest = dir.path().join("timesheet.260227");
+        let older = dir.path().join("timesheet.260220");
+        let now = Local::now();
+
+        fs::write(
+            &older,
+            format!(
+                "{}|START|ignored-older-file\n",
+                format_log_timestamp(now - chrono::Duration::hours(1))
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &latest,
+            format!(
+                "{}|START|rotated\n{}|START|boundary\n{}|START|dup\n",
+                format_log_timestamp(now - chrono::Duration::days(6)),
+                format_log_timestamp(now - chrono::Duration::days(7)),
+                format_log_timestamp(now - chrono::Duration::days(5)),
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &log_path,
+            format!(
+                "{}|START|current\n{}|START|dup\n{}|START|ignored-too-old\n",
+                format_log_timestamp(now - chrono::Duration::hours(2)),
+                format_log_timestamp(now - chrono::Duration::hours(1)),
+                format_log_timestamp(now - chrono::Duration::days(8)),
+            ),
+        )
+        .unwrap();
+
+        let activities = reminder_activities_most_recent_first_at(&log_path, now);
+
+        assert_eq!(activities, vec!["dup", "current", "rotated", "boundary"]);
     }
 
     #[test]
