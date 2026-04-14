@@ -1,7 +1,7 @@
 # Timesheet
 
 Copyright (c) 2025 Robert August Vincent II <pillarsdotnet@gmail.com>
-Co-author: Cursor-AI.
+Co-author: Cursor-AI and GitHub Copilot.
 
 CLI for tracking work start/stop and reporting time by activity and by day of week.
 
@@ -16,7 +16,7 @@ that pops up every five minutes and asks what I've been doing. I called it
 
 My present position has similar reporting requirements, so I have recreated that
 old program with improvements. I took the opportunity to simultaneously scratch
-two itches: AI and the Rust Programming Language. So I used Cursor-AI almost
+two itches: AI and the Rust Programming Language. So I used an AI agent almost
 exclusively to write the program code, both in its original form as a set of
 Korn Shell scripts, and in its current form as a Rust program.
 
