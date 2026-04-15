@@ -3,13 +3,13 @@
 //! Custom panel guarantees vertical layout regardless of choice count (NSAlert switches to horizontal).
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::runtime::{AnyObject, Bool, ProtocolObject};
 use objc2::{define_class, msg_send, AnyThread, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
-    NSBackingStoreType, NSButton, NSEvent, NSImage, NSPanel, NSScreen, NSScrollView, NSStackView,
-    NSStackViewDistribution, NSTextField, NSUserInterfaceLayoutOrientation, NSView, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask,
+    NSBackingStoreType, NSButton, NSEvent, NSEventModifierFlags, NSImage, NSPanel, NSScreen,
+    NSScrollView, NSStackView, NSStackViewDistribution, NSTextField,
+    NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -29,6 +29,19 @@ thread_local! {
 static CHOICES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 /// Icon path for dock (ts-icon.svg/png next to exe, or assets/icon.svg when running from repo).
 static ICON_PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+fn is_command_v_shortcut(modifiers: NSEventModifierFlags, key: &str) -> bool {
+    let modifiers = modifiers & NSEventModifierFlags::DeviceIndependentFlagsMask;
+    let allowed_modifiers = NSEventModifierFlags::Command | NSEventModifierFlags::Shift;
+    modifiers.contains(NSEventModifierFlags::Command)
+        && !modifiers.intersects(
+            NSEventModifierFlags::Control
+                | NSEventModifierFlags::Option
+                | NSEventModifierFlags::Help,
+        )
+        && (modifiers - allowed_modifiers).is_empty()
+        && key.eq_ignore_ascii_case("v")
+}
 
 /// Run the native reminder dialog. Must be called from the main thread (e.g. when invoked as `ts --reminder-dialog ...`).
 /// Returns the selected choice string, or None if cancelled/error.
@@ -165,6 +178,33 @@ define_class!(
     unsafe impl NSObjectProtocol for TSReminderInputButtonHandler {}
 );
 
+define_class!(
+    #[unsafe(super(NSTextField))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "TSReminderInputField"]
+    struct TSReminderInputField;
+
+    impl TSReminderInputField {
+        #[unsafe(method(performKeyEquivalent:))]
+        fn perform_key_equivalent(&self, event: &NSEvent) -> Bool {
+            let key = event
+                .charactersIgnoringModifiers()
+                .map(|chars| chars.to_string())
+                .unwrap_or_default();
+            if is_command_v_shortcut(event.modifierFlags(), &key) {
+                if let Some(editor) = self.currentEditor() {
+                    unsafe { editor.paste(None) };
+                    return true.into();
+                }
+            }
+
+            false.into()
+        }
+    }
+
+    unsafe impl NSObjectProtocol for TSReminderInputField {}
+);
+
 fn centered_rect(screen_frame: NSRect, width: f64, height: f64) -> NSRect {
     let x = screen_frame.origin.x + (screen_frame.size.width - width) / 2.0;
     let y = screen_frame.origin.y + (screen_frame.size.height - height) / 2.0;
@@ -210,8 +250,8 @@ fn run_native_enter_activity_dialog(mtm: MainThreadMarker, app: &NSApplication) 
     label.setDrawsBackground(false);
     content.addSubview(&label);
 
-    let input_alloc = NSTextField::alloc(mtm);
-    let input: Retained<NSTextField> = unsafe {
+    let input_alloc = TSReminderInputField::alloc(mtm);
+    let input: Retained<TSReminderInputField> = unsafe {
         msg_send![
             input_alloc,
             initWithFrame: NSRect::new(NSPoint::new(20.0, 64.0), NSSize::new(480.0, 28.0))
@@ -254,8 +294,13 @@ fn run_native_enter_activity_dialog(mtm: MainThreadMarker, app: &NSApplication) 
     ));
     content.addSubview(&ok);
 
-    panel.setInitialFirstResponder(Some(input.as_ref() as &NSView));
+    let input_field: &TSReminderInputField = input.as_ref();
+    let input_text: &NSTextField = input_field.as_ref();
+    let input_view: &NSView = input_text.as_ref();
+    panel.setInitialFirstResponder(Some(input_view));
     let _: () = unsafe { msg_send![&panel, makeKeyAndOrderFront: None::<&AnyObject>] };
+    let input_responder = input_text.as_ref();
+    let _: bool = panel.makeFirstResponder(Some(input_responder));
     unsafe { input.selectText(None) };
     let _ = app.runModalForWindow(&panel);
     let _: () = unsafe { msg_send![&panel, orderOut: None::<&AnyObject>] };
@@ -448,3 +493,27 @@ define_class!(
         }
     }
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_v_shortcut_matches_standard_paste() {
+        assert!(is_command_v_shortcut(NSEventModifierFlags::Command, "v"));
+        assert!(is_command_v_shortcut(
+            NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+            "V"
+        ));
+    }
+
+    #[test]
+    fn command_v_shortcut_rejects_other_modifier_combinations() {
+        assert!(!is_command_v_shortcut(NSEventModifierFlags::Control, "v"));
+        assert!(!is_command_v_shortcut(
+            NSEventModifierFlags::Command | NSEventModifierFlags::Option,
+            "v"
+        ));
+        assert!(!is_command_v_shortcut(NSEventModifierFlags::Command, "c"));
+    }
+}
