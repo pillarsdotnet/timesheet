@@ -53,7 +53,7 @@ To run **`ts start`** at login and **`ts stop`** at logout/shutdown:
 ts autostart
 ```
 
-You can pass an interval (e.g. **`ts autostart 5s`**) to set the reminder interval and start the daemon in this session. On macOS this uses LaunchAgents and a logout hook. If the installer prints a `sudo defaults write com.apple.loginwindow LogoutHook ...` command, run it once (it requires your password) so that STOP is recorded when you log out or shut down. To remove: **`ts autostart uninstall`**.
+You can pass an interval (e.g. **`ts autostart 5s`**) to set the reminder interval and start the daemon in this session. Startup skips a new START if the last log entry is a STOP less than 60 seconds old, and if it finds a non-STOP event more than 5 minutes old it backfills a STOP 5 minutes after that event before recording the new START. On macOS this uses LaunchAgents and a logout hook. If the installer prints a `sudo defaults write com.apple.loginwindow LogoutHook ...` command, run it once (it requires your password) so that STOP is recorded when you log out or shut down. To remove: **`ts autostart uninstall`**.
 
 ## Configuration
 

@@ -105,6 +105,16 @@ fn format_stop_log_entry(dt: DateTime<Local>) -> String {
     format!("{}|STOP", format_log_timestamp(dt))
 }
 
+fn append_log_entry(timesheet: &Path, entry: &str) -> Result<(), String> {
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(timesheet)
+        .map_err(|e| e.to_string())?;
+    f.write_all(format!("{}\n", entry).as_bytes())
+        .map_err(|e| e.to_string())
+}
+
 /// Returns the default timesheet path: `$HOME/Documents/timesheet.log`, or `./Documents/timesheet.log` if `HOME` is unset.
 fn timesheet_path() -> PathBuf {
     env::var_os("HOME")
@@ -223,27 +233,13 @@ fn reminder_activities_most_recent_first_at(timesheet: &Path, now: DateTime<Loca
 fn append_start_entry(timesheet: &Path, activity: &str) -> Result<(), String> {
     maybe_rotate_if_previous_week(timesheet)?;
     let now = Local::now();
-    let line = format!("{}\n", format_start_log_entry(now, activity));
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(timesheet)
-        .map_err(|e| e.to_string())?;
-    f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
-    Ok(())
+    append_log_entry(timesheet, &format_start_log_entry(now, activity))
 }
 
 /// Append a STOP log entry at the given datetime (used by reminder daemon on timeout/shutdown). Calls maybe_rotate first.
 fn append_stop_entry(timesheet: &Path, dt: DateTime<Local>) -> Result<(), String> {
     maybe_rotate_if_previous_week(timesheet)?;
-    let line = format!("{}\n", format_stop_log_entry(dt));
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(timesheet)
-        .map_err(|e| e.to_string())?;
-    f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
-    Ok(())
+    append_log_entry(timesheet, &format_stop_log_entry(dt))
 }
 
 /// DateTime of Sunday 00:00:00 for the week containing `now` (local time).
@@ -314,6 +310,10 @@ fn parse_log_lines(content: &str) -> ParsedLogLines {
 fn read_log_lines(path: &Path) -> Result<ParsedLogLines, String> {
     let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
     Ok(parse_log_lines(&content))
+}
+
+fn last_recorded_event(content: &str) -> Option<LogLine> {
+    content.lines().rev().find_map(parse_line)
 }
 
 fn last_start_entry(lines: &[(usize, LogLine)]) -> CurrentTask {
@@ -763,25 +763,38 @@ fn sprint_report_data(timesheet: &Path) -> Result<(ParsedLogLines, CurrentTask),
 /// Ensures the reminder daemon is running at entry (so it stays running even when ts start is run at system startup and
 /// exits before the final start call), then restarts it after recording START to reset the timer.
 fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
-    maybe_rotate_if_previous_week(timesheet)?;
     // Guard against shutdown/reload race: if auto-invoked (no args) and the last log
     // entry is a very recent STOP, skip — launchd is re-firing RunAtLoad during shutdown,
     // not a genuine login.
     if args.is_empty() {
+        let startup_now = Local::now();
         let content = fs::read_to_string(timesheet).unwrap_or_default();
-        let last = content.lines().rev().find(|l| !l.trim().is_empty());
-        if let Some(LogLine::Stop(dt)) = last.and_then(parse_line) {
-            let age = Local::now().signed_duration_since(dt).num_seconds();
-            if (0..60).contains(&age) {
-                if env::var_os("TS_DEBUG").is_some() {
-                    let _ = std::io::stderr().write_all(
-                        b"ts: skipping start: last STOP was <60s ago (shutdown/reload guard)\n",
-                    );
+        match last_recorded_event(&content) {
+            Some(LogLine::Stop(dt)) => {
+                let age = startup_now.signed_duration_since(dt).num_seconds();
+                if (0..60).contains(&age) {
+                    if env::var_os("TS_DEBUG").is_some() {
+                        let _ = std::io::stderr().write_all(
+                            b"ts: skipping start: last STOP was <60s ago (shutdown/reload guard)\n",
+                        );
+                    }
+                    return Ok(());
                 }
-                return Ok(());
             }
+            // Reconcile a missed shutdown STOP before any weekly rotation or recent-STOP guard
+            // could hide the stale open session.
+            Some(LogLine::Start(dt, _))
+                if startup_now.signed_duration_since(dt) > chrono::Duration::minutes(5) =>
+            {
+                append_log_entry(
+                    timesheet,
+                    &format_stop_log_entry(dt + chrono::Duration::minutes(5)),
+                )?;
+            }
+            _ => {}
         }
     }
+    maybe_rotate_if_previous_week(timesheet)?;
     // Start daemon early so it is running even when ts start is invoked at login (LaunchAgent) and exits quickly.
     start_reminder_daemon_if_needed(timesheet);
     let activity = if args.is_empty() {
@@ -815,25 +828,14 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
     // Close any open session before starting a new one.
     {
         let content = fs::read_to_string(timesheet).unwrap_or_default();
-        let last = content.lines().rev().find(|l| !l.trim().is_empty());
-        if last
-            .and_then(parse_line)
+        if last_recorded_event(&content)
             .map(|ll| matches!(ll, LogLine::Start(_, _)))
             .unwrap_or(false)
         {
-            let stop_line = format!("{}\n", format_stop_log_entry(now));
-            if let Ok(mut sf) = fs::OpenOptions::new().append(true).open(timesheet) {
-                let _ = sf.write_all(stop_line.as_bytes());
-            }
+            let _ = append_log_entry(timesheet, &format_stop_log_entry(now));
         }
     }
-    let line = format!("{}\n", format_start_log_entry(now, &activity));
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(timesheet)
-        .map_err(|e| e.to_string())?;
-    f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    append_log_entry(timesheet, &format_start_log_entry(now, &activity))?;
     println!(
         "Started: {} at {}",
         activity,
@@ -1549,7 +1551,9 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
         return Err(format!("ts install: missing {}", src_to_use.display()));
     }
     let dest_file = dest.join(if cfg!(windows) { "ts.exe" } else { "ts" });
-    fs::copy(src_to_use, &dest_file).map_err(|e| format!("ts install: copy failed: {}", e))?;
+    if !paths_refer_to_same_file(src_to_use, &dest_file) {
+        fs::copy(src_to_use, &dest_file).map_err(|e| format!("ts install: copy failed: {}", e))?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1671,6 +1675,13 @@ fn is_writable(p: &Path) -> bool {
     fs::metadata(p)
         .map(|m| !m.permissions().readonly())
         .unwrap_or(false)
+}
+
+fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Rebuild from a local directory or clone: run `cargo build --release` then install to current binary's dir.
@@ -1879,6 +1890,7 @@ Runs
 .B "ts start"
 at login (RunAtLoad, limited to Aqua sessions).
 A shutdown guard skips the start if the last log entry is a STOP less than 60\ s old.
+If the last recorded event is not STOP and is more than 5 minutes old, startup backfills a STOP 5 minutes after that event before recording the new START.
 .TP
 \fBcom.ts.autostart.session\fR
 Runs
@@ -3528,6 +3540,18 @@ mod tests {
     }
 
     #[test]
+    fn test_paths_refer_to_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ts");
+        let other = dir.path().join("other");
+        fs::write(&path, "bin").unwrap();
+        fs::write(&other, "other").unwrap();
+
+        assert!(paths_refer_to_same_file(&path, &path));
+        assert!(!paths_refer_to_same_file(&path, &other));
+    }
+
+    #[test]
     fn test_help_prelude_starts_with_canonical_source_url() {
         assert_eq!(help_prelude(), format!("{}\n\n", CANONICAL_SOURCE_URL));
     }
@@ -4137,6 +4161,38 @@ mod tests {
         assert!(result.is_ok());
         let content = fs::read_to_string(&log_path).unwrap();
         assert!(content.contains("misc/unspecified"));
+    }
+
+    #[test]
+    fn test_cmd_start_backfills_stale_open_session_before_new_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        let stale_start = Local::now() - chrono::Duration::minutes(6);
+        fs::write(
+            &log_path,
+            format!("{}\n", format_start_log_entry(stale_start, "coding")),
+        )
+        .unwrap();
+
+        let result = cmd_start(&[], &log_path);
+
+        assert!(result.is_ok());
+        let content = fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "expected stale START, backfilled STOP, new START"
+        );
+        assert_eq!(lines[0], format_start_log_entry(stale_start, "coding"));
+        assert_eq!(
+            lines[1],
+            format_stop_log_entry(stale_start + chrono::Duration::minutes(5))
+        );
+        match parse_line(lines[2]) {
+            Some(LogLine::Start(_, activity)) => assert_eq!(activity, "misc/unspecified"),
+            other => panic!("expected new START entry, got {:?}", other),
+        }
     }
 
     #[test]
