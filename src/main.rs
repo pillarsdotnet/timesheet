@@ -105,6 +105,14 @@ fn format_stop_log_entry(dt: DateTime<Local>) -> String {
     format!("{}|STOP", format_log_timestamp(dt))
 }
 
+/// Caps automatic STOP timestamps so they do not land more than five minutes after the latest log entry.
+fn clamp_auto_stop_time(timesheet: &Path, requested_dt: DateTime<Local>) -> DateTime<Local> {
+    let Some(last_dt) = last_line_dt(timesheet) else {
+        return requested_dt;
+    };
+    std::cmp::min(requested_dt, last_dt + chrono::Duration::minutes(5))
+}
+
 fn append_log_entry(timesheet: &Path, entry: &str) -> Result<(), String> {
     let mut f = fs::OpenOptions::new()
         .create(true)
@@ -236,8 +244,9 @@ fn append_start_entry(timesheet: &Path, activity: &str) -> Result<(), String> {
     append_log_entry(timesheet, &format_start_log_entry(now, activity))
 }
 
-/// Append a STOP log entry at the given datetime (used by reminder daemon on timeout/shutdown). Calls maybe_rotate first.
+/// Append an automatic STOP log entry, capped to no more than five minutes after the latest log entry.
 fn append_stop_entry(timesheet: &Path, dt: DateTime<Local>) -> Result<(), String> {
+    let dt = clamp_auto_stop_time(timesheet, dt);
     maybe_rotate_if_previous_week(timesheet)?;
     append_log_entry(timesheet, &format_stop_log_entry(dt))
 }
@@ -376,7 +385,7 @@ fn date_range_in_log(path: &Path) -> Option<(NaiveDate, NaiveDate)> {
 
 /// Rotates the log: renames it to `timesheet.YYMMDD` using the most recent entry's date.
 /// If that file already exists (same day), appends the current log to it and removes the source.
-/// If the last entry is START (work in progress), appends a STOP at current time before rotating.
+/// If the last entry is START (work in progress), appends a STOP no later than five minutes after that entry before rotating.
 fn do_rotate(timesheet: &Path) -> Result<(), String> {
     if !timesheet.exists() {
         return Err("ts rotate: no timesheet data found.".to_string());
@@ -388,12 +397,12 @@ fn do_rotate(timesheet: &Path) -> Result<(), String> {
         .map(|ll| matches!(ll, LogLine::Start(..)))
         .unwrap_or(false)
     {
-        let now = Local::now();
+        let stop_dt = clamp_auto_stop_time(timesheet, Local::now());
         let mut f = fs::OpenOptions::new()
             .append(true)
             .open(timesheet)
             .map_err(|e| e.to_string())?;
-        f.write_all(format!("{}\n", format_stop_log_entry(now)).as_bytes())
+        f.write_all(format!("{}\n", format_stop_log_entry(stop_dt)).as_bytes())
             .map_err(|e| e.to_string())?;
     }
     let max_dt = max_dt_in_log(timesheet).ok_or("ts rotate: no valid entries in timesheet.")?;
@@ -786,10 +795,8 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
             Some(LogLine::Start(dt, _))
                 if startup_now.signed_duration_since(dt) > chrono::Duration::minutes(5) =>
             {
-                append_log_entry(
-                    timesheet,
-                    &format_stop_log_entry(dt + chrono::Duration::minutes(5)),
-                )?;
+                let stop_dt = clamp_auto_stop_time(timesheet, startup_now);
+                append_log_entry(timesheet, &format_stop_log_entry(stop_dt))?;
             }
             _ => {}
         }
@@ -832,7 +839,8 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
             .map(|ll| matches!(ll, LogLine::Start(_, _)))
             .unwrap_or(false)
         {
-            let _ = append_log_entry(timesheet, &format_stop_log_entry(now));
+            let stop_dt = clamp_auto_stop_time(timesheet, now);
+            let _ = append_log_entry(timesheet, &format_stop_log_entry(stop_dt));
         }
     }
     append_log_entry(timesheet, &format_start_log_entry(now, &activity))?;
@@ -1955,7 +1963,7 @@ and
 .B reminder
 are aliases for
 .BR interval .
-Reminder daemon behavior: on timeout (no click), records STOP at reminder-appeared time and brings the existing reminder window to the front of the window stack (does not launch a new prompt). Dismissed without choice (close, Escape) re-shows immediately. The "Enter new activity" dialog has no timeout; blank/cancelled re-shows the reminder. On system shutdown (SIGTERM), records STOP and exits.
+Reminder daemon behavior: on timeout (no click), records STOP at reminder-appeared time, capped to no more than 5 minutes after the latest log entry, and brings the existing reminder window to the front of the window stack (does not launch a new prompt). Dismissed without choice (close, Escape) re-shows immediately. The "Enter new activity" dialog has no timeout; blank/cancelled re-shows the reminder. On system shutdown (SIGTERM), records STOP with the same 5-minute cap and exits.
 .TP
 .B list
 Plaintext report: percentage of time per activity (high to low), and hours per day of week (Sun\-Sat).
@@ -2037,7 +2045,7 @@ Alias for
 .BR interval .
 .TP
 .B rotate
-If the last entry is START (work in progress), appends a STOP at current time first.
+If the last entry is START (work in progress), appends a STOP no later than 5 minutes after that entry first.
 Rename the timesheet log to
 .B timesheet.YYMMDD
 using the timestamp of the log's most recent entry (START or STOP).
@@ -3728,6 +3736,30 @@ mod tests {
     }
 
     #[test]
+    fn test_append_stop_entry_caps_to_five_minutes_after_latest_log_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        let start_dt = Local::now() - chrono::Duration::hours(2);
+        fs::write(
+            &log_path,
+            format!("{}\n", format_start_log_entry(start_dt, "coding")),
+        )
+        .unwrap();
+
+        let result = append_stop_entry(&log_path, Local::now());
+
+        assert!(result.is_ok());
+        let content = fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], format_start_log_entry(start_dt, "coding"));
+        assert_eq!(
+            lines[1],
+            format_stop_log_entry(start_dt + chrono::Duration::minutes(5))
+        );
+    }
+
+    #[test]
     fn test_do_rotate_renames_file() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("timesheet.log");
@@ -3790,6 +3822,30 @@ mod tests {
         let content = fs::read_to_string(&dest).unwrap();
         assert!(content.contains("old"));
         assert!(content.contains("first"));
+    }
+
+    #[test]
+    fn test_do_rotate_caps_auto_stop_to_five_minutes_after_open_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        let start_dt = Local::now() - chrono::Duration::hours(2);
+        fs::write(
+            &log_path,
+            format!("{}\n", format_start_log_entry(start_dt, "coding")),
+        )
+        .unwrap();
+
+        let result = do_rotate(&log_path);
+
+        assert!(result.is_ok());
+        let stop_dt = start_dt + chrono::Duration::minutes(5);
+        let stamp = stop_dt.format("%y%m%d").to_string();
+        let rotated = dir.path().join(format!("timesheet.{}", stamp));
+        let content = fs::read_to_string(&rotated).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], format_start_log_entry(start_dt, "coding"));
+        assert_eq!(lines[1], format_stop_log_entry(stop_dt));
     }
 
     #[test]
@@ -4191,6 +4247,34 @@ mod tests {
         );
         match parse_line(lines[2]) {
             Some(LogLine::Start(_, activity)) => assert_eq!(activity, "misc/unspecified"),
+            other => panic!("expected new START entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cmd_start_caps_auto_closed_session_before_new_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        let stale_start = Local::now() - chrono::Duration::hours(2);
+        fs::write(
+            &log_path,
+            format!("{}\n", format_start_log_entry(stale_start, "coding")),
+        )
+        .unwrap();
+
+        let result = cmd_start(&["next task".to_string()], &log_path);
+
+        assert!(result.is_ok());
+        let content = fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 3, "expected START, auto STOP, new START");
+        assert_eq!(lines[0], format_start_log_entry(stale_start, "coding"));
+        assert_eq!(
+            lines[1],
+            format_stop_log_entry(stale_start + chrono::Duration::minutes(5))
+        );
+        match parse_line(lines[2]) {
+            Some(LogLine::Start(_, activity)) => assert_eq!(activity, "next task"),
             other => panic!("expected new START entry, got {:?}", other),
         }
     }
