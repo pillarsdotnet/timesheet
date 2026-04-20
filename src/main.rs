@@ -342,21 +342,21 @@ fn last_line_dt(path: &Path) -> Option<DateTime<Local>> {
     }
 }
 
-/// Maximum DateTime among all START/STOP lines in the log; `None` if no valid entries.
-fn max_dt_in_log(path: &Path) -> Option<DateTime<Local>> {
+/// Minimum DateTime among all START/STOP lines in the log; `None` if no valid entries.
+fn min_dt_in_log(path: &Path) -> Option<DateTime<Local>> {
     let content = fs::read_to_string(path).ok()?;
-    let mut max: Option<DateTime<Local>> = None;
+    let mut min: Option<DateTime<Local>> = None;
     for line in content.lines() {
         match parse_line(line) {
             Some(LogLine::Start(dt, _)) | Some(LogLine::Stop(dt)) => {
-                if max.is_none_or(|m| dt > m) {
-                    max = Some(dt);
+                if min.is_none_or(|m| dt < m) {
+                    min = Some(dt);
                 }
             }
             None => {}
         }
     }
-    max
+    min
 }
 
 /// Date range (min, max) of all START/STOP entries in the log; `None` if no valid entries.
@@ -383,7 +383,7 @@ fn date_range_in_log(path: &Path) -> Option<(NaiveDate, NaiveDate)> {
     }
 }
 
-/// Rotates the log: renames it to `timesheet.YYMMDD` using the most recent entry's date.
+/// Rotates the log: renames it to `timesheet.YYMMDD` using the earliest entry's date.
 /// If that file already exists (same day), appends the current log to it and removes the source.
 /// If the last entry is START (work in progress), appends a STOP no later than five minutes after that entry before rotating.
 fn do_rotate(timesheet: &Path) -> Result<(), String> {
@@ -405,8 +405,8 @@ fn do_rotate(timesheet: &Path) -> Result<(), String> {
         f.write_all(format!("{}\n", format_stop_log_entry(stop_dt)).as_bytes())
             .map_err(|e| e.to_string())?;
     }
-    let max_dt = max_dt_in_log(timesheet).ok_or("ts rotate: no valid entries in timesheet.")?;
-    let stamp = max_dt.format("%y%m%d").to_string();
+    let min_dt = min_dt_in_log(timesheet).ok_or("ts rotate: no valid entries in timesheet.")?;
+    let stamp = min_dt.format("%y%m%d").to_string();
     let parent = timesheet.parent().ok_or("ts rotate: no parent dir")?;
     let stem = timesheet
         .file_stem()
@@ -659,7 +659,7 @@ fn resolve_list_input_impl(
             return Ok(path);
         }
         // Content-based found nothing (e.g. empty rotated file). Fall back to extension-as-date:
-        // use a file whose extension is YYMMDD on or after the requested date (the log that was current then).
+        // use the most recent file whose extension date is on or before the requested date.
         let mut by_ext_date: Vec<(PathBuf, NaiveDate)> = Vec::new();
         for path in &candidates {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -670,14 +670,14 @@ fn resolve_list_input_impl(
                     ext[4..6].parse::<u32>(),
                 ) {
                     if let Some(ext_date) = NaiveDate::from_ymd_opt(2000 + yy, mm, dd) {
-                        if ext_date >= want {
+                        if ext_date <= want {
                             by_ext_date.push((path.clone(), ext_date));
                         }
                     }
                 }
             }
         }
-        if let Some((path, _)) = by_ext_date.into_iter().min_by_key(|(_, d)| *d) {
+        if let Some((path, _)) = by_ext_date.into_iter().max_by_key(|(_, d)| *d) {
             return Ok(path);
         }
     }
@@ -2048,7 +2048,7 @@ Alias for
 If the last entry is START (work in progress), appends a STOP no later than 5 minutes after that entry first.
 Rename the timesheet log to
 .B timesheet.YYMMDD
-using the timestamp of the log's most recent entry (START or STOP).
+using the timestamp of the log's earliest entry (START or STOP).
 Errors if the log is missing or has no valid entries.
 .TP
 .B start
@@ -3715,7 +3715,7 @@ mod tests {
     }
 
     #[test]
-    fn test_max_dt_in_log() {
+    fn test_min_dt_in_log() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log");
         fs::write(
@@ -3728,11 +3728,11 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(max_dt_in_log(&path).map(|d| d.timestamp()), Some(200));
+        assert_eq!(min_dt_in_log(&path).map(|d| d.timestamp()), Some(100));
         fs::write(&path, "").unwrap();
-        assert!(max_dt_in_log(&path).is_none());
+        assert!(min_dt_in_log(&path).is_none());
         fs::write(&path, "comment\n").unwrap();
-        assert!(max_dt_in_log(&path).is_none());
+        assert!(min_dt_in_log(&path).is_none());
     }
 
     #[test]
@@ -3768,7 +3768,7 @@ mod tests {
             format!(
                 "{}|START|coding\n{}|STOP\n",
                 fmt_ts(1730000000),
-                fmt_ts(1730003600)
+                fmt_ts(1730086400)
             ),
         )
         .unwrap();
@@ -3776,7 +3776,7 @@ mod tests {
         assert!(result.is_ok());
         assert!(!log_path.exists());
         let stamp = chrono::Local
-            .timestamp_opt(1730003600, 0)
+            .timestamp_opt(1730000000, 0)
             .single()
             .unwrap()
             .format("%y%m%d")
@@ -3992,8 +3992,15 @@ mod tests {
         let log_path = dir.path().join("timesheet.log");
         fs::File::create(&log_path).unwrap();
         let later = dir.path().join("timesheet.250301");
-        // Epochs on 2025-02-19 and 2025-03-02 so the file's date range includes 2025-02-19
-        fs::write(&later, "START|1739984400|a\nSTOP|1740891600\n").unwrap(); // 2025-02-19 12:00 UTC, 2025-03-02 00:00 UTC
+        fs::write(
+            &later,
+            format!(
+                "{}|START|a\n{}|STOP\n",
+                format_log_timestamp(Local.with_ymd_and_hms(2025, 2, 19, 12, 0, 0).unwrap()),
+                format_log_timestamp(Local.with_ymd_and_hms(2025, 3, 2, 0, 0, 0).unwrap()),
+            ),
+        )
+        .unwrap();
         let out = resolve_list_input(Some("250219"), &log_path).unwrap();
         assert_eq!(
             out, later,
@@ -4003,16 +4010,16 @@ mod tests {
 
     #[test]
     fn test_resolve_list_input_date_fallback_by_extension() {
-        // No timesheet.250219; timesheet.260220 exists (extension 2026-02-20 >= 2025-02-19). Use it for 2/19.
+        // Empty rotated files fall back to filename semantics: pick the latest file whose start date is on/before the requested date.
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("timesheet.log");
         fs::File::create(&log_path).unwrap();
         let later = dir.path().join("timesheet.260220");
         fs::File::create(&later).unwrap(); // empty or no 2025-02-19 in content
-        let out = resolve_list_input(Some("2/19"), &log_path).unwrap();
+        let out = resolve_list_input(Some("2/21"), &log_path).unwrap();
         assert_eq!(
             out, later,
-            "ts list 2/19 should fall back to file with extension date on or after that day"
+            "ts list 2/21 should fall back to file with extension date on or before that day"
         );
     }
 
