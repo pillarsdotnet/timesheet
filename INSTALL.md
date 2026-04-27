@@ -110,3 +110,5 @@ prek install -f
 ```
 
 This installs both pre-commit and commit-msg hooks. Run all hooks manually with `prek run`, or run a single hook with `prek run <hook-id>`.
+
+If you prefer Python `pre-commit`, this repo also includes `.pre-commit-config.yaml`. Running `pre-commit install` will install both the `pre-commit` and `commit-msg` hooks, so commitlint catches non-Conventional Commit messages locally before CI does.
