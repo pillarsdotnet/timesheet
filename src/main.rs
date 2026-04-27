@@ -219,7 +219,7 @@ fn reminder_activities_most_recent_first_at(timesheet: &Path, now: DateTime<Loca
             continue;
         };
         for line in content.lines() {
-            if let Some(LogLine::Start(dt, activity)) = parse_line(line) {
+            if let Some(LogLine::Start(dt, activity)) = migrate_parse_line(line) {
                 if dt >= cutoff && dt <= now {
                     let replace = by_activity
                         .get(&activity)
@@ -3144,6 +3144,9 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
             Ok(c) => c,
             Err(_) => return NativeOutcome::Unavailable,
         };
+        // Bring the chooser forward as soon as it launches; otherwise `ts start`
+        // can sit behind Terminal until the first reminder timeout elapses.
+        macos_bring_reminder_window_to_front(child.id());
         let appeared = Local::now();
         let timeout = Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS);
         let mut appended_stop_for_this_reminder = false;
@@ -4078,6 +4081,39 @@ mod tests {
         let activities = reminder_activities_most_recent_first_at(&log_path, now);
 
         assert_eq!(activities, vec!["dup", "current", "rotated", "boundary"]);
+    }
+
+    #[test]
+    fn test_reminder_activities_accept_legacy_current_and_rotated_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        let latest = dir.path().join("timesheet.260227");
+        let now = Local::now();
+
+        fs::write(
+            &latest,
+            format!(
+                "START|{}|legacy-rotated\n",
+                format_log_timestamp(now - chrono::Duration::days(2))
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &log_path,
+            format!(
+                "START|{}|legacy-current\nSTART|{}|legacy-dup\n",
+                format_log_timestamp(now - chrono::Duration::hours(2)),
+                format_log_timestamp(now - chrono::Duration::hours(1)),
+            ),
+        )
+        .unwrap();
+
+        let activities = reminder_activities_most_recent_first_at(&log_path, now);
+
+        assert_eq!(
+            activities,
+            vec!["legacy-dup", "legacy-current", "legacy-rotated"]
+        );
     }
 
     #[test]
