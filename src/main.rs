@@ -141,6 +141,54 @@ fn reminder_pid_path() -> PathBuf {
         .join("ts-reminder.pid")
 }
 
+/// Atomically claim sole ownership of the reminder daemon by creating the PID file with O_EXCL.
+/// Returns true if this process now owns the daemon role, false if a live daemon already owns it.
+/// This makes the daemon self-deduplicating: if several are spawned in a race (interactive `ts start`,
+/// `ts autostart`, and the systemd start unit can all fire near-simultaneously), only the first to
+/// claim the file runs the loop; the rest see a live owner and exit.
+#[cfg(unix)]
+fn claim_reminder_daemon_ownership(pid_path: &Path) -> bool {
+    let my_pid = process::id();
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(pid_path)
+        {
+            Ok(mut f) => {
+                let _ = f.write_all(my_pid.to_string().as_bytes());
+                return true;
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // A pid file exists; keep it only if it names a live process other than us.
+                match fs::read_to_string(pid_path) {
+                    Ok(data) => {
+                        if let Ok(pid) = data.trim().parse::<u32>() {
+                            if pid != my_pid && is_pid_running(pid) {
+                                return false;
+                            }
+                        }
+                        // Stale or unparsable owner: remove and retry the exclusive create.
+                        let _ = fs::remove_file(pid_path);
+                    }
+                    // The file vanished between the failed create and this read: retry.
+                    Err(_) => {}
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+/// True if the reminder PID file still names this process (i.e. we are the current owner).
+#[cfg(unix)]
+fn owns_reminder_daemon(pid_path: &Path) -> bool {
+    fs::read_to_string(pid_path)
+        .ok()
+        .map(|d| d.trim() == process::id().to_string())
+        .unwrap_or(false)
+}
+
 /// Path for the reminder interval config file (seconds as decimal string; same dir as PID file).
 fn reminder_interval_path() -> PathBuf {
     reminder_pid_path()
@@ -2948,15 +2996,25 @@ fn run_reminder_daemon(timesheet: &Path) {
     if let Some(parent) = pid_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    if fs::write(&pid_path, process::id().to_string()).is_err() {
+    // Claim sole ownership; if another daemon is already running, exit instead of duplicating it.
+    if !claim_reminder_daemon_ownership(&pid_path) {
+        ts_debug("reminder daemon: another daemon already owns the pid file, exiting");
         return;
     }
     let pid_path_guard = pid_path.clone();
     let _cleanup = defer(move || {
-        let _ = fs::remove_file(&pid_path_guard);
+        // Only remove the pid file if we still own it, so we never delete a successor's file.
+        if owns_reminder_daemon(&pid_path_guard) {
+            let _ = fs::remove_file(&pid_path_guard);
+        }
     });
 
     loop {
+        // If ownership changed underneath us (e.g. another daemon took over), exit quietly.
+        if !owns_reminder_daemon(&pid_path) {
+            ts_debug("reminder daemon: lost pid ownership, exiting");
+            return;
+        }
         let interval_secs = get_reminder_interval_secs();
         ts_debug(&format!("reminder daemon: sleeping {}s", interval_secs));
         thread::sleep(Duration::from_secs(interval_secs));
@@ -3117,7 +3175,10 @@ fn command_on_path(name: &str) -> bool {
     })
 }
 
-/// Pick a dialog backend, preferring the one native to the running desktop, then whichever is installed.
+/// Pick a dialog backend. Prefer zenity only on explicitly GTK-based desktops; otherwise prefer
+/// kdialog (KDE-first), then fall back to whichever is installed. Choosing kdialog when the desktop
+/// is unknown keeps the dialog identical whether the daemon is launched from an interactive shell or
+/// from a systemd user unit (where XDG_CURRENT_DESKTOP is typically unset), avoiding mixed window styles.
 #[cfg(target_os = "linux")]
 fn detect_linux_dialog() -> Option<LinuxDialog> {
     let has_kdialog = command_on_path("kdialog");
@@ -3125,11 +3186,10 @@ fn detect_linux_dialog() -> Option<LinuxDialog> {
     let desktop = env::var_os("XDG_CURRENT_DESKTOP")
         .map(|d| d.to_string_lossy().to_uppercase())
         .unwrap_or_default();
-    let prefer_kde = desktop.contains("KDE") || desktop.contains("PLASMA");
-    if prefer_kde && has_kdialog {
-        return Some(LinuxDialog::KDialog);
-    }
-    if !prefer_kde && has_zenity {
+    let gtk_desktop = ["GNOME", "XFCE", "CINNAMON", "MATE", "UNITY", "LXDE", "PANTHEON"]
+        .iter()
+        .any(|d| desktop.contains(d));
+    if gtk_desktop && has_zenity {
         return Some(LinuxDialog::Zenity);
     }
     if has_kdialog {
