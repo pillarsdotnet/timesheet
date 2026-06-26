@@ -27,7 +27,11 @@ figure out how it works. For now I'm just glad that it does.
 
 - Timesheet data file: `~/Documents/timesheet.log` (edit `DEFAULT_TIMESHEET` in `src/main.rs` and rebuild to change)
 - **macOS:** no extra dependencies (reminder dialogs use built-in AppleScript/AppKit).
-- **Linux (KDE/Ubuntu/etc.):** a GUI dialog helper for the reminder prompt — `kdialog` (preferred on KDE/Plasma) or `zenity` (GNOME/other). Install whichever matches your desktop, e.g. `sudo apt install kdialog` or `sudo apt install zenity`. `notify-send` (from `libnotify-bin`) is used for the "reminders stopped" notification, and `systemd --user` for `ts autostart`. Without a dialog helper, reminders fall back to recording a STOP at each interval and `ts start` defaults to misc/unspecified instead of prompting.
+- **Linux (KDE/Ubuntu/etc.):** the reminder prompt uses, in order of preference:
+  1. **A single-click chooser** built with **Python 3 + PyQt** (`python3` plus `python3-pyqt6` or `python3-pyqt5`). This is the preferred experience: each entry acts on a single click with no OK/Cancel buttons (Qt, native on Wayland). Install e.g. `sudo apt install python3-pyqt6`.
+  2. **A fallback list dialog** via `kdialog` (KDE/Plasma) or `zenity` (GNOME/other) when PyQt is unavailable — a select-then-OK list. Install whichever matches your desktop, e.g. `sudo apt install kdialog` or `sudo apt install zenity`.
+
+  `notify-send` (from `libnotify-bin`) is used for the "reminders stopped" notification, and `systemd --user` for `ts autostart`. With no chooser available at all, reminders fall back to recording a STOP at each interval and `ts start` defaults to misc/unspecified instead of prompting.
 
 ## Data format
 
@@ -68,7 +72,8 @@ Subcommands (alphabetical):
 
 ### Reminder daemon
 
-- **`ts start`** starts the reminder daemon if it is not already running. With no activity, `ts start` shows the reminder dialog immediately to pick/enter an activity (macOS via AppleScript/AppKit; Linux via `kdialog` on KDE or `zenity` on GNOME/other). The daemon prompts “What are you working on?” at the configured interval.
+- **`ts start`** starts the reminder daemon if it is not already running. With no activity, `ts start` shows the reminder chooser immediately to pick/enter an activity (macOS via AppleScript/AppKit; Linux via the PyQt single-click chooser, falling back to `kdialog`/`zenity`). While this foreground chooser is open no daemon runs, so it cannot pop a second window; a fresh daemon starts once you pick. The daemon prompts “What are you working on?” at the configured interval.
+- **Chooser (Linux, PyQt):** a single click acts immediately — **Stop Work** records a STOP and stops reminders; an **activity** records a START for it and closes the window; **Enter new activity…** opens an input box where a non-empty entry (press Enter) records that activity and closes everything, while a blank entry returns you to the list.
 - **`ts stop`** (when it records a stop) stops the reminder daemon and shows a dialog that reminders have been stopped (skipped during logout/shutdown).
 - **`ts interval`** or **`ts restart [duration]`** sets or shows the interval and restarts the daemon.
 - **Reminder behavior:** If the reminder times out without a mouse click, a STOP is recorded at the time the reminder appeared, capped to no more than 5 minutes after the latest log entry, and the existing reminder window is brought to the front (no new prompt is launched). If the reminder or “Enter new activity” dialog is dismissed without choosing (e.g. closed, Escape), it re-shows immediately. The “Enter new activity” text dialog has no timeout. On system shutdown (SIGTERM), the daemon records STOP with the same 5-minute cap and exits.
