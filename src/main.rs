@@ -35,7 +35,7 @@
 //! | `rename`   | Same as `alias`. |
 //! | `restart`, `reminder` | Aliases for `interval`. |
 //! | `rotate`   | Rename log to `timesheet.YYMMDD`; add STOP first if last entry is START; append if same-day exists. |
-//! | `start`    | Record work start now; with no activity, shows reminder dialog to pick/enter (macOS, or Linux with kdialog/zenity); otherwise optional activity (default: misc/unspecified); starts/restarts reminder daemon. |
+//! | `start`    | Record work start now; with no activity, shows reminder chooser to pick/enter (macOS via AppKit; Linux via PyQt single-click chooser, falling back to kdialog/zenity); otherwise optional activity (default: misc/unspecified); starts/restarts reminder daemon. |
 //! | `started`  | Record a past start time; inserts at the correct chronological position without discarding entries. |
 //! | `stop`     | Record work stop (optional time); amends previous STOP if work already stopped; stops reminder daemon and shows "stopped" dialog when a stop is recorded (skipped during logout/shutdown). |
 //! | `timeoff`  | Show stop time for 8 h/day average; only requires a START entry (adds one if log empty or last is STOP). |
@@ -819,7 +819,7 @@ fn sprint_report_data(timesheet: &Path) -> Result<(ParsedLogLines, CurrentTask),
     Ok((combined, current_task))
 }
 
-/// Records work start now; activity is optional. With no argument, shows the reminder dialog to pick/enter an activity (macOS, or Linux with kdialog/zenity).
+/// Records work start now; activity is optional. With no argument, shows the reminder chooser to pick/enter an activity (macOS via AppKit; Linux via PyQt single-click chooser, falling back to kdialog/zenity).
 /// On other platforms or if the user declines, falls back to misc/unspecified.
 /// Ensures the reminder daemon is running at entry (so it stays running even when ts start is run at system startup and
 /// exits before the final start call), then restarts it after recording START to reset the timer.
@@ -854,8 +854,21 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
         }
     }
     maybe_rotate_if_previous_week(timesheet)?;
-    // Start daemon early so it is running even when ts start is invoked at login (LaunchAgent) and exits quickly.
-    start_reminder_daemon_if_needed(timesheet);
+    // Will we block on an interactive chooser below (no activity given and a GUI chooser is available)?
+    #[cfg(not(test))]
+    let will_prompt = args.is_empty() && start_chooser_available();
+    #[cfg(test)]
+    let will_prompt = false;
+    if will_prompt {
+        // The foreground chooser IS the reminder prompt. Stop any running daemon so it cannot pop a
+        // SECOND prompt window after its interval elapses while the chooser is open. A fresh daemon
+        // is (re)started after the chooser resolves and a START is recorded (below).
+        kill_reminder_daemon_if_running();
+    } else {
+        // Start the daemon early so it is running even when ts start is invoked at login
+        // (LaunchAgent / systemd) and exits quickly without prompting.
+        start_reminder_daemon_if_needed(timesheet);
+    }
     let activity = if args.is_empty() {
         #[cfg(not(test))]
         {
@@ -2098,7 +2111,8 @@ Record work start
 .IR now .
 With no
 .IR activity ,
-shows the reminder dialog to pick or enter an activity (macOS, or Linux with kdialog/zenity installed).
+shows the reminder chooser to pick or enter an activity (macOS via AppKit; Linux via the PyQt
+single-click chooser, falling back to kdialog/zenity). A single click acts immediately.
 Otherwise optional
 .I activity
 (default: misc/unspecified). Appends a START line; does not modify existing entries.
@@ -3084,7 +3098,7 @@ fn parse_native_reminder_dialog_output(output: &str) -> Option<ReminderResult> {
 }
 
 /// Show "What are you working on?" prompt; returns user choice or timeout.
-/// Platform-specific (macOS: AppKit/osascript; Linux: kdialog or zenity).
+/// Platform-specific (macOS: AppKit/osascript; Linux: PyQt single-click chooser, else kdialog/zenity).
 /// timesheet: used when appending STOP on timeout (reminder daemon / ts start).
 fn show_reminder_prompt(activities: &[String], timesheet: Option<&Path>) -> ReminderResult {
     #[cfg(target_os = "macos")]
@@ -3103,16 +3117,28 @@ fn show_reminder_prompt(activities: &[String], timesheet: Option<&Path>) -> Remi
 /// Resolve the activity for `ts start` when none was given on the command line.
 /// Returns `Some(activity)` to start, or `None` if the user chose "Stop Work" (caller should abort the start).
 /// On platforms (or headless setups) without a GUI chooser, returns the default activity without prompting.
+/// Whether `ts start` with no activity can show an interactive GUI chooser on this platform/setup
+/// (macOS always; Linux when kdialog/zenity is installed). Used both to decide whether to block on
+/// the chooser and to avoid starting the reminder daemon early when we will.
+#[cfg(not(test))]
+fn start_chooser_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        detect_linux_dialog().is_some()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
 #[cfg(not(test))]
 fn resolve_start_activity(timesheet: &Path) -> Option<String> {
-    #[cfg(target_os = "macos")]
-    let can_prompt = true;
-    #[cfg(target_os = "linux")]
-    let can_prompt = detect_linux_dialog().is_some();
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let can_prompt = false;
-
-    if !can_prompt {
+    if !start_chooser_available() {
         return Some("misc/unspecified".to_string());
     }
 
@@ -3296,11 +3322,134 @@ fn prompt_enter_activity_linux(backend: LinuxDialog) -> Option<String> {
     }
 }
 
-/// Linux reminder prompt: present the activity chooser via kdialog/zenity and map the choice to a ReminderResult.
+/// Single-click chooser implemented with PyQt (Qt, native to KDE). Each entry acts on a single
+/// click with no OK/Cancel buttons: clicking "Stop Work" / an activity returns it, and clicking
+/// "Enter new activity..." opens an input box in the same window (a non-empty entry returns it; a
+/// blank entry returns to the list). The script writes the chosen string to stdout, or nothing if
+/// the window is dismissed. It exits 3 when no Qt toolkit is available so the caller can fall back.
+#[cfg(target_os = "linux")]
+const REMINDER_CHOOSER_PY: &str = r#"
+import sys, os
+choices = sys.argv[1:]
+def load_qt():
+    for mod in ("PyQt6", "PyQt5"):
+        try:
+            w = __import__(mod + ".QtWidgets", fromlist=["x"])
+            c = __import__(mod + ".QtCore", fromlist=["x"])
+            return (w.QApplication, w.QWidget, w.QVBoxLayout, w.QListWidget,
+                    w.QLabel, w.QInputDialog, c.QTimer)
+        except Exception:
+            continue
+    return None
+bundle = load_qt()
+if bundle is None:
+    sys.exit(3)
+QApplication, QWidget, QVBoxLayout, QListWidget, QLabel, QInputDialog, QTimer = bundle
+result = {"v": None}
+app = QApplication([])
+w = QWidget()
+w.setWindowTitle("ts")
+lay = QVBoxLayout(w)
+lay.addWidget(QLabel("What are you working on?"))
+lst = QListWidget()
+lst.addItems(choices)
+lay.addWidget(lst)
+def finish(val):
+    result["v"] = val
+    app.quit()
+def on_click(item):
+    text = item.text()
+    if text == "Enter new activity...":
+        activity, ok = QInputDialog.getText(w, "ts", "Enter activity:")
+        if ok and activity.strip():
+            finish(activity.strip())
+        else:
+            lst.clearSelection()
+        return
+    finish(text)
+lst.itemClicked.connect(on_click)
+w.resize(380, min(len(choices) * 28 + 90, 520))
+w.show()
+try:
+    w.raise_()
+    w.activateWindow()
+except Exception:
+    pass
+autopick = os.environ.get("TS_CHOOSER_AUTOPICK")
+if autopick is not None:
+    QTimer.singleShot(200, lambda: on_click(lst.item(int(autopick))))
+run = getattr(app, "exec", None) or getattr(app, "exec_")
+run()
+if result["v"] is not None:
+    sys.stdout.write(result["v"])
+    sys.stdout.flush()
+"#;
+
+/// Try the PyQt single-click chooser. Returns `None` if Python/PyQt is unavailable (so the caller
+/// falls back to the kdialog/zenity list dialog); otherwise returns the mapped ReminderResult.
+#[cfg(target_os = "linux")]
+fn show_reminder_prompt_pyqt(
+    choices: &[String],
+    reminder_appeared: DateTime<Local>,
+) -> Option<ReminderResult> {
+    if !command_on_path("python3") {
+        return None;
+    }
+    let mut cmd = Command::new("python3");
+    cmd.arg("-c").arg(REMINDER_CHOOSER_PY);
+    for c in choices {
+        cmd.arg(c);
+    }
+    linux_with_display(&mut cmd);
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    // Wait up to the prompt timeout, collecting both exit code and stdout.
+    let timeout = Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS);
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.code() == Some(3) {
+                    // No Qt toolkit available: let the caller fall back to kdialog/zenity.
+                    return None;
+                }
+                let mut out = Vec::new();
+                if let Some(mut s) = child.stdout.take() {
+                    let _ = io::copy(&mut s, &mut out);
+                }
+                let s = String::from_utf8_lossy(&out).trim().to_string();
+                return Some(match parse_native_reminder_dialog_output(&s) {
+                    // "Enter new activity..." is handled inside the script, so it never reaches here.
+                    Some(result) => result,
+                    None => ReminderResult::ShowAgainImmediate, // dismissed without a choice
+                });
+            }
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            return Some(ReminderResult::TimeoutAddStop(reminder_appeared));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Linux reminder prompt: present the activity chooser and map the choice to a ReminderResult.
+/// Prefers the PyQt single-click chooser (no OK/Cancel); falls back to a kdialog/zenity list dialog.
 #[cfg(target_os = "linux")]
 fn show_reminder_prompt_linux(activities: &[String], _timesheet: Option<&Path>) -> ReminderResult {
     let reminder_appeared = Local::now();
     let choices = reminder_choices(activities);
+
+    if let Some(result) = show_reminder_prompt_pyqt(&choices, reminder_appeared) {
+        return result;
+    }
 
     let backend = match detect_linux_dialog() {
         Some(b) => b,
