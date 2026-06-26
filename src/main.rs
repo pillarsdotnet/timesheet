@@ -23,6 +23,7 @@
 //! |------------|-------------|
 //! | `alias`    | Interactively replace activity text in this week's START entries (regex). |
 //! | `autostart` | Register `ts start` on login and `ts stop` on logout/shutdown (macOS/Linux). |
+//! | `edit`     | Open the timesheet log in `$EDITOR` (then `$VISUAL`, else `vi`). |
 //! | `help`     | Show the man page in a pager (groff -man -Tascii \| less). |
 //! | `install`  | Copy binary and icon to a directory on PATH (icon embedded on macOS). |
 //! | `interval` | Set or show reminder daemon interval (e.g. 3, 3m, 100s, 1h30m). |
@@ -1164,6 +1165,29 @@ fn cmd_tail(tail_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
 }
 
 /// Prints report: % per activity and hours per weekday; optional arg selects file (e.g. `log`, `0220`, `-1`, path).
+/// Opens the timesheet log in the user's editor (`$EDITOR`, falling back to `$VISUAL` then `vi`).
+fn cmd_edit(timesheet: &Path) -> Result<(), String> {
+    let editor = env::var_os("EDITOR")
+        .or_else(|| env::var_os("VISUAL"))
+        .unwrap_or_else(|| "vi".into());
+    if let Some(parent) = timesheet.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("ts edit: cannot create {}: {}", parent.display(), e))?;
+    }
+    let status = Command::new(&editor)
+        .arg(timesheet)
+        .status()
+        .map_err(|e| format!("ts edit: cannot run editor {:?}: {}", editor, e))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "ts edit: editor {:?} exited with {}",
+            editor, status
+        ))
+    }
+}
+
 fn cmd_list(list_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
     if env::var_os("TS_DEBUG").is_some() {
         let _ = std::io::stderr().write_all(b"ts: cmd_list entered\n");
@@ -2033,6 +2057,16 @@ selects the most recently rotated
 .BR timesheet.YYMMDD ,
 .B -2
 the one before that, and so on.
+.TP
+.B edit
+Open the timesheet log
+.RB ( $HOME/Documents/timesheet.log )
+in your editor, taken from
+.B $EDITOR
+(then
+.BR $VISUAL ,
+else
+.BR vi ).
 .TP
 .B sprint
 Plaintext report like
@@ -4002,6 +4036,7 @@ fn main() {
         Some("stop") => cmd_stop(&rest, &timesheet),
         Some("stopped") => cmd_stop(&rest, &timesheet),
         Some("list") => cmd_list(rest.first().map(String::as_str), &timesheet),
+        Some("edit") => cmd_edit(&timesheet),
         Some("sprint") => cmd_sprint(&timesheet),
         Some("tail") => cmd_tail(rest.first().map(String::as_str), &timesheet),
         Some("started") => cmd_started(&rest, &timesheet),
