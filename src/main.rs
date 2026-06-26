@@ -35,7 +35,7 @@
 //! | `rename`   | Same as `alias`. |
 //! | `restart`, `reminder` | Aliases for `interval`. |
 //! | `rotate`   | Rename log to `timesheet.YYMMDD`; add STOP first if last entry is START; append if same-day exists. |
-//! | `start`    | Record work start now; on macOS with no activity, shows reminder dialog to pick/enter; otherwise optional activity (default: misc/unspecified); starts/restarts reminder daemon. |
+//! | `start`    | Record work start now; with no activity, shows reminder dialog to pick/enter (macOS, or Linux with kdialog/zenity); otherwise optional activity (default: misc/unspecified); starts/restarts reminder daemon. |
 //! | `started`  | Record a past start time; inserts at the correct chronological position without discarding entries. |
 //! | `stop`     | Record work stop (optional time); amends previous STOP if work already stopped; stops reminder daemon and shows "stopped" dialog when a stop is recorded (skipped during logout/shutdown). |
 //! | `timeoff`  | Show stop time for 8 h/day average; only requires a START entry (adds one if log empty or last is STOP). |
@@ -204,7 +204,11 @@ fn reminder_activities_most_recent_first(timesheet: &Path) -> Vec<String> {
 }
 
 fn reminder_activities_most_recent_first_at(timesheet: &Path, now: DateTime<Local>) -> Vec<String> {
+    // Stored timestamps are floored to microsecond precision (see format_log_timestamp), so floor
+    // the cutoff to microseconds too; otherwise an entry written exactly at the 7-day boundary is
+    // dropped because its re-parsed value lands just below a nanosecond-precision cutoff.
     let cutoff = now - chrono::Duration::days(7);
+    let cutoff = cutoff - chrono::Duration::nanoseconds((cutoff.timestamp_subsec_nanos() % 1000) as i64);
     let mut by_activity: std::collections::HashMap<String, DateTime<Local>> =
         std::collections::HashMap::new();
 
@@ -767,7 +771,7 @@ fn sprint_report_data(timesheet: &Path) -> Result<(ParsedLogLines, CurrentTask),
     Ok((combined, current_task))
 }
 
-/// Records work start now; activity is optional. With no argument on macOS, shows the reminder dialog to pick/enter an activity.
+/// Records work start now; activity is optional. With no argument, shows the reminder dialog to pick/enter an activity (macOS, or Linux with kdialog/zenity).
 /// On other platforms or if the user declines, falls back to misc/unspecified.
 /// Ensures the reminder daemon is running at entry (so it stays running even when ts start is run at system startup and
 /// exits before the final start call), then restarts it after recording START to reset the timer.
@@ -805,28 +809,18 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
     // Start daemon early so it is running even when ts start is invoked at login (LaunchAgent) and exits quickly.
     start_reminder_daemon_if_needed(timesheet);
     let activity = if args.is_empty() {
-        #[cfg(all(target_os = "macos", not(test)))]
+        #[cfg(not(test))]
         {
-            let activities = reminder_activities_most_recent_first(timesheet);
-            loop {
-                match show_reminder_prompt(&activities, Some(timesheet)) {
-                    ReminderResult::Activity(a) => break a,
-                    ReminderResult::DontBugMe => {
-                        kill_reminder_daemon_if_running();
-                        return Ok(());
-                    }
-                    ReminderResult::ShowAgainImmediate => {} // re-show immediately
-                    ReminderResult::TimeoutAddStop(dt) => {
-                        let _ = append_stop_entry(timesheet, dt);
-                        // re-show immediately
-                    }
-                    ReminderResult::EnterNew => {
-                        unreachable!("show_reminder_prompt converts EnterNew to Activity")
-                    }
+            match resolve_start_activity(timesheet) {
+                Some(a) => a,
+                None => {
+                    // User chose "Stop Work" at the chooser.
+                    kill_reminder_daemon_if_running();
+                    return Ok(());
                 }
             }
         }
-        #[cfg(any(not(target_os = "macos"), test))]
+        #[cfg(test)]
         "misc/unspecified".to_string()
     } else {
         args.join(" ")
@@ -2054,9 +2048,9 @@ Errors if the log is missing or has no valid entries.
 .B start
 Record work start
 .IR now .
-On macOS with no
+With no
 .IR activity ,
-shows the reminder dialog to pick or enter an activity.
+shows the reminder dialog to pick or enter an activity (macOS, or Linux with kdialog/zenity installed).
 Otherwise optional
 .I activity
 (default: misc/unspecified). Appends a START line; does not modify existing entries.
@@ -2513,16 +2507,24 @@ fn do_autostart_uninstall_macos() -> Result<(), String> {
     Ok(())
 }
 
+/// Directory holding systemd user units ($XDG_CONFIG_HOME/systemd/user, defaulting to $HOME/.config/systemd/user).
+#[cfg(target_os = "linux")]
+fn linux_user_units_dir() -> Result<PathBuf, String> {
+    let config = match env::var_os("XDG_CONFIG_HOME") {
+        Some(c) => PathBuf::from(c),
+        None => {
+            let home = env::var_os("HOME").ok_or("ts autostart: HOME not set")?;
+            PathBuf::from(home).join(".config")
+        }
+    };
+    Ok(config.join("systemd/user"))
+}
+
 #[cfg(target_os = "linux")]
 fn do_autostart_install_linux() -> Result<(), String> {
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     let exe_path = exe.to_string_lossy();
-    let config = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env::var_os("HOME").ok_or("ts autostart: HOME not set")?).join(".config")
-        });
-    let user_units = config.join("systemd/user");
+    let user_units = linux_user_units_dir()?;
     fs::create_dir_all(&user_units).map_err(|e| {
         format!(
             "ts autostart: cannot create {}: {}",
@@ -2601,11 +2603,7 @@ WantedBy=default.target
 
 #[cfg(target_os = "linux")]
 fn do_autostart_uninstall_linux() -> Result<(), String> {
-    let home = env::var_os("HOME").ok_or("ts autostart: HOME not set")?;
-    let config = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(&home));
-    let user_units = config.join("systemd/user");
+    let user_units = linux_user_units_dir()?;
     let start_path = user_units.join("ts-autostart-start.service");
     let session_path = user_units.join("ts-autostart-session.service");
 
@@ -3024,16 +3022,237 @@ fn parse_native_reminder_dialog_output(output: &str) -> Option<ReminderResult> {
     Some(ReminderResult::Activity(output.to_string()))
 }
 
-/// Show "What are you working on?" prompt; returns user choice or timeout. Platform-specific (macOS: osascript).
+/// Show "What are you working on?" prompt; returns user choice or timeout.
+/// Platform-specific (macOS: AppKit/osascript; Linux: kdialog or zenity).
 /// timesheet: used when appending STOP on timeout (reminder daemon / ts start).
 fn show_reminder_prompt(activities: &[String], timesheet: Option<&Path>) -> ReminderResult {
     #[cfg(target_os = "macos")]
     return show_reminder_prompt_macos(activities, timesheet);
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    return show_reminder_prompt_linux(activities, timesheet);
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (activities, timesheet);
         ReminderResult::TimeoutAddStop(Local::now())
+    }
+}
+
+/// Resolve the activity for `ts start` when none was given on the command line.
+/// Returns `Some(activity)` to start, or `None` if the user chose "Stop Work" (caller should abort the start).
+/// On platforms (or headless setups) without a GUI chooser, returns the default activity without prompting.
+#[cfg(not(test))]
+fn resolve_start_activity(timesheet: &Path) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    let can_prompt = true;
+    #[cfg(target_os = "linux")]
+    let can_prompt = detect_linux_dialog().is_some();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let can_prompt = false;
+
+    if !can_prompt {
+        return Some("misc/unspecified".to_string());
+    }
+
+    let activities = reminder_activities_most_recent_first(timesheet);
+    loop {
+        match show_reminder_prompt(&activities, Some(timesheet)) {
+            ReminderResult::Activity(a) => return Some(a),
+            ReminderResult::DontBugMe => return None,
+            ReminderResult::ShowAgainImmediate => {
+                // Debounce on Linux: if the GUI helper exits instantly (e.g. the display is not
+                // reachable yet at login) this avoids a tight CPU-spinning re-show loop.
+                #[cfg(target_os = "linux")]
+                thread::sleep(Duration::from_millis(500));
+            }
+            ReminderResult::TimeoutAddStop(dt) => {
+                let _ = append_stop_entry(timesheet, dt);
+                // re-show immediately
+            }
+            ReminderResult::EnterNew => {
+                unreachable!("show_reminder_prompt converts EnterNew to Activity")
+            }
+        }
+    }
+}
+
+/// Build the `Stop Work` / activities / `Enter new activity...` choice list shown in the reminder dialog.
+#[cfg(target_os = "linux")]
+fn reminder_choices(activities: &[String]) -> Vec<String> {
+    let mut choices = vec!["Stop Work".to_string()];
+    for a in activities.iter().rev() {
+        if !a.is_empty() && !choices.contains(a) {
+            choices.push(a.clone());
+        }
+    }
+    choices.push("Enter new activity...".to_string());
+    choices
+}
+
+/// Which GUI dialog helper to drive on Linux. kdialog is native to KDE/Plasma; zenity covers GNOME/other.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum LinuxDialog {
+    KDialog,
+    Zenity,
+}
+
+/// True if `name` is an executable found on `$PATH`.
+#[cfg(target_os = "linux")]
+fn command_on_path(name: &str) -> bool {
+    let path = match env::var_os("PATH") {
+        Some(p) => p,
+        None => return false,
+    };
+    env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(name);
+        candidate.is_file()
+            && std::fs::metadata(&candidate)
+                .map(|m| {
+                    use std::os::unix::fs::PermissionsExt;
+                    m.permissions().mode() & 0o111 != 0
+                })
+                .unwrap_or(false)
+    })
+}
+
+/// Pick a dialog backend, preferring the one native to the running desktop, then whichever is installed.
+#[cfg(target_os = "linux")]
+fn detect_linux_dialog() -> Option<LinuxDialog> {
+    let has_kdialog = command_on_path("kdialog");
+    let has_zenity = command_on_path("zenity");
+    let desktop = env::var_os("XDG_CURRENT_DESKTOP")
+        .map(|d| d.to_string_lossy().to_uppercase())
+        .unwrap_or_default();
+    let prefer_kde = desktop.contains("KDE") || desktop.contains("PLASMA");
+    if prefer_kde && has_kdialog {
+        return Some(LinuxDialog::KDialog);
+    }
+    if !prefer_kde && has_zenity {
+        return Some(LinuxDialog::Zenity);
+    }
+    if has_kdialog {
+        return Some(LinuxDialog::KDialog);
+    }
+    if has_zenity {
+        return Some(LinuxDialog::Zenity);
+    }
+    None
+}
+
+/// Ensure a GUI display is reachable. When launched from a systemd user service the graphical
+/// session variables may be missing; fall back to the common X11 display so dialogs still appear.
+#[cfg(target_os = "linux")]
+fn linux_with_display(cmd: &mut Command) {
+    if env::var_os("WAYLAND_DISPLAY").is_none() && env::var_os("DISPLAY").is_none() {
+        cmd.env("DISPLAY", ":0");
+    }
+}
+
+/// Show a text-entry dialog for "Enter new activity..."; returns the typed activity or None.
+#[cfg(target_os = "linux")]
+fn prompt_enter_activity_linux(backend: LinuxDialog) -> Option<String> {
+    let mut cmd = Command::new(match backend {
+        LinuxDialog::KDialog => "kdialog",
+        LinuxDialog::Zenity => "zenity",
+    });
+    match backend {
+        LinuxDialog::KDialog => {
+            cmd.args(["--title", "ts", "--inputbox", "Enter activity:"]);
+        }
+        LinuxDialog::Zenity => {
+            cmd.args(["--entry", "--title=ts", "--text=Enter activity:"]);
+        }
+    }
+    linux_with_display(&mut cmd);
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let out = wait_no_timeout(child)?;
+    let activity = String::from_utf8_lossy(&out).trim().to_string();
+    if activity.is_empty() {
+        None
+    } else {
+        Some(activity)
+    }
+}
+
+/// Linux reminder prompt: present the activity chooser via kdialog/zenity and map the choice to a ReminderResult.
+#[cfg(target_os = "linux")]
+fn show_reminder_prompt_linux(activities: &[String], _timesheet: Option<&Path>) -> ReminderResult {
+    let reminder_appeared = Local::now();
+    let choices = reminder_choices(activities);
+
+    let backend = match detect_linux_dialog() {
+        Some(b) => b,
+        None => {
+            // No GUI dialog helper installed: behave like a timed-out reminder (records STOP, re-shows later).
+            ts_debug("reminder: no kdialog/zenity found; install one for interactive reminders");
+            return ReminderResult::TimeoutAddStop(reminder_appeared);
+        }
+    };
+
+    let mut cmd = Command::new(match backend {
+        LinuxDialog::KDialog => "kdialog",
+        LinuxDialog::Zenity => "zenity",
+    });
+    match backend {
+        LinuxDialog::KDialog => {
+            cmd.args(["--title", "ts", "--menu", "What are you working on?"]);
+            // kdialog --menu takes (tag, label) pairs; selected tag is printed to stdout.
+            for c in &choices {
+                cmd.arg(c).arg(c);
+            }
+        }
+        LinuxDialog::Zenity => {
+            cmd.args([
+                "--list",
+                "--title=ts",
+                "--text=What are you working on?",
+                "--hide-header",
+                "--column=Activity",
+            ]);
+            for c in &choices {
+                cmd.arg(c);
+            }
+        }
+    }
+    linux_with_display(&mut cmd);
+
+    let child = match cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return ReminderResult::TimeoutAddStop(reminder_appeared),
+    };
+
+    let timeout = Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS);
+    match wait_with_timeout(child, timeout, true) {
+        WaitOutcome::Finished(Some(stdout)) => {
+            let s = String::from_utf8_lossy(&stdout).trim().to_string();
+            match parse_native_reminder_dialog_output(&s) {
+                Some(ReminderResult::EnterNew) => {
+                    if let Some(activity) = prompt_enter_activity_linux(backend) {
+                        ReminderResult::Activity(activity)
+                    } else {
+                        ReminderResult::ShowAgainImmediate
+                    }
+                }
+                Some(result) => result,
+                // Cancelled or dismissed without a choice: re-show immediately.
+                None => ReminderResult::ShowAgainImmediate,
+            }
+        }
+        WaitOutcome::Finished(None) => ReminderResult::TimeoutAddStop(reminder_appeared),
+        WaitOutcome::TimedOut => ReminderResult::TimeoutAddStop(reminder_appeared),
+        WaitOutcome::TimedOutWithChild(_) => ReminderResult::TimeoutAddStop(reminder_appeared),
     }
 }
 
@@ -3412,6 +3631,7 @@ fn show_reminder_prompt_macos_systemui(
     ReminderResult::TimeoutAddStop(reminder_appeared)
 }
 
+#[cfg(target_os = "macos")]
 fn escape_applescript_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -3422,6 +3642,8 @@ enum WaitOutcome {
     Finished(Option<Vec<u8>>),
     TimedOut,
     /// Child still running (not killed); caller can bring window to front and call wait_with_timeout again.
+    /// The held child is only inspected on macOS (to re-front the dialog); other platforms kill on timeout.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     TimedOutWithChild(process::Child),
 }
 
