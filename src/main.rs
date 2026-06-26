@@ -2747,11 +2747,14 @@ fn show_reminders_stopped_notification() {
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = Command::new("notify-send")
-            .args([
-                "--app-name=Timesheet",
-                "Timesheet reminders have been stopped.",
-            ])
+        let mut cmd = Command::new("notify-send");
+        cmd.args([
+            "--app-name=Timesheet",
+            "Timesheet reminders have been stopped.",
+        ]);
+        // notify-send talks to the session bus, which may be missing when launched from systemd.
+        linux_with_display(&mut cmd);
+        let _ = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -3201,12 +3204,64 @@ fn detect_linux_dialog() -> Option<LinuxDialog> {
     None
 }
 
-/// Ensure a GUI display is reachable. When launched from a systemd user service the graphical
-/// session variables may be missing; fall back to the common X11 display so dialogs still appear.
+/// Prepare the GUI session environment for a dialog command, preferring native Wayland (KDE Plasma)
+/// with an X11/XWayland fallback.
+///
+/// Two problems are handled:
+///   1. Launched from a systemd user unit, the graphical-session variables (XDG_RUNTIME_DIR,
+///      WAYLAND_DISPLAY, DBUS_SESSION_BUS_ADDRESS) may be missing. We derive XDG_RUNTIME_DIR from
+///      the uid and probe its directory for a `wayland-N` socket so the dialog still connects.
+///   2. Even in an interactive Wayland session, Qt apps like kdialog default to the xcb (XWayland)
+///      backend when DISPLAY is set and QT_QPA_PLATFORM is unset, so they render as X11 windows.
+///      Setting QT_QPA_PLATFORM=wayland;xcb makes kdialog use Wayland natively when available and
+///      fall back to X11 otherwise. (GTK apps like zenity already pick Wayland on their own.)
+///
+/// Existing values are never overridden, so an explicit user/session configuration wins.
 #[cfg(target_os = "linux")]
 fn linux_with_display(cmd: &mut Command) {
-    if env::var_os("WAYLAND_DISPLAY").is_none() && env::var_os("DISPLAY").is_none() {
+    // Where the Wayland and D-Bus sockets live.
+    let runtime_dir = match env::var_os("XDG_RUNTIME_DIR") {
+        Some(d) => PathBuf::from(d),
+        None => {
+            let uid = unsafe { libc::getuid() };
+            let d = PathBuf::from(format!("/run/user/{}", uid));
+            cmd.env("XDG_RUNTIME_DIR", &d);
+            d
+        }
+    };
+
+    // Determine the Wayland display: use the inherited one, else probe the runtime dir.
+    let wayland_display = env::var_os("WAYLAND_DISPLAY").map(|s| s.to_string_lossy().into_owned());
+    let wayland_display = wayland_display.or_else(|| {
+        (0..4)
+            .map(|n| format!("wayland-{}", n))
+            .find(|name| runtime_dir.join(name).exists())
+            .inspect(|name| {
+                cmd.env("WAYLAND_DISPLAY", name);
+            })
+    });
+
+    let have_x11 = env::var_os("DISPLAY").is_some();
+
+    if wayland_display.is_some() {
+        // Prefer native Wayland, fall back to X11 if the Qt Wayland plugin is unavailable.
+        if env::var_os("QT_QPA_PLATFORM").is_none() {
+            cmd.env("QT_QPA_PLATFORM", "wayland;xcb");
+        }
+    } else if !have_x11 {
+        // No Wayland socket and no X11: last-resort default for Xorg/XWayland.
         cmd.env("DISPLAY", ":0");
+    }
+
+    // kdialog/zenity and notify-send need the user session bus.
+    if env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+        let bus = runtime_dir.join("bus");
+        if bus.exists() {
+            cmd.env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", bus.display()),
+            );
+        }
     }
 }
 
