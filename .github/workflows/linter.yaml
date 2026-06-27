@@ -27,13 +27,11 @@ jobs:
         run: python -m pip install --upgrade pre-commit
 
       # The cargo fmt / clippy / test hooks run the system toolchain, so install
-      # Rust with the rustfmt and clippy components. Pin the version the project
-      # is developed against (Ubuntu's current `rustc`) so a newer clippy cannot
-      # newly fail CI on unchanged code; bump this when moving to a newer Rust.
+      # Rust (stable) with the rustfmt and clippy components. Tracking stable
+      # means a newer clippy may introduce new lints; fix them as they appear.
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.93"
           components: rustfmt, clippy
 
       - name: Cache cargo build artifacts
