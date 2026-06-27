@@ -108,6 +108,8 @@ cargo build --release
 
 The binary is produced at `target/release/ts` (or `target/debug/ts` for `cargo build`). See [INSTALL.md](INSTALL.md) for full instructions.
 
+To set up the full toolchain (Rust components, git hooks) and run the checks, see [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ### Commit messages
 
 The CI lint workflow checks commit messages with [commitlint](https://commitlint.js.org/) (Conventional Commits). Use a leading type and optional scope, e.g. `feat(macos): add dock icon` or `fix: record STOP on shutdown`. See `.commitlintrc.yaml` and [Conventional Commits](https://www.conventionalcommits.org/).
