@@ -106,12 +106,15 @@ fn format_stop_log_entry(dt: DateTime<Local>) -> String {
     format!("{}|STOP", format_log_timestamp(dt))
 }
 
-/// Caps automatic STOP timestamps so they do not land more than five minutes after the latest log entry.
+/// Caps automatic STOP timestamps so they do not land more than one reminder interval after the
+/// latest log entry. The interval is how often you are prompted (default 5 minutes), so a session
+/// you forgot to stop is recorded as ending at most one interval after your last logged activity.
 fn clamp_auto_stop_time(timesheet: &Path, requested_dt: DateTime<Local>) -> DateTime<Local> {
     let Some(last_dt) = last_line_dt(timesheet) else {
         return requested_dt;
     };
-    std::cmp::min(requested_dt, last_dt + chrono::Duration::minutes(5))
+    let cap = chrono::Duration::seconds(get_reminder_interval_secs() as i64);
+    std::cmp::min(requested_dt, last_dt + cap)
 }
 
 fn append_log_entry(timesheet: &Path, entry: &str) -> Result<(), String> {
@@ -295,7 +298,7 @@ fn append_start_entry(timesheet: &Path, activity: &str) -> Result<(), String> {
     append_log_entry(timesheet, &format_start_log_entry(now, activity))
 }
 
-/// Append an automatic STOP log entry, capped to no more than five minutes after the latest log entry.
+/// Append an automatic STOP log entry, capped to no more than one reminder interval after the latest log entry.
 fn append_stop_entry(timesheet: &Path, dt: DateTime<Local>) -> Result<(), String> {
     let dt = clamp_auto_stop_time(timesheet, dt);
     maybe_rotate_if_previous_week(timesheet)?;
@@ -376,9 +379,9 @@ fn last_recorded_event(content: &str) -> Option<LogLine> {
     content.lines().rev().find_map(parse_line)
 }
 
-/// If the last log entry is an open START, append a STOP (capped to no more than 5 minutes after the
-/// latest entry) to close the session, and return `true`. No-op returning `false` if work is already
-/// stopped or the log is empty/unreadable.
+/// If the last log entry is an open START, append a STOP (capped to no more than one reminder
+/// interval after the latest entry) to close the session, and return `true`. No-op returning `false`
+/// if work is already stopped or the log is empty/unreadable.
 fn close_open_session(timesheet: &Path, now: DateTime<Local>) -> bool {
     let content = fs::read_to_string(timesheet).unwrap_or_default();
     let open = last_recorded_event(&content)
@@ -388,6 +391,23 @@ fn close_open_session(timesheet: &Path, now: DateTime<Local>) -> bool {
         let _ = append_stop_entry(timesheet, now);
     }
     open
+}
+
+/// Reconcile a session left open by a missed shutdown/logout STOP: if the last log entry is a START
+/// older than five minutes, close it with a STOP capped to one reminder interval after that entry
+/// (via clamp_auto_stop_time) so a shutdown without `ts stop` never records work all night. A recent
+/// open session is left untouched so we never close one the user is actively working on. Returns
+/// whether a STOP was written.
+fn reconcile_stale_open_session(timesheet: &Path, now: DateTime<Local>) -> bool {
+    let content = fs::read_to_string(timesheet).unwrap_or_default();
+    if let Some(LogLine::Start(dt, _)) = last_recorded_event(&content) {
+        if now.signed_duration_since(dt) > chrono::Duration::minutes(5) {
+            let stop_dt = clamp_auto_stop_time(timesheet, now);
+            let _ = append_log_entry(timesheet, &format_stop_log_entry(stop_dt));
+            return true;
+        }
+    }
+    false
 }
 
 fn last_start_entry(lines: &[(usize, LogLine)]) -> CurrentTask {
@@ -448,7 +468,7 @@ fn date_range_in_log(path: &Path) -> Option<(NaiveDate, NaiveDate)> {
 
 /// Rotates the log: renames it to `timesheet.YYMMDD` using the earliest entry's date.
 /// If that file already exists (same day), appends the current log to it and removes the source.
-/// If the last entry is START (work in progress), appends a STOP no later than five minutes after that entry before rotating.
+/// If the last entry is START (work in progress), appends a STOP no later than one reminder interval after that entry before rotating.
 fn do_rotate(timesheet: &Path) -> Result<(), String> {
     if !timesheet.exists() {
         return Err("ts rotate: no timesheet data found.".to_string());
@@ -841,28 +861,22 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
     if args.is_empty() {
         let startup_now = Local::now();
         let content = fs::read_to_string(timesheet).unwrap_or_default();
-        match last_recorded_event(&content) {
-            Some(LogLine::Stop(dt)) => {
-                let age = startup_now.signed_duration_since(dt).num_seconds();
-                if (0..60).contains(&age) {
-                    if env::var_os("TS_DEBUG").is_some() {
-                        let _ = std::io::stderr().write_all(
-                            b"ts: skipping start: last STOP was <60s ago (shutdown/reload guard)\n",
-                        );
-                    }
-                    return Ok(());
+        if let Some(LogLine::Stop(dt)) = last_recorded_event(&content) {
+            // Shutdown/reload guard: a very recent STOP means launchd/systemd is re-firing during
+            // shutdown, not a genuine login -- skip.
+            let age = startup_now.signed_duration_since(dt).num_seconds();
+            if (0..60).contains(&age) {
+                if env::var_os("TS_DEBUG").is_some() {
+                    let _ = std::io::stderr().write_all(
+                        b"ts: skipping start: last STOP was <60s ago (shutdown/reload guard)\n",
+                    );
                 }
+                return Ok(());
             }
-            // Reconcile a missed shutdown STOP before any weekly rotation or recent-STOP guard
-            // could hide the stale open session.
-            Some(LogLine::Start(dt, _))
-                if startup_now.signed_duration_since(dt) > chrono::Duration::minutes(5) =>
-            {
-                let stop_dt = clamp_auto_stop_time(timesheet, startup_now);
-                append_log_entry(timesheet, &format_stop_log_entry(stop_dt))?;
-            }
-            _ => {}
         }
+        // Reconcile a missed shutdown STOP before any weekly rotation or recent-STOP guard could
+        // hide the stale open session.
+        reconcile_stale_open_session(timesheet, startup_now);
     }
     maybe_rotate_if_previous_week(timesheet)?;
     // Will we block on an interactive chooser below (no activity given and a GUI chooser is available)?
@@ -1979,7 +1993,7 @@ Runs
 .B "ts start"
 at login (RunAtLoad, limited to Aqua sessions).
 A shutdown guard skips the start if the last log entry is a STOP less than 60\ s old.
-If the last recorded event is not STOP and is more than 5 minutes old, startup backfills a STOP 5 minutes after that event before recording the new START.
+If the last recorded event is not STOP and is more than 5 minutes old, startup backfills a STOP one reminder interval after that event before recording the new START.
 .TP
 \fBcom.ts.autostart.session\fR
 Runs
@@ -2044,7 +2058,7 @@ and
 .B reminder
 are aliases for
 .BR interval .
-Reminder daemon behavior: on timeout (no click), records STOP at reminder-appeared time, capped to no more than 5 minutes after the latest log entry, and brings the existing reminder window to the front of the window stack (does not launch a new prompt). Dismissed without choice (close, Escape) re-shows immediately. The "Enter new activity" dialog has no timeout; blank/cancelled re-shows the reminder. At logout/shutdown the open session is stopped: on macOS the daemon itself records STOP when launchd sends it SIGTERM (capped to 5 minutes after the latest entry); on Linux the systemd session unit's ExecStop runs "ts stop" instead, and the daemon stays silent on SIGTERM (systemd may signal it during ordinary teardown, so writing a STOP there would be spurious).
+Reminder daemon behavior: on timeout (no click), records STOP at reminder-appeared time, capped to no more than one reminder interval after the latest log entry, and brings the existing reminder window to the front of the window stack (does not launch a new prompt). Dismissed without choice (close, Escape) re-shows immediately. The "Enter new activity" dialog has no timeout; blank/cancelled re-shows the reminder. At logout/shutdown the open session is stopped: on macOS the daemon itself records STOP when launchd sends it SIGTERM (capped to one reminder interval after the latest entry); on Linux the systemd session unit's ExecStop runs "ts stop" instead, and the daemon stays silent on SIGTERM (systemd may signal it during ordinary teardown, so writing a STOP there would be spurious). Any automatic STOP is capped to one reminder interval (default 5 minutes) after the latest entry, so forgetting to stop never records work all night.
 .TP
 .B list
 Plaintext report: percentage of time per activity (high to low), and hours per day of week (Sun\-Sat).
@@ -2136,7 +2150,7 @@ Alias for
 .BR interval .
 .TP
 .B rotate
-If the last entry is START (work in progress), appends a STOP no later than 5 minutes after that entry first.
+If the last entry is START (work in progress), appends a STOP no later than one reminder interval after that entry first.
 Rename the timesheet log to
 .B timesheet.YYMMDD
 using the timestamp of the log's earliest entry (START or STOP).
@@ -2304,6 +2318,9 @@ fn cmd_help() -> Result<(), String> {
 fn cmd_autostart(args: &[String]) -> Result<(), String> {
     let uninstall = args.first().map(String::as_str) == Some("uninstall");
     if !uninstall {
+        // Like `ts start`, close a session left open by a previous day's missed shutdown STOP
+        // (capped to one reminder interval) so autostart never leaves an all-night session dangling.
+        reconcile_stale_open_session(&timesheet_path(), Local::now());
         let interval_set = if let Some(interval_arg) = args.first() {
             if let Ok(secs) = parse_interval_duration(interval_arg) {
                 let path = reminder_interval_path();
@@ -4285,7 +4302,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append_stop_entry_caps_to_five_minutes_after_latest_log_entry() {
+    fn test_append_stop_entry_caps_to_reminder_interval_after_latest_log_entry() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("timesheet.log");
         let start_dt = Local::now() - chrono::Duration::hours(2);
@@ -4302,10 +4319,9 @@ mod tests {
         let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], format_start_log_entry(start_dt, "coding"));
-        assert_eq!(
-            lines[1],
-            format_stop_log_entry(start_dt + chrono::Duration::minutes(5))
-        );
+        // The auto STOP is capped to one reminder interval after the open START (default 5 min).
+        let cap = chrono::Duration::seconds(get_reminder_interval_secs() as i64);
+        assert_eq!(lines[1], format_stop_log_entry(start_dt + cap));
     }
 
     #[test]
@@ -4374,7 +4390,7 @@ mod tests {
     }
 
     #[test]
-    fn test_do_rotate_caps_auto_stop_to_five_minutes_after_open_start() {
+    fn test_do_rotate_caps_auto_stop_to_reminder_interval_after_open_start() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("timesheet.log");
         let start_dt = Local::now() - chrono::Duration::hours(2);
@@ -4387,7 +4403,7 @@ mod tests {
         let result = do_rotate(&log_path);
 
         assert!(result.is_ok());
-        let stop_dt = start_dt + chrono::Duration::minutes(5);
+        let stop_dt = start_dt + chrono::Duration::seconds(get_reminder_interval_secs() as i64);
         let stamp = stop_dt.format("%y%m%d").to_string();
         let rotated = dir.path().join(format!("timesheet.{}", stamp));
         let content = fs::read_to_string(&rotated).unwrap();
@@ -4812,7 +4828,7 @@ mod tests {
     fn test_cmd_start_backfills_stale_open_session_before_new_start() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("timesheet.log");
-        let stale_start = Local::now() - chrono::Duration::minutes(6);
+        let stale_start = Local::now() - chrono::Duration::hours(2);
         fs::write(
             &log_path,
             format!("{}\n", format_start_log_entry(stale_start, "coding")),
@@ -4830,10 +4846,9 @@ mod tests {
             "expected stale START, backfilled STOP, new START"
         );
         assert_eq!(lines[0], format_start_log_entry(stale_start, "coding"));
-        assert_eq!(
-            lines[1],
-            format_stop_log_entry(stale_start + chrono::Duration::minutes(5))
-        );
+        // Backfilled STOP is capped to one reminder interval after the stale START (default 5 min).
+        let cap = chrono::Duration::seconds(get_reminder_interval_secs() as i64);
+        assert_eq!(lines[1], format_stop_log_entry(stale_start + cap));
         match parse_line(lines[2]) {
             Some(LogLine::Start(_, activity)) => assert_eq!(activity, "misc/unspecified"),
             other => panic!("expected new START entry, got {:?}", other),
@@ -4858,10 +4873,9 @@ mod tests {
         let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 3, "expected START, auto STOP, new START");
         assert_eq!(lines[0], format_start_log_entry(stale_start, "coding"));
-        assert_eq!(
-            lines[1],
-            format_stop_log_entry(stale_start + chrono::Duration::minutes(5))
-        );
+        // Auto STOP is capped to one reminder interval after the open START (default 5 min).
+        let cap = chrono::Duration::seconds(get_reminder_interval_secs() as i64);
+        assert_eq!(lines[1], format_stop_log_entry(stale_start + cap));
         match parse_line(lines[2]) {
             Some(LogLine::Start(_, activity)) => assert_eq!(activity, "next task"),
             other => panic!("expected new START entry, got {:?}", other),
@@ -5096,6 +5110,44 @@ mod tests {
         fs::write(&log_path, &original).unwrap();
 
         let wrote = close_open_session(&log_path, Local::now());
+
+        assert!(!wrote);
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), original);
+    }
+
+    #[test]
+    fn test_reconcile_stale_open_session_caps_old_open_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        let start = Local::now() - chrono::Duration::hours(8);
+        fs::write(
+            &log_path,
+            format!("{}|START|task\n", format_log_timestamp(start)),
+        )
+        .unwrap();
+
+        let wrote = reconcile_stale_open_session(&log_path, Local::now());
+
+        assert!(wrote);
+        let content = fs::read_to_string(&log_path).unwrap();
+        // STOP is capped to one reminder interval after the open START, not "now" (no all-nighter).
+        let cap = chrono::Duration::seconds(get_reminder_interval_secs() as i64);
+        let expected_stop = format_stop_log_entry(start + cap);
+        assert!(content.contains(&format!("{}\n", expected_stop)));
+    }
+
+    #[test]
+    fn test_reconcile_stale_open_session_leaves_recent_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        // Open START only 1 minute ago: the user is actively working; do not close it.
+        let original = format!(
+            "{}|START|task\n",
+            format_log_timestamp(Local::now() - chrono::Duration::minutes(1))
+        );
+        fs::write(&log_path, &original).unwrap();
+
+        let wrote = reconcile_stale_open_session(&log_path, Local::now());
 
         assert!(!wrote);
         assert_eq!(fs::read_to_string(&log_path).unwrap(), original);
