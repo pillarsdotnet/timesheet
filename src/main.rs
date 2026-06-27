@@ -376,6 +376,20 @@ fn last_recorded_event(content: &str) -> Option<LogLine> {
     content.lines().rev().find_map(parse_line)
 }
 
+/// If the last log entry is an open START, append a STOP (capped to no more than 5 minutes after the
+/// latest entry) to close the session, and return `true`. No-op returning `false` if work is already
+/// stopped or the log is empty/unreadable.
+fn close_open_session(timesheet: &Path, now: DateTime<Local>) -> bool {
+    let content = fs::read_to_string(timesheet).unwrap_or_default();
+    let open = last_recorded_event(&content)
+        .map(|ll| matches!(ll, LogLine::Start(_, _)))
+        .unwrap_or(false);
+    if open {
+        let _ = append_stop_entry(timesheet, now);
+    }
+    open
+}
+
 fn last_start_entry(lines: &[(usize, LogLine)]) -> CurrentTask {
     lines.iter().rev().find_map(|(_, line)| match line {
         LogLine::Start(dt, activity) => Some((*dt, activity.clone())),
@@ -872,7 +886,8 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
             match resolve_start_activity(timesheet) {
                 Some(a) => a,
                 None => {
-                    // User chose "Stop Work" at the chooser.
+                    // User chose "Stop Work" at the chooser: close the open session and stop reminders.
+                    close_open_session(timesheet, Local::now());
                     kill_reminder_daemon_if_running();
                     return Ok(());
                 }
@@ -885,16 +900,7 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
     };
     let now = Local::now();
     // Close any open session before starting a new one.
-    {
-        let content = fs::read_to_string(timesheet).unwrap_or_default();
-        if last_recorded_event(&content)
-            .map(|ll| matches!(ll, LogLine::Start(_, _)))
-            .unwrap_or(false)
-        {
-            let stop_dt = clamp_auto_stop_time(timesheet, now);
-            let _ = append_log_entry(timesheet, &format_stop_log_entry(stop_dt));
-        }
-    }
+    close_open_session(timesheet, now);
     append_log_entry(timesheet, &format_start_log_entry(now, &activity))?;
     println!(
         "Started: {} at {}",
@@ -3089,6 +3095,8 @@ fn run_reminder_daemon(timesheet: &Path) {
         let activities = reminder_activities_most_recent_first(timesheet);
         match show_reminder_prompt(&activities, Some(timesheet)) {
             ReminderResult::DontBugMe => {
+                // "Stop Work": close the open session (record a STOP) before stopping reminders.
+                close_open_session(timesheet, Local::now());
                 show_reminders_stopped_notification();
                 break;
             }
@@ -5051,6 +5059,46 @@ mod tests {
         assert!(content.contains(&format!("{}\n", format_stop_log_entry(stop_dt))));
         // The START gained microsecond precision (it had none in the input).
         assert!(content.contains(".000000"));
+    }
+
+    #[test]
+    fn test_close_open_session_records_stop_when_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        fs::write(
+            &log_path,
+            format!(
+                "{}|START|task\n",
+                format_log_timestamp(Local::now() - chrono::Duration::minutes(1))
+            ),
+        )
+        .unwrap();
+
+        let wrote = close_open_session(&log_path, Local::now());
+
+        assert!(wrote);
+        let content = fs::read_to_string(&log_path).unwrap();
+        assert!(matches!(
+            last_recorded_event(&content),
+            Some(LogLine::Stop(_))
+        ));
+    }
+
+    #[test]
+    fn test_close_open_session_noop_when_already_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        let original = format!(
+            "{}|START|task\n{}|STOP\n",
+            format_log_timestamp(Local::now() - chrono::Duration::minutes(2)),
+            format_log_timestamp(Local::now() - chrono::Duration::minutes(1))
+        );
+        fs::write(&log_path, &original).unwrap();
+
+        let wrote = close_open_session(&log_path, Local::now());
+
+        assert!(!wrote);
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), original);
     }
 
     #[test]
