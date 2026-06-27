@@ -162,18 +162,15 @@ fn claim_reminder_daemon_ownership(pid_path: &Path) -> bool {
             }
             Err(ref e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 // A pid file exists; keep it only if it names a live process other than us.
-                match fs::read_to_string(pid_path) {
-                    Ok(data) => {
-                        if let Ok(pid) = data.trim().parse::<u32>() {
-                            if pid != my_pid && is_pid_running(pid) {
-                                return false;
-                            }
+                // If the file vanished between the failed create and this read, just retry.
+                if let Ok(data) = fs::read_to_string(pid_path) {
+                    if let Ok(pid) = data.trim().parse::<u32>() {
+                        if pid != my_pid && is_pid_running(pid) {
+                            return false;
                         }
-                        // Stale or unparsable owner: remove and retry the exclusive create.
-                        let _ = fs::remove_file(pid_path);
                     }
-                    // The file vanished between the failed create and this read: retry.
-                    Err(_) => {}
+                    // Stale or unparsable owner: remove and retry the exclusive create.
+                    let _ = fs::remove_file(pid_path);
                 }
             }
             Err(_) => return false,
@@ -257,7 +254,8 @@ fn reminder_activities_most_recent_first_at(timesheet: &Path, now: DateTime<Loca
     // the cutoff to microseconds too; otherwise an entry written exactly at the 7-day boundary is
     // dropped because its re-parsed value lands just below a nanosecond-precision cutoff.
     let cutoff = now - chrono::Duration::days(7);
-    let cutoff = cutoff - chrono::Duration::nanoseconds((cutoff.timestamp_subsec_nanos() % 1000) as i64);
+    let cutoff =
+        cutoff - chrono::Duration::nanoseconds((cutoff.timestamp_subsec_nanos() % 1000) as i64);
     let mut by_activity: std::collections::HashMap<String, DateTime<Local>> =
         std::collections::HashMap::new();
 
@@ -3249,9 +3247,11 @@ fn detect_linux_dialog() -> Option<LinuxDialog> {
     let desktop = env::var_os("XDG_CURRENT_DESKTOP")
         .map(|d| d.to_string_lossy().to_uppercase())
         .unwrap_or_default();
-    let gtk_desktop = ["GNOME", "XFCE", "CINNAMON", "MATE", "UNITY", "LXDE", "PANTHEON"]
-        .iter()
-        .any(|d| desktop.contains(d));
+    let gtk_desktop = [
+        "GNOME", "XFCE", "CINNAMON", "MATE", "UNITY", "LXDE", "PANTHEON",
+    ]
+    .iter()
+    .any(|d| desktop.contains(d));
     if gtk_desktop && has_zenity {
         return Some(LinuxDialog::Zenity);
     }
