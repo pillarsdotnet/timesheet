@@ -2038,7 +2038,7 @@ and
 .B reminder
 are aliases for
 .BR interval .
-Reminder daemon behavior: on timeout (no click), records STOP at reminder-appeared time, capped to no more than 5 minutes after the latest log entry, and brings the existing reminder window to the front of the window stack (does not launch a new prompt). Dismissed without choice (close, Escape) re-shows immediately. The "Enter new activity" dialog has no timeout; blank/cancelled re-shows the reminder. On system shutdown (SIGTERM), records STOP with the same 5-minute cap and exits.
+Reminder daemon behavior: on timeout (no click), records STOP at reminder-appeared time, capped to no more than 5 minutes after the latest log entry, and brings the existing reminder window to the front of the window stack (does not launch a new prompt). Dismissed without choice (close, Escape) re-shows immediately. The "Enter new activity" dialog has no timeout; blank/cancelled re-shows the reminder. At logout/shutdown the open session is stopped: on macOS the daemon itself records STOP when launchd sends it SIGTERM (capped to 5 minutes after the latest entry); on Linux the systemd session unit's ExecStop runs "ts stop" instead, and the daemon stays silent on SIGTERM (systemd may signal it during ordinary teardown, so writing a STOP there would be spurious).
 .TP
 .B list
 Plaintext report: percentage of time per activity (high to low), and hours per day of week (Sun\-Sat).
@@ -2625,11 +2625,16 @@ fn do_autostart_install_linux() -> Result<(), String> {
         )
     })?;
 
+    // RemainAfterExit keeps the unit active after `ts start` exits so systemd does not tear down
+    // its control group -- otherwise the reminder daemon `ts start` spawns (which lives in this
+    // unit's cgroup; setsid only changes the process group, not the cgroup) would be killed the
+    // moment `ts start` returns.
     let start_unit = format!(
         r#"[Unit]
 Description=ts start on login
 [Service]
 Type=oneshot
+RemainAfterExit=yes
 ExecStart={} start
 [Install]
 WantedBy=default.target
@@ -2665,8 +2670,11 @@ WantedBy=default.target
     {
         return Err("ts autostart: systemctl daemon-reload failed".to_string());
     }
+    // Enable the start unit for next login but do NOT --now it: running `ts start` immediately would
+    // close the caller's already-open session and pop another chooser. The reminder daemon for the
+    // current session is started separately by `ts autostart` (start_reminder_daemon_if_needed).
     if !Command::new("systemctl")
-        .args(["--user", "enable", "--now", "ts-autostart-start.service"])
+        .args(["--user", "enable", "ts-autostart-start.service"])
         .status()
         .map_err(|e| e.to_string())?
         .success()
@@ -3021,19 +3029,30 @@ fn run_reminder_daemon(timesheet: &Path) {
         let set_for_sigwait = set;
         let timesheet_for_signal = timesheet.to_path_buf();
         thread::spawn(move || {
+            let _ = &timesheet_for_signal; // used only on non-Linux below
             let mut sig: libc::c_int = 0;
             if unsafe { sigwait(&set_for_sigwait, &mut sig) } == 0 && sig == SIGTERM {
-                // Only write STOP on real system shutdown. kill_reminder_daemon_if_running()
-                // removes the PID file before sending SIGTERM, so if the file is gone (or no
-                // longer points to us) this is an intentional ts kill and we skip the STOP.
-                let my_pid = process::id();
-                let is_shutdown = fs::read_to_string(reminder_pid_path())
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok())
-                    .map(|p| p == my_pid)
-                    .unwrap_or(false);
-                if is_shutdown {
-                    let _ = append_stop_entry(&timesheet_for_signal, Local::now());
+                // On macOS the reminder daemon IS the session LaunchAgent: launchd SIGTERMs it at
+                // logout/shutdown and it records the STOP here. kill_reminder_daemon_if_running()
+                // removes the PID file before signaling, so an intentional `ts` kill (file gone or
+                // no longer ours) is skipped.
+                //
+                // On Linux the logout STOP is recorded by the systemd session unit's ExecStop
+                // (`ts stop`), and systemd may SIGTERM the daemon during ordinary unit/cgroup
+                // teardown -- e.g. when the oneshot `ts start` that spawned it exits -- not only at
+                // logout. Writing a STOP here would produce spurious entries, so the daemon stays
+                // silent and just exits.
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let my_pid = process::id();
+                    let is_shutdown = fs::read_to_string(reminder_pid_path())
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                        .map(|p| p == my_pid)
+                        .unwrap_or(false);
+                    if is_shutdown {
+                        let _ = append_stop_entry(&timesheet_for_signal, Local::now());
+                    }
                 }
                 process::exit(0);
             }
