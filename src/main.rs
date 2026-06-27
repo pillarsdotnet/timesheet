@@ -23,6 +23,7 @@
 //! |------------|-------------|
 //! | `alias`    | Interactively replace activity text in this week's START entries (regex). |
 //! | `autostart` | Register `ts start` on login and `ts stop` on logout/shutdown (macOS/Linux). |
+//! | `edit`     | Open the timesheet log in `$EDITOR` (then `$VISUAL`, else `vi`). |
 //! | `help`     | Show the man page in a pager (groff -man -Tascii \| less). |
 //! | `install`  | Copy binary and icon to a directory on PATH (icon embedded on macOS). |
 //! | `interval` | Set or show reminder daemon interval (e.g. 3, 3m, 100s, 1h30m). |
@@ -35,7 +36,7 @@
 //! | `rename`   | Same as `alias`. |
 //! | `restart`, `reminder` | Aliases for `interval`. |
 //! | `rotate`   | Rename log to `timesheet.YYMMDD`; add STOP first if last entry is START; append if same-day exists. |
-//! | `start`    | Record work start now; on macOS with no activity, shows reminder dialog to pick/enter; otherwise optional activity (default: misc/unspecified); starts/restarts reminder daemon. |
+//! | `start`    | Record work start now; with no activity, shows reminder chooser to pick/enter (macOS via AppKit; Linux via PyQt single-click chooser, falling back to kdialog/zenity); otherwise optional activity (default: misc/unspecified); starts/restarts reminder daemon. |
 //! | `started`  | Record a past start time; inserts at the correct chronological position without discarding entries. |
 //! | `stop`     | Record work stop (optional time); amends previous STOP if work already stopped; stops reminder daemon and shows "stopped" dialog when a stop is recorded (skipped during logout/shutdown). |
 //! | `timeoff`  | Show stop time for 8 h/day average; only requires a START entry (adds one if log empty or last is STOP). |
@@ -105,12 +106,15 @@ fn format_stop_log_entry(dt: DateTime<Local>) -> String {
     format!("{}|STOP", format_log_timestamp(dt))
 }
 
-/// Caps automatic STOP timestamps so they do not land more than five minutes after the latest log entry.
+/// Caps automatic STOP timestamps so they do not land more than one reminder interval after the
+/// latest log entry. The interval is how often you are prompted (default 5 minutes), so a session
+/// you forgot to stop is recorded as ending at most one interval after your last logged activity.
 fn clamp_auto_stop_time(timesheet: &Path, requested_dt: DateTime<Local>) -> DateTime<Local> {
     let Some(last_dt) = last_line_dt(timesheet) else {
         return requested_dt;
     };
-    std::cmp::min(requested_dt, last_dt + chrono::Duration::minutes(5))
+    let cap = chrono::Duration::seconds(get_reminder_interval_secs() as i64);
+    std::cmp::min(requested_dt, last_dt + cap)
 }
 
 fn append_log_entry(timesheet: &Path, entry: &str) -> Result<(), String> {
@@ -139,6 +143,51 @@ fn reminder_pid_path() -> PathBuf {
     cache
         .unwrap_or_else(|| PathBuf::from("."))
         .join("ts-reminder.pid")
+}
+
+/// Atomically claim sole ownership of the reminder daemon by creating the PID file with O_EXCL.
+/// Returns true if this process now owns the daemon role, false if a live daemon already owns it.
+/// This makes the daemon self-deduplicating: if several are spawned in a race (interactive `ts start`,
+/// `ts autostart`, and the systemd start unit can all fire near-simultaneously), only the first to
+/// claim the file runs the loop; the rest see a live owner and exit.
+#[cfg(unix)]
+fn claim_reminder_daemon_ownership(pid_path: &Path) -> bool {
+    let my_pid = process::id();
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(pid_path)
+        {
+            Ok(mut f) => {
+                let _ = f.write_all(my_pid.to_string().as_bytes());
+                return true;
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // A pid file exists; keep it only if it names a live process other than us.
+                // If the file vanished between the failed create and this read, just retry.
+                if let Ok(data) = fs::read_to_string(pid_path) {
+                    if let Ok(pid) = data.trim().parse::<u32>() {
+                        if pid != my_pid && is_pid_running(pid) {
+                            return false;
+                        }
+                    }
+                    // Stale or unparsable owner: remove and retry the exclusive create.
+                    let _ = fs::remove_file(pid_path);
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+/// True if the reminder PID file still names this process (i.e. we are the current owner).
+#[cfg(unix)]
+fn owns_reminder_daemon(pid_path: &Path) -> bool {
+    fs::read_to_string(pid_path)
+        .ok()
+        .map(|d| d.trim() == process::id().to_string())
+        .unwrap_or(false)
 }
 
 /// Path for the reminder interval config file (seconds as decimal string; same dir as PID file).
@@ -204,7 +253,12 @@ fn reminder_activities_most_recent_first(timesheet: &Path) -> Vec<String> {
 }
 
 fn reminder_activities_most_recent_first_at(timesheet: &Path, now: DateTime<Local>) -> Vec<String> {
+    // Stored timestamps are floored to microsecond precision (see format_log_timestamp), so floor
+    // the cutoff to microseconds too; otherwise an entry written exactly at the 7-day boundary is
+    // dropped because its re-parsed value lands just below a nanosecond-precision cutoff.
     let cutoff = now - chrono::Duration::days(7);
+    let cutoff =
+        cutoff - chrono::Duration::nanoseconds((cutoff.timestamp_subsec_nanos() % 1000) as i64);
     let mut by_activity: std::collections::HashMap<String, DateTime<Local>> =
         std::collections::HashMap::new();
 
@@ -233,7 +287,7 @@ fn reminder_activities_most_recent_first_at(timesheet: &Path, now: DateTime<Loca
         }
     }
     let mut order: Vec<(String, DateTime<Local>)> = by_activity.into_iter().collect();
-    order.sort_by(|a, b| b.1.cmp(&a.1));
+    order.sort_by_key(|b| std::cmp::Reverse(b.1));
     order.into_iter().map(|(a, _)| a).collect()
 }
 
@@ -244,7 +298,7 @@ fn append_start_entry(timesheet: &Path, activity: &str) -> Result<(), String> {
     append_log_entry(timesheet, &format_start_log_entry(now, activity))
 }
 
-/// Append an automatic STOP log entry, capped to no more than five minutes after the latest log entry.
+/// Append an automatic STOP log entry, capped to no more than one reminder interval after the latest log entry.
 fn append_stop_entry(timesheet: &Path, dt: DateTime<Local>) -> Result<(), String> {
     let dt = clamp_auto_stop_time(timesheet, dt);
     maybe_rotate_if_previous_week(timesheet)?;
@@ -325,6 +379,37 @@ fn last_recorded_event(content: &str) -> Option<LogLine> {
     content.lines().rev().find_map(parse_line)
 }
 
+/// If the last log entry is an open START, append a STOP (capped to no more than one reminder
+/// interval after the latest entry) to close the session, and return `true`. No-op returning `false`
+/// if work is already stopped or the log is empty/unreadable.
+fn close_open_session(timesheet: &Path, now: DateTime<Local>) -> bool {
+    let content = fs::read_to_string(timesheet).unwrap_or_default();
+    let open = last_recorded_event(&content)
+        .map(|ll| matches!(ll, LogLine::Start(_, _)))
+        .unwrap_or(false);
+    if open {
+        let _ = append_stop_entry(timesheet, now);
+    }
+    open
+}
+
+/// Reconcile a session left open by a missed shutdown/logout STOP: if the last log entry is a START
+/// older than five minutes, close it with a STOP capped to one reminder interval after that entry
+/// (via clamp_auto_stop_time) so a shutdown without `ts stop` never records work all night. A recent
+/// open session is left untouched so we never close one the user is actively working on. Returns
+/// whether a STOP was written.
+fn reconcile_stale_open_session(timesheet: &Path, now: DateTime<Local>) -> bool {
+    let content = fs::read_to_string(timesheet).unwrap_or_default();
+    if let Some(LogLine::Start(dt, _)) = last_recorded_event(&content) {
+        if now.signed_duration_since(dt) > chrono::Duration::minutes(5) {
+            let stop_dt = clamp_auto_stop_time(timesheet, now);
+            let _ = append_log_entry(timesheet, &format_stop_log_entry(stop_dt));
+            return true;
+        }
+    }
+    false
+}
+
 fn last_start_entry(lines: &[(usize, LogLine)]) -> CurrentTask {
     lines.iter().rev().find_map(|(_, line)| match line {
         LogLine::Start(dt, activity) => Some((*dt, activity.clone())),
@@ -348,12 +433,10 @@ fn min_dt_in_log(path: &Path) -> Option<DateTime<Local>> {
     let mut min: Option<DateTime<Local>> = None;
     for line in content.lines() {
         match parse_line(line) {
-            Some(LogLine::Start(dt, _)) | Some(LogLine::Stop(dt)) => {
-                if min.is_none_or(|m| dt < m) {
-                    min = Some(dt);
-                }
+            Some(LogLine::Start(dt, _)) | Some(LogLine::Stop(dt)) if min.is_none_or(|m| dt < m) => {
+                min = Some(dt);
             }
-            None => {}
+            _ => {}
         }
     }
     min
@@ -385,7 +468,7 @@ fn date_range_in_log(path: &Path) -> Option<(NaiveDate, NaiveDate)> {
 
 /// Rotates the log: renames it to `timesheet.YYMMDD` using the earliest entry's date.
 /// If that file already exists (same day), appends the current log to it and removes the source.
-/// If the last entry is START (work in progress), appends a STOP no later than five minutes after that entry before rotating.
+/// If the last entry is START (work in progress), appends a STOP no later than one reminder interval after that entry before rotating.
 fn do_rotate(timesheet: &Path) -> Result<(), String> {
     if !timesheet.exists() {
         return Err("ts rotate: no timesheet data found.".to_string());
@@ -767,7 +850,7 @@ fn sprint_report_data(timesheet: &Path) -> Result<(ParsedLogLines, CurrentTask),
     Ok((combined, current_task))
 }
 
-/// Records work start now; activity is optional. With no argument on macOS, shows the reminder dialog to pick/enter an activity.
+/// Records work start now; activity is optional. With no argument, shows the reminder chooser to pick/enter an activity (macOS via AppKit; Linux via PyQt single-click chooser, falling back to kdialog/zenity).
 /// On other platforms or if the user declines, falls back to misc/unspecified.
 /// Ensures the reminder daemon is running at entry (so it stays running even when ts start is run at system startup and
 /// exits before the final start call), then restarts it after recording START to reset the timer.
@@ -778,71 +861,60 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
     if args.is_empty() {
         let startup_now = Local::now();
         let content = fs::read_to_string(timesheet).unwrap_or_default();
-        match last_recorded_event(&content) {
-            Some(LogLine::Stop(dt)) => {
-                let age = startup_now.signed_duration_since(dt).num_seconds();
-                if (0..60).contains(&age) {
-                    if env::var_os("TS_DEBUG").is_some() {
-                        let _ = std::io::stderr().write_all(
-                            b"ts: skipping start: last STOP was <60s ago (shutdown/reload guard)\n",
-                        );
-                    }
+        if let Some(LogLine::Stop(dt)) = last_recorded_event(&content) {
+            // Shutdown/reload guard: a very recent STOP means launchd/systemd is re-firing during
+            // shutdown, not a genuine login -- skip.
+            let age = startup_now.signed_duration_since(dt).num_seconds();
+            if (0..60).contains(&age) {
+                if env::var_os("TS_DEBUG").is_some() {
+                    let _ = std::io::stderr().write_all(
+                        b"ts: skipping start: last STOP was <60s ago (shutdown/reload guard)\n",
+                    );
+                }
+                return Ok(());
+            }
+        }
+        // Reconcile a missed shutdown STOP before any weekly rotation or recent-STOP guard could
+        // hide the stale open session.
+        reconcile_stale_open_session(timesheet, startup_now);
+    }
+    maybe_rotate_if_previous_week(timesheet)?;
+    // Will we block on an interactive chooser below (no activity given and a GUI chooser is available)?
+    #[cfg(not(test))]
+    let will_prompt = args.is_empty() && start_chooser_available();
+    #[cfg(test)]
+    let will_prompt = false;
+    if will_prompt {
+        // The foreground chooser IS the reminder prompt. Stop any running daemon so it cannot pop a
+        // SECOND prompt window after its interval elapses while the chooser is open. A fresh daemon
+        // is (re)started after the chooser resolves and a START is recorded (below).
+        kill_reminder_daemon_if_running();
+    } else {
+        // Start the daemon early so it is running even when ts start is invoked at login
+        // (LaunchAgent / systemd) and exits quickly without prompting.
+        start_reminder_daemon_if_needed(timesheet);
+    }
+    let activity = if args.is_empty() {
+        #[cfg(not(test))]
+        {
+            match resolve_start_activity(timesheet) {
+                Some(a) => a,
+                None => {
+                    // User chose "Stop Work" at the chooser: close the open session and stop reminders.
+                    close_open_session(timesheet, Local::now());
+                    kill_reminder_daemon_if_running();
                     return Ok(());
                 }
             }
-            // Reconcile a missed shutdown STOP before any weekly rotation or recent-STOP guard
-            // could hide the stale open session.
-            Some(LogLine::Start(dt, _))
-                if startup_now.signed_duration_since(dt) > chrono::Duration::minutes(5) =>
-            {
-                let stop_dt = clamp_auto_stop_time(timesheet, startup_now);
-                append_log_entry(timesheet, &format_stop_log_entry(stop_dt))?;
-            }
-            _ => {}
         }
-    }
-    maybe_rotate_if_previous_week(timesheet)?;
-    // Start daemon early so it is running even when ts start is invoked at login (LaunchAgent) and exits quickly.
-    start_reminder_daemon_if_needed(timesheet);
-    let activity = if args.is_empty() {
-        #[cfg(all(target_os = "macos", not(test)))]
-        {
-            let activities = reminder_activities_most_recent_first(timesheet);
-            loop {
-                match show_reminder_prompt(&activities, Some(timesheet)) {
-                    ReminderResult::Activity(a) => break a,
-                    ReminderResult::DontBugMe => {
-                        kill_reminder_daemon_if_running();
-                        return Ok(());
-                    }
-                    ReminderResult::ShowAgainImmediate => {} // re-show immediately
-                    ReminderResult::TimeoutAddStop(dt) => {
-                        let _ = append_stop_entry(timesheet, dt);
-                        // re-show immediately
-                    }
-                    ReminderResult::EnterNew => {
-                        unreachable!("show_reminder_prompt converts EnterNew to Activity")
-                    }
-                }
-            }
-        }
-        #[cfg(any(not(target_os = "macos"), test))]
+        #[cfg(test)]
         "misc/unspecified".to_string()
     } else {
         args.join(" ")
     };
     let now = Local::now();
     // Close any open session before starting a new one.
-    {
-        let content = fs::read_to_string(timesheet).unwrap_or_default();
-        if last_recorded_event(&content)
-            .map(|ll| matches!(ll, LogLine::Start(_, _)))
-            .unwrap_or(false)
-        {
-            let stop_dt = clamp_auto_stop_time(timesheet, now);
-            let _ = append_log_entry(timesheet, &format_stop_log_entry(stop_dt));
-        }
-    }
+    close_open_session(timesheet, now);
     append_log_entry(timesheet, &format_start_log_entry(now, &activity))?;
     println!(
         "Started: {} at {}",
@@ -1109,6 +1181,29 @@ fn cmd_tail(tail_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
 }
 
 /// Prints report: % per activity and hours per weekday; optional arg selects file (e.g. `log`, `0220`, `-1`, path).
+/// Opens the timesheet log in the user's editor (`$EDITOR`, falling back to `$VISUAL` then `vi`).
+fn cmd_edit(timesheet: &Path) -> Result<(), String> {
+    let editor = env::var_os("EDITOR")
+        .or_else(|| env::var_os("VISUAL"))
+        .unwrap_or_else(|| "vi".into());
+    if let Some(parent) = timesheet.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("ts edit: cannot create {}: {}", parent.display(), e))?;
+    }
+    let status = Command::new(&editor)
+        .arg(timesheet)
+        .status()
+        .map_err(|e| format!("ts edit: cannot run editor {:?}: {}", editor, e))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "ts edit: editor {:?} exited with {}",
+            editor, status
+        ))
+    }
+}
+
 fn cmd_list(list_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
     if env::var_os("TS_DEBUG").is_some() {
         let _ = std::io::stderr().write_all(b"ts: cmd_list entered\n");
@@ -1898,7 +1993,7 @@ Runs
 .B "ts start"
 at login (RunAtLoad, limited to Aqua sessions).
 A shutdown guard skips the start if the last log entry is a STOP less than 60\ s old.
-If the last recorded event is not STOP and is more than 5 minutes old, startup backfills a STOP 5 minutes after that event before recording the new START.
+If the last recorded event is not STOP and is more than 5 minutes old, startup backfills a STOP one reminder interval after that event before recording the new START.
 .TP
 \fBcom.ts.autostart.session\fR
 Runs
@@ -1912,9 +2007,16 @@ to invoke
 .B "ts stop"
 in the console user's launchd context. Requires sudo to register; if it cannot be set the command to run manually is printed.
 .RE
-On Linux uses systemd user services. With
+On Linux uses systemd user services, plus a system-level logout hook
+.RB ( ts-logout- uid .service)
+whose ExecStop runs "ts stop" before shutdown.target as a second guarantee that STOP is recorded on a
+full shutdown/reboot. Installing the system unit needs administrator access, so the
+.B sudo
+command is printed and offered to run; if declined, run it yourself. Once present, later runs skip it.
+With
 .I uninstall
-removes the registration.
+removes the registration (the logout hook removal also needs
+.BR sudo ).
 Without
 .I interval
 : starts the daemon if not running and prints the current reminder interval.
@@ -1943,7 +2045,7 @@ is the directory containing the binary (default: current executable's directory)
 is always written even without the source repository.
 .TP
 .B uninstall
-Stop the reminder daemon, remove startup/shutdown/login/logout hooks (LaunchAgents and LogoutHook on macOS, systemd user units on Linux), prompt to remove timesheet log files (y/N), then remove
+Stop the reminder daemon, remove startup/shutdown/login/logout hooks (LaunchAgents and LogoutHook on macOS, systemd user units and the system-level logout hook on Linux), prompt to remove timesheet log files (y/N), then remove
 .B ts-icon.svg
 and the
 .B ts
@@ -1963,7 +2065,7 @@ and
 .B reminder
 are aliases for
 .BR interval .
-Reminder daemon behavior: on timeout (no click), records STOP at reminder-appeared time, capped to no more than 5 minutes after the latest log entry, and brings the existing reminder window to the front of the window stack (does not launch a new prompt). Dismissed without choice (close, Escape) re-shows immediately. The "Enter new activity" dialog has no timeout; blank/cancelled re-shows the reminder. On system shutdown (SIGTERM), records STOP with the same 5-minute cap and exits.
+Reminder daemon behavior: on timeout (no click), records STOP at reminder-appeared time, capped to no more than one reminder interval after the latest log entry, and brings the existing reminder window to the front of the window stack (does not launch a new prompt). Dismissed without choice (close, Escape) re-shows immediately. The "Enter new activity" dialog has no timeout; blank/cancelled re-shows the reminder. At logout/shutdown the open session is stopped: on macOS the daemon itself records STOP when launchd sends it SIGTERM (capped to one reminder interval after the latest entry); on Linux the systemd session unit's ExecStop runs "ts stop" instead, and the daemon stays silent on SIGTERM (systemd may signal it during ordinary teardown, so writing a STOP there would be spurious). Any automatic STOP is capped to one reminder interval (default 5 minutes) after the latest entry, so forgetting to stop never records work all night.
 .TP
 .B list
 Plaintext report: percentage of time per activity (high to low), and hours per day of week (Sun\-Sat).
@@ -1978,6 +2080,16 @@ selects the most recently rotated
 .BR timesheet.YYMMDD ,
 .B -2
 the one before that, and so on.
+.TP
+.B edit
+Open the timesheet log
+.RB ( $HOME/Documents/timesheet.log )
+in your editor, taken from
+.B $EDITOR
+(then
+.BR $VISUAL ,
+else
+.BR vi ).
 .TP
 .B sprint
 Plaintext report like
@@ -2045,7 +2157,7 @@ Alias for
 .BR interval .
 .TP
 .B rotate
-If the last entry is START (work in progress), appends a STOP no later than 5 minutes after that entry first.
+If the last entry is START (work in progress), appends a STOP no later than one reminder interval after that entry first.
 Rename the timesheet log to
 .B timesheet.YYMMDD
 using the timestamp of the log's earliest entry (START or STOP).
@@ -2054,9 +2166,10 @@ Errors if the log is missing or has no valid entries.
 .B start
 Record work start
 .IR now .
-On macOS with no
+With no
 .IR activity ,
-shows the reminder dialog to pick or enter an activity.
+shows the reminder chooser to pick or enter an activity (macOS via AppKit; Linux via the PyQt
+single-click chooser, falling back to kdialog/zenity). A single click acts immediately.
 Otherwise optional
 .I activity
 (default: misc/unspecified). Appends a START line; does not modify existing entries.
@@ -2212,6 +2325,9 @@ fn cmd_help() -> Result<(), String> {
 fn cmd_autostart(args: &[String]) -> Result<(), String> {
     let uninstall = args.first().map(String::as_str) == Some("uninstall");
     if !uninstall {
+        // Like `ts start`, close a session left open by a previous day's missed shutdown STOP
+        // (capped to one reminder interval) so autostart never leaves an all-night session dangling.
+        reconcile_stale_open_session(&timesheet_path(), Local::now());
         let interval_set = if let Some(interval_arg) = args.first() {
             if let Ok(secs) = parse_interval_duration(interval_arg) {
                 let path = reminder_interval_path();
@@ -2513,16 +2629,24 @@ fn do_autostart_uninstall_macos() -> Result<(), String> {
     Ok(())
 }
 
+/// Directory holding systemd user units ($XDG_CONFIG_HOME/systemd/user, defaulting to $HOME/.config/systemd/user).
+#[cfg(target_os = "linux")]
+fn linux_user_units_dir() -> Result<PathBuf, String> {
+    let config = match env::var_os("XDG_CONFIG_HOME") {
+        Some(c) => PathBuf::from(c),
+        None => {
+            let home = env::var_os("HOME").ok_or("ts autostart: HOME not set")?;
+            PathBuf::from(home).join(".config")
+        }
+    };
+    Ok(config.join("systemd/user"))
+}
+
 #[cfg(target_os = "linux")]
 fn do_autostart_install_linux() -> Result<(), String> {
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     let exe_path = exe.to_string_lossy();
-    let config = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env::var_os("HOME").ok_or("ts autostart: HOME not set")?).join(".config")
-        });
-    let user_units = config.join("systemd/user");
+    let user_units = linux_user_units_dir()?;
     fs::create_dir_all(&user_units).map_err(|e| {
         format!(
             "ts autostart: cannot create {}: {}",
@@ -2531,11 +2655,16 @@ fn do_autostart_install_linux() -> Result<(), String> {
         )
     })?;
 
+    // RemainAfterExit keeps the unit active after `ts start` exits so systemd does not tear down
+    // its control group -- otherwise the reminder daemon `ts start` spawns (which lives in this
+    // unit's cgroup; setsid only changes the process group, not the cgroup) would be killed the
+    // moment `ts start` returns.
     let start_unit = format!(
         r#"[Unit]
 Description=ts start on login
 [Service]
 Type=oneshot
+RemainAfterExit=yes
 ExecStart={} start
 [Install]
 WantedBy=default.target
@@ -2571,8 +2700,11 @@ WantedBy=default.target
     {
         return Err("ts autostart: systemctl daemon-reload failed".to_string());
     }
+    // Enable the start unit for next login but do NOT --now it: running `ts start` immediately would
+    // close the caller's already-open session and pop another chooser. The reminder daemon for the
+    // current session is started separately by `ts autostart` (start_reminder_daemon_if_needed).
     if !Command::new("systemctl")
-        .args(["--user", "enable", "--now", "ts-autostart-start.service"])
+        .args(["--user", "enable", "ts-autostart-start.service"])
         .status()
         .map_err(|e| e.to_string())?
         .success()
@@ -2595,17 +2727,122 @@ WantedBy=default.target
         start_path.display(),
         session_path.display()
     );
+    // Also offer a system-level shutdown hook (like the macOS LogoutHook) as a second guarantee.
+    install_linux_logout_hook(&exe_path)?;
     println!("  To remove: ts autostart uninstall");
     Ok(())
 }
 
+/// Name of the system-level logout-hook unit (keyed by uid so multiple users don't collide).
+#[cfg(target_os = "linux")]
+fn linux_logout_hook_unit_name() -> String {
+    let uid = unsafe { libc::getuid() };
+    format!("ts-logout-{}.service", uid)
+}
+
+/// Install a system-level systemd unit whose ExecStop records a STOP at shutdown/reboot, mirroring
+/// the macOS LogoutHook. The systemd *user* session unit already records STOP at logout, but on a
+/// full shutdown the user manager can be torn down before its ExecStop runs; a system unit ordered
+/// `Before=shutdown.target` is the reliable, "system waits for it" guarantee. Installing into
+/// /etc/systemd/system needs root, so (like macOS) we print the command and offer to run it via sudo.
+#[cfg(target_os = "linux")]
+fn install_linux_logout_hook(exe_path: &str) -> Result<(), String> {
+    let unit_name = linux_logout_hook_unit_name();
+    let dest = format!("/etc/systemd/system/{}", unit_name);
+    if Path::new(&dest).exists() {
+        // Already installed (readable without root).
+        return Ok(());
+    }
+    let uid = unsafe { libc::getuid() };
+    let unit = format!(
+        r#"[Unit]
+Description=Record timesheet STOP at shutdown for uid {uid}
+DefaultDependencies=no
+Before=shutdown.target reboot.target halt.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User={uid}
+Environment=TS_LOGOUT=1
+ExecStart=/bin/true
+ExecStop={exe} stop
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        uid = uid,
+        exe = exe_path
+    );
+
+    // Stage the unit in a user-writable ts dir; the sudo command installs it system-wide.
+    let staged = linux_user_units_dir()?
+        .parent() // .../systemd
+        .and_then(|p| p.parent()) // .../.config
+        .map(|c| c.join("ts"))
+        .ok_or("ts autostart: cannot resolve config dir")?;
+    fs::create_dir_all(&staged)
+        .map_err(|e| format!("ts autostart: cannot create {}: {}", staged.display(), e))?;
+    let staged_unit = staged.join(&unit_name);
+    fs::write(&staged_unit, &unit)
+        .map_err(|e| format!("ts autostart: cannot write logout hook: {}", e))?;
+
+    let inner = format!(
+        "install -m644 '{src}' '{dest}' && systemctl daemon-reload && systemctl enable --now {name}",
+        src = staged_unit.display(),
+        dest = dest,
+        name = unit_name
+    );
+    println!("  To also record STOP on a full shutdown/reboot (a second guarantee, like the macOS");
+    println!("  logout hook), install a system service. This requires administrator access:");
+    println!("  sudo sh -c \"{}\"", inner);
+    print!("  Run this command now? [y/N] ");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    if io::stdin().lock().read_line(&mut line).is_ok() {
+        let answer = line.trim().to_lowercase();
+        if answer == "y" || answer == "yes" {
+            match Command::new("sudo").args(["sh", "-c", &inner]).status() {
+                Ok(s) if s.success() => println!("  Logout hook installed ({}).", dest),
+                _ => println!(
+                    "  ts autostart: logout hook not installed (sudo cancelled or failed); \
+                     run the command above to enable it."
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove the system-level logout-hook unit (best effort; prints the sudo command to run manually).
+#[cfg(target_os = "linux")]
+fn uninstall_linux_logout_hook() {
+    let unit_name = linux_logout_hook_unit_name();
+    let dest = format!("/etc/systemd/system/{}", unit_name);
+    if !Path::new(&dest).exists() {
+        return;
+    }
+    let inner = format!(
+        "systemctl disable --now {name}; rm -f '{dest}'; systemctl daemon-reload",
+        name = unit_name,
+        dest = dest
+    );
+    println!("Removing the system-level logout hook requires administrator access:");
+    println!("  sudo sh -c \"{}\"", inner);
+    print!("  Run this command now? [y/N] ");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    if io::stdin().lock().read_line(&mut line).is_ok() {
+        let answer = line.trim().to_lowercase();
+        if answer == "y" || answer == "yes" {
+            let _ = Command::new("sudo").args(["sh", "-c", &inner]).status();
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn do_autostart_uninstall_linux() -> Result<(), String> {
-    let home = env::var_os("HOME").ok_or("ts autostart: HOME not set")?;
-    let config = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(&home));
-    let user_units = config.join("systemd/user");
+    let user_units = linux_user_units_dir()?;
     let start_path = user_units.join("ts-autostart-start.service");
     let session_path = user_units.join("ts-autostart-session.service");
 
@@ -2617,6 +2854,7 @@ fn do_autostart_uninstall_linux() -> Result<(), String> {
         .output();
     let _ = fs::remove_file(&start_path);
     let _ = fs::remove_file(&session_path);
+    uninstall_linux_logout_hook();
     println!("Autostart uninstalled.");
     Ok(())
 }
@@ -2701,11 +2939,14 @@ fn show_reminders_stopped_notification() {
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = Command::new("notify-send")
-            .args([
-                "--app-name=Timesheet",
-                "Timesheet reminders have been stopped.",
-            ])
+        let mut cmd = Command::new("notify-send");
+        cmd.args([
+            "--app-name=Timesheet",
+            "Timesheet reminders have been stopped.",
+        ]);
+        // notify-send talks to the session bus, which may be missing when launched from systemd.
+        linux_with_display(&mut cmd);
+        let _ = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -2928,19 +3169,30 @@ fn run_reminder_daemon(timesheet: &Path) {
         let set_for_sigwait = set;
         let timesheet_for_signal = timesheet.to_path_buf();
         thread::spawn(move || {
+            let _ = &timesheet_for_signal; // used only on non-Linux below
             let mut sig: libc::c_int = 0;
             if unsafe { sigwait(&set_for_sigwait, &mut sig) } == 0 && sig == SIGTERM {
-                // Only write STOP on real system shutdown. kill_reminder_daemon_if_running()
-                // removes the PID file before sending SIGTERM, so if the file is gone (or no
-                // longer points to us) this is an intentional ts kill and we skip the STOP.
-                let my_pid = process::id();
-                let is_shutdown = fs::read_to_string(reminder_pid_path())
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok())
-                    .map(|p| p == my_pid)
-                    .unwrap_or(false);
-                if is_shutdown {
-                    let _ = append_stop_entry(&timesheet_for_signal, Local::now());
+                // On macOS the reminder daemon IS the session LaunchAgent: launchd SIGTERMs it at
+                // logout/shutdown and it records the STOP here. kill_reminder_daemon_if_running()
+                // removes the PID file before signaling, so an intentional `ts` kill (file gone or
+                // no longer ours) is skipped.
+                //
+                // On Linux the logout STOP is recorded by the systemd session unit's ExecStop
+                // (`ts stop`), and systemd may SIGTERM the daemon during ordinary unit/cgroup
+                // teardown -- e.g. when the oneshot `ts start` that spawned it exits -- not only at
+                // logout. Writing a STOP here would produce spurious entries, so the daemon stays
+                // silent and just exits.
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let my_pid = process::id();
+                    let is_shutdown = fs::read_to_string(reminder_pid_path())
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                        .map(|p| p == my_pid)
+                        .unwrap_or(false);
+                    if is_shutdown {
+                        let _ = append_stop_entry(&timesheet_for_signal, Local::now());
+                    }
                 }
                 process::exit(0);
             }
@@ -2950,15 +3202,25 @@ fn run_reminder_daemon(timesheet: &Path) {
     if let Some(parent) = pid_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    if fs::write(&pid_path, process::id().to_string()).is_err() {
+    // Claim sole ownership; if another daemon is already running, exit instead of duplicating it.
+    if !claim_reminder_daemon_ownership(&pid_path) {
+        ts_debug("reminder daemon: another daemon already owns the pid file, exiting");
         return;
     }
     let pid_path_guard = pid_path.clone();
     let _cleanup = defer(move || {
-        let _ = fs::remove_file(&pid_path_guard);
+        // Only remove the pid file if we still own it, so we never delete a successor's file.
+        if owns_reminder_daemon(&pid_path_guard) {
+            let _ = fs::remove_file(&pid_path_guard);
+        }
     });
 
     loop {
+        // If ownership changed underneath us (e.g. another daemon took over), exit quietly.
+        if !owns_reminder_daemon(&pid_path) {
+            ts_debug("reminder daemon: lost pid ownership, exiting");
+            return;
+        }
         let interval_secs = get_reminder_interval_secs();
         ts_debug(&format!("reminder daemon: sleeping {}s", interval_secs));
         thread::sleep(Duration::from_secs(interval_secs));
@@ -2967,6 +3229,8 @@ fn run_reminder_daemon(timesheet: &Path) {
         let activities = reminder_activities_most_recent_first(timesheet);
         match show_reminder_prompt(&activities, Some(timesheet)) {
             ReminderResult::DontBugMe => {
+                // "Stop Work": close the open session (record a STOP) before stopping reminders.
+                close_open_session(timesheet, Local::now());
                 show_reminders_stopped_notification();
                 break;
             }
@@ -3024,16 +3288,428 @@ fn parse_native_reminder_dialog_output(output: &str) -> Option<ReminderResult> {
     Some(ReminderResult::Activity(output.to_string()))
 }
 
-/// Show "What are you working on?" prompt; returns user choice or timeout. Platform-specific (macOS: osascript).
+/// Show "What are you working on?" prompt; returns user choice or timeout.
+/// Platform-specific (macOS: AppKit/osascript; Linux: PyQt single-click chooser, else kdialog/zenity).
 /// timesheet: used when appending STOP on timeout (reminder daemon / ts start).
 fn show_reminder_prompt(activities: &[String], timesheet: Option<&Path>) -> ReminderResult {
     #[cfg(target_os = "macos")]
     return show_reminder_prompt_macos(activities, timesheet);
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    return show_reminder_prompt_linux(activities, timesheet);
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (activities, timesheet);
         ReminderResult::TimeoutAddStop(Local::now())
+    }
+}
+
+/// Resolve the activity for `ts start` when none was given on the command line.
+/// Returns `Some(activity)` to start, or `None` if the user chose "Stop Work" (caller should abort the start).
+/// On platforms (or headless setups) without a GUI chooser, returns the default activity without prompting.
+/// Whether `ts start` with no activity can show an interactive GUI chooser on this platform/setup
+/// (macOS always; Linux when kdialog/zenity is installed). Used both to decide whether to block on
+/// the chooser and to avoid starting the reminder daemon early when we will.
+#[cfg(not(test))]
+fn start_chooser_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        detect_linux_dialog().is_some()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+#[cfg(not(test))]
+fn resolve_start_activity(timesheet: &Path) -> Option<String> {
+    if !start_chooser_available() {
+        return Some("misc/unspecified".to_string());
+    }
+
+    let activities = reminder_activities_most_recent_first(timesheet);
+    loop {
+        match show_reminder_prompt(&activities, Some(timesheet)) {
+            ReminderResult::Activity(a) => return Some(a),
+            ReminderResult::DontBugMe => return None,
+            ReminderResult::ShowAgainImmediate => {
+                // Debounce on Linux: if the GUI helper exits instantly (e.g. the display is not
+                // reachable yet at login) this avoids a tight CPU-spinning re-show loop.
+                #[cfg(target_os = "linux")]
+                thread::sleep(Duration::from_millis(500));
+            }
+            ReminderResult::TimeoutAddStop(dt) => {
+                let _ = append_stop_entry(timesheet, dt);
+                // re-show immediately
+            }
+            ReminderResult::EnterNew => {
+                unreachable!("show_reminder_prompt converts EnterNew to Activity")
+            }
+        }
+    }
+}
+
+/// Build the `Stop Work` / activities / `Enter new activity...` choice list shown in the reminder dialog.
+#[cfg(target_os = "linux")]
+fn reminder_choices(activities: &[String]) -> Vec<String> {
+    let mut choices = vec!["Stop Work".to_string()];
+    for a in activities.iter().rev() {
+        if !a.is_empty() && !choices.contains(a) {
+            choices.push(a.clone());
+        }
+    }
+    choices.push("Enter new activity...".to_string());
+    choices
+}
+
+/// Which GUI dialog helper to drive on Linux. kdialog is native to KDE/Plasma; zenity covers GNOME/other.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum LinuxDialog {
+    KDialog,
+    Zenity,
+}
+
+/// True if `name` is an executable found on `$PATH`.
+#[cfg(target_os = "linux")]
+fn command_on_path(name: &str) -> bool {
+    let path = match env::var_os("PATH") {
+        Some(p) => p,
+        None => return false,
+    };
+    env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(name);
+        candidate.is_file()
+            && std::fs::metadata(&candidate)
+                .map(|m| {
+                    use std::os::unix::fs::PermissionsExt;
+                    m.permissions().mode() & 0o111 != 0
+                })
+                .unwrap_or(false)
+    })
+}
+
+/// Pick a dialog backend. Prefer zenity only on explicitly GTK-based desktops; otherwise prefer
+/// kdialog (KDE-first), then fall back to whichever is installed. Choosing kdialog when the desktop
+/// is unknown keeps the dialog identical whether the daemon is launched from an interactive shell or
+/// from a systemd user unit (where XDG_CURRENT_DESKTOP is typically unset), avoiding mixed window styles.
+#[cfg(target_os = "linux")]
+fn detect_linux_dialog() -> Option<LinuxDialog> {
+    let has_kdialog = command_on_path("kdialog");
+    let has_zenity = command_on_path("zenity");
+    let desktop = env::var_os("XDG_CURRENT_DESKTOP")
+        .map(|d| d.to_string_lossy().to_uppercase())
+        .unwrap_or_default();
+    let gtk_desktop = [
+        "GNOME", "XFCE", "CINNAMON", "MATE", "UNITY", "LXDE", "PANTHEON",
+    ]
+    .iter()
+    .any(|d| desktop.contains(d));
+    if gtk_desktop && has_zenity {
+        return Some(LinuxDialog::Zenity);
+    }
+    if has_kdialog {
+        return Some(LinuxDialog::KDialog);
+    }
+    if has_zenity {
+        return Some(LinuxDialog::Zenity);
+    }
+    None
+}
+
+/// Prepare the GUI session environment for a dialog command, preferring native Wayland (KDE Plasma)
+/// with an X11/XWayland fallback.
+///
+/// Two problems are handled:
+///   1. Launched from a systemd user unit, the graphical-session variables (XDG_RUNTIME_DIR,
+///      WAYLAND_DISPLAY, DBUS_SESSION_BUS_ADDRESS) may be missing. We derive XDG_RUNTIME_DIR from
+///      the uid and probe its directory for a `wayland-N` socket so the dialog still connects.
+///   2. Even in an interactive Wayland session, Qt apps like kdialog default to the xcb (XWayland)
+///      backend when DISPLAY is set and QT_QPA_PLATFORM is unset, so they render as X11 windows.
+///      Setting QT_QPA_PLATFORM=wayland;xcb makes kdialog use Wayland natively when available and
+///      fall back to X11 otherwise. (GTK apps like zenity already pick Wayland on their own.)
+///
+/// Existing values are never overridden, so an explicit user/session configuration wins.
+#[cfg(target_os = "linux")]
+fn linux_with_display(cmd: &mut Command) {
+    // Where the Wayland and D-Bus sockets live.
+    let runtime_dir = match env::var_os("XDG_RUNTIME_DIR") {
+        Some(d) => PathBuf::from(d),
+        None => {
+            let uid = unsafe { libc::getuid() };
+            let d = PathBuf::from(format!("/run/user/{}", uid));
+            cmd.env("XDG_RUNTIME_DIR", &d);
+            d
+        }
+    };
+
+    // Determine the Wayland display: use the inherited one, else probe the runtime dir.
+    let wayland_display = env::var_os("WAYLAND_DISPLAY").map(|s| s.to_string_lossy().into_owned());
+    let wayland_display = wayland_display.or_else(|| {
+        (0..4)
+            .map(|n| format!("wayland-{}", n))
+            .find(|name| runtime_dir.join(name).exists())
+            .inspect(|name| {
+                cmd.env("WAYLAND_DISPLAY", name);
+            })
+    });
+
+    let have_x11 = env::var_os("DISPLAY").is_some();
+
+    if wayland_display.is_some() {
+        // Prefer native Wayland, fall back to X11 if the Qt Wayland plugin is unavailable.
+        if env::var_os("QT_QPA_PLATFORM").is_none() {
+            cmd.env("QT_QPA_PLATFORM", "wayland;xcb");
+        }
+    } else if !have_x11 {
+        // No Wayland socket and no X11: last-resort default for Xorg/XWayland.
+        cmd.env("DISPLAY", ":0");
+    }
+
+    // kdialog/zenity and notify-send need the user session bus.
+    if env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+        let bus = runtime_dir.join("bus");
+        if bus.exists() {
+            cmd.env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", bus.display()),
+            );
+        }
+    }
+}
+
+/// Show a text-entry dialog for "Enter new activity..."; returns the typed activity or None.
+#[cfg(target_os = "linux")]
+fn prompt_enter_activity_linux(backend: LinuxDialog) -> Option<String> {
+    let mut cmd = Command::new(match backend {
+        LinuxDialog::KDialog => "kdialog",
+        LinuxDialog::Zenity => "zenity",
+    });
+    match backend {
+        LinuxDialog::KDialog => {
+            cmd.args(["--title", "ts", "--inputbox", "Enter activity:"]);
+        }
+        LinuxDialog::Zenity => {
+            cmd.args(["--entry", "--title=ts", "--text=Enter activity:"]);
+        }
+    }
+    linux_with_display(&mut cmd);
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let out = wait_no_timeout(child)?;
+    let activity = String::from_utf8_lossy(&out).trim().to_string();
+    if activity.is_empty() {
+        None
+    } else {
+        Some(activity)
+    }
+}
+
+/// Single-click chooser implemented with PyQt (Qt, native to KDE). Each entry acts on a single
+/// click with no OK/Cancel buttons: clicking "Stop Work" / an activity returns it, and clicking
+/// "Enter new activity..." opens an input box in the same window (a non-empty entry returns it; a
+/// blank entry returns to the list). The script writes the chosen string to stdout, or nothing if
+/// the window is dismissed. It exits 3 when no Qt toolkit is available so the caller can fall back.
+#[cfg(target_os = "linux")]
+const REMINDER_CHOOSER_PY: &str = r#"
+import sys, os
+choices = sys.argv[1:]
+def load_qt():
+    for mod in ("PyQt6", "PyQt5"):
+        try:
+            w = __import__(mod + ".QtWidgets", fromlist=["x"])
+            c = __import__(mod + ".QtCore", fromlist=["x"])
+            return (w.QApplication, w.QWidget, w.QVBoxLayout, w.QListWidget,
+                    w.QLabel, w.QInputDialog, c.QTimer)
+        except Exception:
+            continue
+    return None
+bundle = load_qt()
+if bundle is None:
+    sys.exit(3)
+QApplication, QWidget, QVBoxLayout, QListWidget, QLabel, QInputDialog, QTimer = bundle
+result = {"v": None}
+app = QApplication([])
+w = QWidget()
+w.setWindowTitle("ts")
+lay = QVBoxLayout(w)
+lay.addWidget(QLabel("What are you working on?"))
+lst = QListWidget()
+lst.addItems(choices)
+lay.addWidget(lst)
+def finish(val):
+    result["v"] = val
+    app.quit()
+def on_click(item):
+    text = item.text()
+    if text == "Enter new activity...":
+        activity, ok = QInputDialog.getText(w, "ts", "Enter activity:")
+        if ok and activity.strip():
+            finish(activity.strip())
+        else:
+            lst.clearSelection()
+        return
+    finish(text)
+lst.itemClicked.connect(on_click)
+w.resize(380, min(len(choices) * 28 + 90, 520))
+w.show()
+try:
+    w.raise_()
+    w.activateWindow()
+except Exception:
+    pass
+autopick = os.environ.get("TS_CHOOSER_AUTOPICK")
+if autopick is not None:
+    QTimer.singleShot(200, lambda: on_click(lst.item(int(autopick))))
+run = getattr(app, "exec", None) or getattr(app, "exec_")
+run()
+if result["v"] is not None:
+    sys.stdout.write(result["v"])
+    sys.stdout.flush()
+"#;
+
+/// Try the PyQt single-click chooser. Returns `None` if Python/PyQt is unavailable (so the caller
+/// falls back to the kdialog/zenity list dialog); otherwise returns the mapped ReminderResult.
+#[cfg(target_os = "linux")]
+fn show_reminder_prompt_pyqt(
+    choices: &[String],
+    reminder_appeared: DateTime<Local>,
+) -> Option<ReminderResult> {
+    if !command_on_path("python3") {
+        return None;
+    }
+    let mut cmd = Command::new("python3");
+    cmd.arg("-c").arg(REMINDER_CHOOSER_PY);
+    for c in choices {
+        cmd.arg(c);
+    }
+    linux_with_display(&mut cmd);
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    // Wait up to the prompt timeout, collecting both exit code and stdout.
+    let timeout = Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS);
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.code() == Some(3) {
+                    // No Qt toolkit available: let the caller fall back to kdialog/zenity.
+                    return None;
+                }
+                let mut out = Vec::new();
+                if let Some(mut s) = child.stdout.take() {
+                    let _ = io::copy(&mut s, &mut out);
+                }
+                let s = String::from_utf8_lossy(&out).trim().to_string();
+                return Some(match parse_native_reminder_dialog_output(&s) {
+                    // "Enter new activity..." is handled inside the script, so it never reaches here.
+                    Some(result) => result,
+                    None => ReminderResult::ShowAgainImmediate, // dismissed without a choice
+                });
+            }
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            return Some(ReminderResult::TimeoutAddStop(reminder_appeared));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Linux reminder prompt: present the activity chooser and map the choice to a ReminderResult.
+/// Prefers the PyQt single-click chooser (no OK/Cancel); falls back to a kdialog/zenity list dialog.
+#[cfg(target_os = "linux")]
+fn show_reminder_prompt_linux(activities: &[String], _timesheet: Option<&Path>) -> ReminderResult {
+    let reminder_appeared = Local::now();
+    let choices = reminder_choices(activities);
+
+    if let Some(result) = show_reminder_prompt_pyqt(&choices, reminder_appeared) {
+        return result;
+    }
+
+    let backend = match detect_linux_dialog() {
+        Some(b) => b,
+        None => {
+            // No GUI dialog helper installed: behave like a timed-out reminder (records STOP, re-shows later).
+            ts_debug("reminder: no kdialog/zenity found; install one for interactive reminders");
+            return ReminderResult::TimeoutAddStop(reminder_appeared);
+        }
+    };
+
+    let mut cmd = Command::new(match backend {
+        LinuxDialog::KDialog => "kdialog",
+        LinuxDialog::Zenity => "zenity",
+    });
+    match backend {
+        LinuxDialog::KDialog => {
+            cmd.args(["--title", "ts", "--menu", "What are you working on?"]);
+            // kdialog --menu takes (tag, label) pairs; selected tag is printed to stdout.
+            for c in &choices {
+                cmd.arg(c).arg(c);
+            }
+        }
+        LinuxDialog::Zenity => {
+            cmd.args([
+                "--list",
+                "--title=ts",
+                "--text=What are you working on?",
+                "--hide-header",
+                "--column=Activity",
+            ]);
+            for c in &choices {
+                cmd.arg(c);
+            }
+        }
+    }
+    linux_with_display(&mut cmd);
+
+    let child = match cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return ReminderResult::TimeoutAddStop(reminder_appeared),
+    };
+
+    let timeout = Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS);
+    match wait_with_timeout(child, timeout, true) {
+        WaitOutcome::Finished(Some(stdout)) => {
+            let s = String::from_utf8_lossy(&stdout).trim().to_string();
+            match parse_native_reminder_dialog_output(&s) {
+                Some(ReminderResult::EnterNew) => {
+                    if let Some(activity) = prompt_enter_activity_linux(backend) {
+                        ReminderResult::Activity(activity)
+                    } else {
+                        ReminderResult::ShowAgainImmediate
+                    }
+                }
+                Some(result) => result,
+                // Cancelled or dismissed without a choice: re-show immediately.
+                None => ReminderResult::ShowAgainImmediate,
+            }
+        }
+        WaitOutcome::Finished(None) => ReminderResult::TimeoutAddStop(reminder_appeared),
+        WaitOutcome::TimedOut => ReminderResult::TimeoutAddStop(reminder_appeared),
+        WaitOutcome::TimedOutWithChild(_) => ReminderResult::TimeoutAddStop(reminder_appeared),
     }
 }
 
@@ -3412,6 +4088,7 @@ fn show_reminder_prompt_macos_systemui(
     ReminderResult::TimeoutAddStop(reminder_appeared)
 }
 
+#[cfg(target_os = "macos")]
 fn escape_applescript_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -3422,6 +4099,8 @@ enum WaitOutcome {
     Finished(Option<Vec<u8>>),
     TimedOut,
     /// Child still running (not killed); caller can bring window to front and call wait_with_timeout again.
+    /// The held child is only inspected on macOS (to re-front the dialog); other platforms kill on timeout.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     TimedOutWithChild(process::Child),
 }
 
@@ -3516,6 +4195,7 @@ fn main() {
         Some("stop") => cmd_stop(&rest, &timesheet),
         Some("stopped") => cmd_stop(&rest, &timesheet),
         Some("list") => cmd_list(rest.first().map(String::as_str), &timesheet),
+        Some("edit") => cmd_edit(&timesheet),
         Some("sprint") => cmd_sprint(&timesheet),
         Some("tail") => cmd_tail(rest.first().map(String::as_str), &timesheet),
         Some("started") => cmd_started(&rest, &timesheet),
@@ -3739,7 +4419,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append_stop_entry_caps_to_five_minutes_after_latest_log_entry() {
+    fn test_append_stop_entry_caps_to_reminder_interval_after_latest_log_entry() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("timesheet.log");
         let start_dt = Local::now() - chrono::Duration::hours(2);
@@ -3756,10 +4436,9 @@ mod tests {
         let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], format_start_log_entry(start_dt, "coding"));
-        assert_eq!(
-            lines[1],
-            format_stop_log_entry(start_dt + chrono::Duration::minutes(5))
-        );
+        // The auto STOP is capped to one reminder interval after the open START (default 5 min).
+        let cap = chrono::Duration::seconds(get_reminder_interval_secs() as i64);
+        assert_eq!(lines[1], format_stop_log_entry(start_dt + cap));
     }
 
     #[test]
@@ -3828,7 +4507,7 @@ mod tests {
     }
 
     #[test]
-    fn test_do_rotate_caps_auto_stop_to_five_minutes_after_open_start() {
+    fn test_do_rotate_caps_auto_stop_to_reminder_interval_after_open_start() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("timesheet.log");
         let start_dt = Local::now() - chrono::Duration::hours(2);
@@ -3841,7 +4520,7 @@ mod tests {
         let result = do_rotate(&log_path);
 
         assert!(result.is_ok());
-        let stop_dt = start_dt + chrono::Duration::minutes(5);
+        let stop_dt = start_dt + chrono::Duration::seconds(get_reminder_interval_secs() as i64);
         let stamp = stop_dt.format("%y%m%d").to_string();
         let rotated = dir.path().join(format!("timesheet.{}", stamp));
         let content = fs::read_to_string(&rotated).unwrap();
@@ -4266,7 +4945,7 @@ mod tests {
     fn test_cmd_start_backfills_stale_open_session_before_new_start() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("timesheet.log");
-        let stale_start = Local::now() - chrono::Duration::minutes(6);
+        let stale_start = Local::now() - chrono::Duration::hours(2);
         fs::write(
             &log_path,
             format!("{}\n", format_start_log_entry(stale_start, "coding")),
@@ -4284,10 +4963,9 @@ mod tests {
             "expected stale START, backfilled STOP, new START"
         );
         assert_eq!(lines[0], format_start_log_entry(stale_start, "coding"));
-        assert_eq!(
-            lines[1],
-            format_stop_log_entry(stale_start + chrono::Duration::minutes(5))
-        );
+        // Backfilled STOP is capped to one reminder interval after the stale START (default 5 min).
+        let cap = chrono::Duration::seconds(get_reminder_interval_secs() as i64);
+        assert_eq!(lines[1], format_stop_log_entry(stale_start + cap));
         match parse_line(lines[2]) {
             Some(LogLine::Start(_, activity)) => assert_eq!(activity, "misc/unspecified"),
             other => panic!("expected new START entry, got {:?}", other),
@@ -4312,10 +4990,9 @@ mod tests {
         let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 3, "expected START, auto STOP, new START");
         assert_eq!(lines[0], format_start_log_entry(stale_start, "coding"));
-        assert_eq!(
-            lines[1],
-            format_stop_log_entry(stale_start + chrono::Duration::minutes(5))
-        );
+        // Auto STOP is capped to one reminder interval after the open START (default 5 min).
+        let cap = chrono::Duration::seconds(get_reminder_interval_secs() as i64);
+        assert_eq!(lines[1], format_stop_log_entry(stale_start + cap));
         match parse_line(lines[2]) {
             Some(LogLine::Start(_, activity)) => assert_eq!(activity, "next task"),
             other => panic!("expected new START entry, got {:?}", other),
@@ -4504,8 +5181,93 @@ mod tests {
 
         assert!(result.is_ok());
         let content = fs::read_to_string(&log_path).unwrap();
-        assert!(content.contains("2026-03-30T14:30:00.000000-04:00|START|manual\n"));
-        assert!(content.contains("2026-03-30T15:21:48.022092-04:00|STOP\n"));
+        // Compute the expected lines through the same parse+format path migrate uses, so the
+        // assertion is independent of the machine's timezone (CI runs in UTC). The seconds-only
+        // START must gain microsecond precision; the STOP keeps its existing micros.
+        let start_dt = parse_timestamp_field("2026-03-30T14:30:00-04:00").unwrap();
+        let stop_dt = parse_timestamp_field("2026-03-30T15:21:48.022092-04:00").unwrap();
+        assert!(content.contains(&format!("{}\n", format_start_log_entry(start_dt, "manual"))));
+        assert!(content.contains(&format!("{}\n", format_stop_log_entry(stop_dt))));
+        // The START gained microsecond precision (it had none in the input).
+        assert!(content.contains(".000000"));
+    }
+
+    #[test]
+    fn test_close_open_session_records_stop_when_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        fs::write(
+            &log_path,
+            format!(
+                "{}|START|task\n",
+                format_log_timestamp(Local::now() - chrono::Duration::minutes(1))
+            ),
+        )
+        .unwrap();
+
+        let wrote = close_open_session(&log_path, Local::now());
+
+        assert!(wrote);
+        let content = fs::read_to_string(&log_path).unwrap();
+        assert!(matches!(
+            last_recorded_event(&content),
+            Some(LogLine::Stop(_))
+        ));
+    }
+
+    #[test]
+    fn test_close_open_session_noop_when_already_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        let original = format!(
+            "{}|START|task\n{}|STOP\n",
+            format_log_timestamp(Local::now() - chrono::Duration::minutes(2)),
+            format_log_timestamp(Local::now() - chrono::Duration::minutes(1))
+        );
+        fs::write(&log_path, &original).unwrap();
+
+        let wrote = close_open_session(&log_path, Local::now());
+
+        assert!(!wrote);
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), original);
+    }
+
+    #[test]
+    fn test_reconcile_stale_open_session_caps_old_open_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        let start = Local::now() - chrono::Duration::hours(8);
+        fs::write(
+            &log_path,
+            format!("{}|START|task\n", format_log_timestamp(start)),
+        )
+        .unwrap();
+
+        let wrote = reconcile_stale_open_session(&log_path, Local::now());
+
+        assert!(wrote);
+        let content = fs::read_to_string(&log_path).unwrap();
+        // STOP is capped to one reminder interval after the open START, not "now" (no all-nighter).
+        let cap = chrono::Duration::seconds(get_reminder_interval_secs() as i64);
+        let expected_stop = format_stop_log_entry(start + cap);
+        assert!(content.contains(&format!("{}\n", expected_stop)));
+    }
+
+    #[test]
+    fn test_reconcile_stale_open_session_leaves_recent_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        // Open START only 1 minute ago: the user is actively working; do not close it.
+        let original = format!(
+            "{}|START|task\n",
+            format_log_timestamp(Local::now() - chrono::Duration::minutes(1))
+        );
+        fs::write(&log_path, &original).unwrap();
+
+        let wrote = reconcile_stale_open_session(&log_path, Local::now());
+
+        assert!(!wrote);
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), original);
     }
 
     #[test]
