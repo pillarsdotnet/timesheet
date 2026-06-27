@@ -47,3 +47,10 @@ repos:
         language: system
         files: \.(rs|toml)$
         pass_filenames: false
+
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test
+        language: system
+        files: \.(rs|toml)$
+        pass_filenames: false
