@@ -2007,9 +2007,16 @@ to invoke
 .B "ts stop"
 in the console user's launchd context. Requires sudo to register; if it cannot be set the command to run manually is printed.
 .RE
-On Linux uses systemd user services. With
+On Linux uses systemd user services, plus a system-level logout hook
+.RB ( ts-logout- uid .service)
+whose ExecStop runs "ts stop" before shutdown.target as a second guarantee that STOP is recorded on a
+full shutdown/reboot. Installing the system unit needs administrator access, so the
+.B sudo
+command is printed and offered to run; if declined, run it yourself. Once present, later runs skip it.
+With
 .I uninstall
-removes the registration.
+removes the registration (the logout hook removal also needs
+.BR sudo ).
 Without
 .I interval
 : starts the daemon if not running and prints the current reminder interval.
@@ -2038,7 +2045,7 @@ is the directory containing the binary (default: current executable's directory)
 is always written even without the source repository.
 .TP
 .B uninstall
-Stop the reminder daemon, remove startup/shutdown/login/logout hooks (LaunchAgents and LogoutHook on macOS, systemd user units on Linux), prompt to remove timesheet log files (y/N), then remove
+Stop the reminder daemon, remove startup/shutdown/login/logout hooks (LaunchAgents and LogoutHook on macOS, systemd user units and the system-level logout hook on Linux), prompt to remove timesheet log files (y/N), then remove
 .B ts-icon.svg
 and the
 .B ts
@@ -2720,8 +2727,117 @@ WantedBy=default.target
         start_path.display(),
         session_path.display()
     );
+    // Also offer a system-level shutdown hook (like the macOS LogoutHook) as a second guarantee.
+    install_linux_logout_hook(&exe_path)?;
     println!("  To remove: ts autostart uninstall");
     Ok(())
+}
+
+/// Name of the system-level logout-hook unit (keyed by uid so multiple users don't collide).
+#[cfg(target_os = "linux")]
+fn linux_logout_hook_unit_name() -> String {
+    let uid = unsafe { libc::getuid() };
+    format!("ts-logout-{}.service", uid)
+}
+
+/// Install a system-level systemd unit whose ExecStop records a STOP at shutdown/reboot, mirroring
+/// the macOS LogoutHook. The systemd *user* session unit already records STOP at logout, but on a
+/// full shutdown the user manager can be torn down before its ExecStop runs; a system unit ordered
+/// `Before=shutdown.target` is the reliable, "system waits for it" guarantee. Installing into
+/// /etc/systemd/system needs root, so (like macOS) we print the command and offer to run it via sudo.
+#[cfg(target_os = "linux")]
+fn install_linux_logout_hook(exe_path: &str) -> Result<(), String> {
+    let unit_name = linux_logout_hook_unit_name();
+    let dest = format!("/etc/systemd/system/{}", unit_name);
+    if Path::new(&dest).exists() {
+        // Already installed (readable without root).
+        return Ok(());
+    }
+    let uid = unsafe { libc::getuid() };
+    let unit = format!(
+        r#"[Unit]
+Description=Record timesheet STOP at shutdown for uid {uid}
+DefaultDependencies=no
+Before=shutdown.target reboot.target halt.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User={uid}
+Environment=TS_LOGOUT=1
+ExecStart=/bin/true
+ExecStop={exe} stop
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        uid = uid,
+        exe = exe_path
+    );
+
+    // Stage the unit in a user-writable ts dir; the sudo command installs it system-wide.
+    let staged = linux_user_units_dir()?
+        .parent() // .../systemd
+        .and_then(|p| p.parent()) // .../.config
+        .map(|c| c.join("ts"))
+        .ok_or("ts autostart: cannot resolve config dir")?;
+    fs::create_dir_all(&staged)
+        .map_err(|e| format!("ts autostart: cannot create {}: {}", staged.display(), e))?;
+    let staged_unit = staged.join(&unit_name);
+    fs::write(&staged_unit, &unit)
+        .map_err(|e| format!("ts autostart: cannot write logout hook: {}", e))?;
+
+    let inner = format!(
+        "install -m644 '{src}' '{dest}' && systemctl daemon-reload && systemctl enable --now {name}",
+        src = staged_unit.display(),
+        dest = dest,
+        name = unit_name
+    );
+    println!("  To also record STOP on a full shutdown/reboot (a second guarantee, like the macOS");
+    println!("  logout hook), install a system service. This requires administrator access:");
+    println!("  sudo sh -c \"{}\"", inner);
+    print!("  Run this command now? [y/N] ");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    if io::stdin().lock().read_line(&mut line).is_ok() {
+        let answer = line.trim().to_lowercase();
+        if answer == "y" || answer == "yes" {
+            match Command::new("sudo").args(["sh", "-c", &inner]).status() {
+                Ok(s) if s.success() => println!("  Logout hook installed ({}).", dest),
+                _ => println!(
+                    "  ts autostart: logout hook not installed (sudo cancelled or failed); \
+                     run the command above to enable it."
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove the system-level logout-hook unit (best effort; prints the sudo command to run manually).
+#[cfg(target_os = "linux")]
+fn uninstall_linux_logout_hook() {
+    let unit_name = linux_logout_hook_unit_name();
+    let dest = format!("/etc/systemd/system/{}", unit_name);
+    if !Path::new(&dest).exists() {
+        return;
+    }
+    let inner = format!(
+        "systemctl disable --now {name}; rm -f '{dest}'; systemctl daemon-reload",
+        name = unit_name,
+        dest = dest
+    );
+    println!("Removing the system-level logout hook requires administrator access:");
+    println!("  sudo sh -c \"{}\"", inner);
+    print!("  Run this command now? [y/N] ");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    if io::stdin().lock().read_line(&mut line).is_ok() {
+        let answer = line.trim().to_lowercase();
+        if answer == "y" || answer == "yes" {
+            let _ = Command::new("sudo").args(["sh", "-c", &inner]).status();
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2738,6 +2854,7 @@ fn do_autostart_uninstall_linux() -> Result<(), String> {
         .output();
     let _ = fs::remove_file(&start_path);
     let _ = fs::remove_file(&session_path);
+    uninstall_linux_logout_hook();
     println!("Autostart uninstalled.");
     Ok(())
 }
