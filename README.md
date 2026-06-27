@@ -28,6 +28,7 @@ figure out how it works. For now I'm just glad that it does.
 - Timesheet data file: `~/Documents/timesheet.log` (edit `DEFAULT_TIMESHEET` in `src/main.rs` and rebuild to change)
 - **macOS:** no extra dependencies (reminder dialogs use built-in AppleScript/AppKit).
 - **Linux (KDE/Ubuntu/etc.):** the reminder prompt uses, in order of preference:
+
   1. **A single-click chooser** built with **Python 3 + PyQt** (`python3` plus `python3-pyqt6` or `python3-pyqt5`). This is the preferred experience: each entry acts on a single click with no OK/Cancel buttons (Qt, native on Wayland). Install e.g. `sudo apt install python3-pyqt6`.
   2. **A fallback list dialog** via `kdialog` (KDE/Plasma) or `zenity` (GNOME/other) when PyQt is unavailable — a select-then-OK list. Install whichever matches your desktop, e.g. `sudo apt install kdialog` or `sudo apt install zenity`.
 
