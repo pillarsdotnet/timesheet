@@ -18,13 +18,21 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          node-version: "20"
+          python-version: "3.x"
 
-      - name: Install markdownlint-cli and prettier
-        run: npm install -g markdownlint-cli prettier
+      - name: Install pre-commit
+        run: python -m pip install --upgrade pre-commit
+
+      # Cache the pre-commit hook environments, keyed on the config so a hook
+      # version bump invalidates the cache.
+      - name: Cache pre-commit environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
 
       - name: Commitlint
         if: github.event_name == 'pull_request'
@@ -33,8 +41,13 @@ jobs:
           configFile: .commitlintrc.yaml
           failOnWarnings: true
 
-      - name: Markdownlint
-        run: markdownlint "**/*.md"
+      # Run the repository's own pre-commit hooks so the linter and local
+      # pre-commit use the exact same tools and pinned versions (from
+      # .pre-commit-config.yaml) and cannot drift apart. The Rust hooks
+      # (cargo fmt / clippy) need the toolchain and run elsewhere, so only the
+      # docs-formatting hooks are invoked here.
+      - name: Prettier (pre-commit)
+        run: pre-commit run --all-files --show-diff-on-failure prettier
 
-      - name: Prettier (check)
-        run: prettier --check "**/*.md" "**/*.yaml"
+      - name: Markdownlint (pre-commit)
+        run: pre-commit run --all-files --show-diff-on-failure markdownlint
