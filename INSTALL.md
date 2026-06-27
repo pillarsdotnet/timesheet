@@ -99,16 +99,24 @@ To run the linter:
 cargo clippy --all-targets -- -D warnings
 ```
 
-## Linting and Git hooks (prek)
+## Linting and Git hooks
 
-This project uses [prek](https://prek.j178.dev/) (a Rust-based pre-commit alternative). Configuration is in `prek.toml`.
+Hooks are defined in a single file, `.pre-commit-config.yaml`, which is the one source of truth used by the local hooks **and** by CI (the lint workflow runs these same hooks), so the two cannot drift apart.
 
-Install prek (e.g. `cargo install prek`), then install git hooks:
+Run the hooks with either tool:
 
-```sh
-prek install -f
-```
+- [prek](https://prek.j178.dev/) (a Rust-based pre-commit alternative; reads `.pre-commit-config.yaml` natively):
 
-This installs both pre-commit and commit-msg hooks. Run all hooks manually with `prek run`, or run a single hook with `prek run <hook-id>`.
+  ```sh
+  cargo install prek   # or see the prek docs for prebuilt binaries
+  prek install -f
+  ```
 
-If you prefer Python `pre-commit`, this repo also includes `.pre-commit-config.yaml`. Running `pre-commit install` will install both the `pre-commit` and `commit-msg` hooks, so commitlint catches non-Conventional Commit messages locally before CI does.
+- Python [pre-commit](https://pre-commit.com/):
+
+  ```sh
+  pip install pre-commit
+  pre-commit install
+  ```
+
+Either command installs both the `pre-commit` and `commit-msg` hooks (so commitlint catches non-Conventional Commit messages locally before CI does). Run all hooks manually with `prek run --all-files` / `pre-commit run --all-files`, or a single hook with `prek run <hook-id>` / `pre-commit run <hook-id>`.
