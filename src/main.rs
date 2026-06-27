@@ -284,7 +284,7 @@ fn reminder_activities_most_recent_first_at(timesheet: &Path, now: DateTime<Loca
         }
     }
     let mut order: Vec<(String, DateTime<Local>)> = by_activity.into_iter().collect();
-    order.sort_by(|a, b| b.1.cmp(&a.1));
+    order.sort_by_key(|b| std::cmp::Reverse(b.1));
     order.into_iter().map(|(a, _)| a).collect()
 }
 
@@ -399,12 +399,10 @@ fn min_dt_in_log(path: &Path) -> Option<DateTime<Local>> {
     let mut min: Option<DateTime<Local>> = None;
     for line in content.lines() {
         match parse_line(line) {
-            Some(LogLine::Start(dt, _)) | Some(LogLine::Stop(dt)) => {
-                if min.is_none_or(|m| dt < m) {
-                    min = Some(dt);
-                }
+            Some(LogLine::Start(dt, _)) | Some(LogLine::Stop(dt)) if min.is_none_or(|m| dt < m) => {
+                min = Some(dt);
             }
-            None => {}
+            _ => {}
         }
     }
     min
@@ -5025,8 +5023,15 @@ mod tests {
 
         assert!(result.is_ok());
         let content = fs::read_to_string(&log_path).unwrap();
-        assert!(content.contains("2026-03-30T14:30:00.000000-04:00|START|manual\n"));
-        assert!(content.contains("2026-03-30T15:21:48.022092-04:00|STOP\n"));
+        // Compute the expected lines through the same parse+format path migrate uses, so the
+        // assertion is independent of the machine's timezone (CI runs in UTC). The seconds-only
+        // START must gain microsecond precision; the STOP keeps its existing micros.
+        let start_dt = parse_timestamp_field("2026-03-30T14:30:00-04:00").unwrap();
+        let stop_dt = parse_timestamp_field("2026-03-30T15:21:48.022092-04:00").unwrap();
+        assert!(content.contains(&format!("{}\n", format_start_log_entry(start_dt, "manual"))));
+        assert!(content.contains(&format!("{}\n", format_stop_log_entry(stop_dt))));
+        // The START gained microsecond precision (it had none in the input).
+        assert!(content.contains(".000000"));
     }
 
     #[test]
