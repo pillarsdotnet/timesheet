@@ -43,6 +43,30 @@ The log file contains one entry per line:
 
 Start/stop pairs are matched in **LIFO order** (each STOP pairs with the most recent START). The report uses these pairs to compute duration and attribute time to activity and day of week.
 
+## Configuration
+
+Optional settings live in **`~/.config/timesheet.yml`** (or `$XDG_CONFIG_HOME/timesheet.yml`; `$TS_CONFIG` overrides both, and a `timesheet.yaml` sibling is used if no `.yml` exists). The file does not exist by default and every setting has a default, so configuring anything is optional.
+
+Only a small YAML subset is understood: `key: value` pairs, `#` comments, optional quotes, and one level of indented nesting. Unknown keys are ignored, and a value that can't be understood prints a warning on stderr and falls back to the default.
+
+### `rotate` — when a new timesheet week begins
+
+`ts` rotates `timesheet.log` to `timesheet.YYMMDD` at the start of each week, so each rotated file holds exactly one work week. By default the week begins **Sunday at 00:00** local time. If your employer's week runs Monday through Sunday — rotating at midnight between Sunday night and Monday morning — say so:
+
+```yaml
+# ~/.config/timesheet.yml
+rotate:
+  day: monday
+  time: "00:00"
+```
+
+- **`day`** — weekday name or three-letter abbreviation, any case (`monday`, `Mon`, `SUNDAY`). Default: `sunday`.
+- **`time`** — `HH:MM`, `HH:MM:SS`, or a bare hour, in local time. Default: `00:00`.
+
+A scalar shorthand works too: `rotate: monday`, or `rotate: "fri 17:00"` for a week that turns over Friday at 5 pm.
+
+The rotation boundary is checked by `ts start`, `ts stop`, `ts started`, `ts timeoff` and the reminder daemon: if the log's last entry falls before the most recent boundary, the log is rotated before the new entry is recorded. `ts rotate` run by hand always rotates, whatever the boundary. The same boundary defines "this week" for `ts alias`.
+
 ## ts command
 
 The **`ts`** command takes a required subcommand as its first argument. Full documentation: **`ts help`** or **`ts manpage`**.
@@ -64,7 +88,7 @@ Subcommands (alphabetical):
 | `rename`    | Same as `alias`.                                                                                                                                                                                                                                                                                                                                                                                             |
 | `reminder`  | Alias for `interval`.                                                                                                                                                                                                                                                                                                                                                                                        |
 | `restart`   | Alias for `interval` (with no argument, reports current interval and restarts the daemon).                                                                                                                                                                                                                                                                                                                   |
-| `rotate`    | Rename `timesheet.log` to `timesheet.YYMMDD` using the earliest entry's date; if last entry is START, appends a STOP no later than one reminder interval after that entry first. If a file for that date already exists, appends to it.                                                                                                                                                                      |
+| `rotate`    | Rename `timesheet.log` to `timesheet.YYMMDD` using the earliest entry's date; if last entry is START, appends a STOP no later than one reminder interval after that entry first. If a file for that date already exists, appends to it. Happens automatically at the start of each week — see [Configuration](#rotate--when-a-new-timesheet-week-begins).                                                    |
 | `start`     | Record work start **now**. With no activity: shows the reminder dialog to pick/enter an activity (macOS, or Linux with `kdialog`/`zenity` installed); otherwise defaults to misc/unspecified. Starts the reminder daemon if not already running.                                                                                                                                                             |
 | `started`   | Record a work start at a **past time**. Args: `ts started <start_time> [activity...]`. Time formats: e.g. `YYYY-MM-DD HH:MM`, `HH:MM`, or GNU date -d style.                                                                                                                                                                                                                                                 |
 | `stop`      | Record work stop at **now** or at an optional stop time. If the last entry is already STOP and no time is given, nothing happens; if a time is given, the last STOP is amended. If the last entry is START, appends the new STOP. When a stop is recorded, stops the reminder daemon and shows a dialog that reminders have been stopped (skipped during logout/shutdown).                                   |

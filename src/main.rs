@@ -17,6 +17,18 @@
 //!
 //! Start/stop pairs are matched in LIFO order (each STOP pairs with the most recent START).
 //!
+//! ## Configuration
+//!
+//! Optional settings live in `$HOME/.config/timesheet.yml` (see [`config_path`]). Currently the
+//! only setting is `rotate`, which says when a new timesheet week begins — the boundary at which
+//! the log is automatically rotated (default Sunday 00:00 local):
+//!
+//! ```yaml
+//! rotate:
+//!   day: monday
+//!   time: "00:00"
+//! ```
+//!
 //! ## Subcommands
 //!
 //! | Command    | Description |
@@ -42,7 +54,9 @@
 //! | `timeoff`  | Show stop time for 8 h/day average; only requires a START entry (adds one if log empty or last is STOP). |
 //! | `uninstall` | Stop daemon, remove autostart hooks, optionally remove log files, remove binary and icon. |
 
-use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat};
+use chrono::{
+    DateTime, Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat, Weekday,
+};
 #[cfg(target_os = "macos")]
 use libc::getuid;
 #[cfg(unix)]
@@ -305,17 +319,229 @@ fn append_stop_entry(timesheet: &Path, dt: DateTime<Local>) -> Result<(), String
     append_log_entry(timesheet, &format_stop_log_entry(dt))
 }
 
-/// DateTime of Sunday 00:00:00 for the week containing `now` (local time).
+/// When a new timesheet week begins: the weekday and local time of day at which
+/// [`maybe_rotate_if_previous_week`] rotates the log. Configurable in `timesheet.yml`
+/// (see [`config_path`]); defaults to Sunday 00:00.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RotationBoundary {
+    day: Weekday,
+    time: NaiveTime,
+}
+
+impl Default for RotationBoundary {
+    fn default() -> Self {
+        RotationBoundary {
+            day: Weekday::Sun,
+            time: NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+        }
+    }
+}
+
+/// Config file path: `$TS_CONFIG`, else `$XDG_CONFIG_HOME/timesheet.yml`, else
+/// `$HOME/.config/timesheet.yml`. A `timesheet.yaml` sibling is used when no `.yml` exists.
+fn config_path() -> PathBuf {
+    if let Some(p) = env::var_os("TS_CONFIG") {
+        return PathBuf::from(p);
+    }
+    let dir = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let yml = dir.join("timesheet.yml");
+    if !yml.exists() {
+        let yaml = dir.join("timesheet.yaml");
+        if yaml.exists() {
+            return yaml;
+        }
+    }
+    yml
+}
+
+/// Strips an unquoted `#` comment from a config line.
+fn strip_yaml_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'"' || b == b'\'' => quote = Some(b),
+            None if b == b'#' => return &line[..i],
+            None => {}
+        }
+    }
+    line
+}
+
+/// Removes matching surrounding single or double quotes.
+fn unquote_yaml_scalar(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 {
+        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+        if (first == b'"' || first == b'\'') && first == last {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
+}
+
+/// Parses the supported YAML subset: `key: value` pairs, `#` comments, optional quotes, and one
+/// level of nested mapping. Nested keys are returned dotted (`rotate: {day: monday}` becomes
+/// `rotate.day` -> `monday`). Keys are lowercased; anything else in the file is ignored.
+fn parse_simple_yaml(text: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let mut section: Option<String> = None;
+    for raw in text.lines() {
+        let line = strip_yaml_comment(raw);
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "---" {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        let value = unquote_yaml_scalar(value.trim()).trim().to_string();
+        if indent == 0 {
+            section = if value.is_empty() {
+                Some(key.clone())
+            } else {
+                None
+            };
+            if !value.is_empty() {
+                map.insert(key, value);
+            }
+        } else {
+            match &section {
+                Some(sec) => {
+                    map.insert(format!("{}.{}", sec, key), value);
+                }
+                None => {
+                    map.insert(key, value);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Parses a weekday name (full or three-letter abbreviation, any case).
+fn parse_weekday(s: &str) -> Option<Weekday> {
+    s.trim().parse::<Weekday>().ok()
+}
+
+/// Parses a time of day: `HH:MM`, `HH:MM:SS`, or a bare hour (`0`, `9`).
+fn parse_time_of_day(s: &str) -> Option<NaiveTime> {
+    let s = s.trim();
+    if let Ok(h) = s.parse::<u32>() {
+        return NaiveTime::from_hms_opt(h, 0, 0);
+    }
+    NaiveTime::parse_from_str(s, "%H:%M:%S")
+        .or_else(|_| NaiveTime::parse_from_str(s, "%H:%M"))
+        .ok()
+}
+
+/// Reads the rotation boundary out of a parsed config, collecting a message for each bad value.
+/// Accepted forms: `rotate: monday`, `rotate: "monday 09:00"`, or a `rotate:` mapping with
+/// `day:` and/or `time:` keys. Missing or invalid values fall back to the default (Sunday 00:00).
+fn rotation_boundary_from_config(
+    map: &std::collections::HashMap<String, String>,
+) -> (RotationBoundary, Vec<String>) {
+    let mut boundary = RotationBoundary::default();
+    let mut warnings = Vec::new();
+
+    // Scalar shorthand: `rotate: monday` or `rotate: monday 09:00`.
+    if let Some(scalar) = map.get("rotate") {
+        let mut fields = scalar.split_whitespace();
+        match fields.next().and_then(parse_weekday) {
+            Some(day) => boundary.day = day,
+            None => warnings.push(format!("rotate: unrecognized weekday \"{}\"", scalar)),
+        }
+        if let Some(rest) = fields.next() {
+            match parse_time_of_day(rest) {
+                Some(time) => boundary.time = time,
+                None => warnings.push(format!("rotate: unrecognized time \"{}\"", rest)),
+            }
+        }
+    }
+    if let Some(day) = map.get("rotate.day") {
+        match parse_weekday(day) {
+            Some(d) => boundary.day = d,
+            None => warnings.push(format!("rotate.day: unrecognized weekday \"{}\"", day)),
+        }
+    }
+    if let Some(time) = map.get("rotate.time") {
+        match parse_time_of_day(time) {
+            Some(t) => boundary.time = t,
+            None => warnings.push(format!("rotate.time: unrecognized time \"{}\"", time)),
+        }
+    }
+    (boundary, warnings)
+}
+
+/// Rotation boundary from `path`, or the default when the file is absent. Unreadable files and
+/// invalid values warn on stderr and fall back to the default rather than failing the command.
+fn load_rotation_boundary(path: &Path) -> RotationBoundary {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return RotationBoundary::default(),
+        Err(e) => {
+            eprintln!("ts: {}: {}; using default rotation", path.display(), e);
+            return RotationBoundary::default();
+        }
+    };
+    let (boundary, warnings) = rotation_boundary_from_config(&parse_simple_yaml(&text));
+    for w in warnings {
+        eprintln!("ts: {}: {}", path.display(), w);
+    }
+    boundary
+}
+
+/// The configured rotation boundary (see [`config_path`]).
+fn rotation_boundary() -> RotationBoundary {
+    load_rotation_boundary(&config_path())
+}
+
+/// Resolves a local wall-clock date and time to an instant, tolerating daylight-saving
+/// transitions: an ambiguous time uses the earlier instant, and a time that does not exist
+/// (spring-forward gap) advances to the first instant that does.
+fn local_datetime_at(date: NaiveDate, time: NaiveTime) -> DateTime<Local> {
+    let naive = date.and_time(time);
+    for extra_minutes in [0, 15, 30, 45, 60, 90, 120, 180] {
+        let candidate = naive + chrono::Duration::minutes(extra_minutes);
+        match candidate.and_local_timezone(Local) {
+            chrono::LocalResult::Single(dt) => return dt,
+            chrono::LocalResult::Ambiguous(earliest, _) => return earliest,
+            chrono::LocalResult::None => continue,
+        }
+    }
+    naive.and_utc().with_timezone(&Local)
+}
+
+/// DateTime of the start of the timesheet week containing `now`: the most recent occurrence of
+/// the configured rotation boundary (default Sunday 00:00) at or before `now`, in local time.
 fn week_start(now: DateTime<Local>) -> DateTime<Local> {
-    let today = now.date_naive();
-    let dow = today.weekday().num_days_from_sunday() as u64;
-    today
-        .checked_sub_days(chrono::Days::new(dow))
-        .unwrap_or(today)
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_local_timezone(Local)
-        .unwrap()
+    week_start_with(now, rotation_boundary())
+}
+
+fn week_start_with(now: DateTime<Local>, boundary: RotationBoundary) -> DateTime<Local> {
+    let days_back =
+        (now.weekday().num_days_from_sunday() + 7 - boundary.day.num_days_from_sunday()) % 7;
+    let date = now.date_naive();
+    let date = date
+        .checked_sub_days(chrono::Days::new(days_back as u64))
+        .unwrap_or(date);
+    let start = local_datetime_at(date, boundary.time);
+    if start <= now {
+        return start;
+    }
+    // The boundary has not been reached yet today; the week began a week earlier.
+    let earlier = date.checked_sub_days(chrono::Days::new(7)).unwrap_or(date);
+    local_datetime_at(earlier, boundary.time)
 }
 
 /// Parses a timestamp field: strict ISO 8601 (RFC 3339) only.
@@ -512,7 +738,8 @@ fn do_rotate(timesheet: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// If the last log entry is from the previous week (before this week's Sunday 00:00), runs [`do_rotate`].
+/// If the last log entry is from the previous week (before the most recent rotation boundary —
+/// Sunday 00:00 unless `timesheet.yml` says otherwise), runs [`do_rotate`].
 fn maybe_rotate_if_previous_week(timesheet: &Path) -> Result<(), String> {
     if !timesheet.exists() {
         return Ok(());
@@ -1944,6 +2171,62 @@ The log file is
 by default (compile-time constant
 .BR DEFAULT_TIMESHEET
 in source).
+.SH CONFIGURATION
+Optional settings are read from
+.BR $HOME/.config/timesheet.yml
+(see
+.BR FILES ).
+The file is missing by default and every setting has a default, so no configuration is required.
+Only a small YAML subset is understood:
+.BR "key: value" " pairs, " #
+comments, optional quotes, and one level of indented nesting. Unknown keys are ignored;
+an unusable value prints a warning on stderr and the default is used.
+.PP
+.B "rotate"
+selects when a new timesheet week begins \(em the boundary at which
+.B ts
+automatically rotates the log (see
+.BR "AUTOMATIC ROTATION" ).
+It takes a mapping with
+.B day
+(weekday name or three-letter abbreviation, any case) and
+.B time
+(HH:MM, HH:MM:SS, or a bare hour), or a scalar shorthand
+.RB ( "rotate: monday" ", " "rotate: \(dqfri 17:00\(dq" ).
+Defaults:
+.B day
+Sunday,
+.B time
+00:00 (local time).
+.PP
+Rotating at midnight between Sunday night and Monday morning \(em i.e.\& a work week
+that runs Monday through Sunday:
+.PP
+.RS
+.nf
+# ~/.config/timesheet.yml
+rotate:
+  day: monday
+  time: "00:00"
+.fi
+.RE
+.SH "AUTOMATIC ROTATION"
+.B start,
+.B stop,
+.B started,
+.B timeoff
+and the reminder daemon first check whether the log's last entry predates the most recent
+rotation boundary (by default Sunday 00:00; see
+.BR CONFIGURATION ).
+If so, they run
+.B rotate
+before recording anything, so each
+.B timesheet.YYMMDD
+file holds exactly one work week. The
+.B rotate
+command itself always rotates, regardless of the boundary. The boundary also defines
+"this week" for
+.BR alias .
 .SH "LOG FORMAT"
 One entry per line. The timestamp is the first field, strict ISO 8601 (e.g. 2026-03-06T14:30:00-08:00).
 .TP
@@ -2162,6 +2445,8 @@ Rename the timesheet log to
 .B timesheet.YYMMDD
 using the timestamp of the log's earliest entry (START or STOP).
 Errors if the log is missing or has no valid entries.
+Rotation also happens on its own at the start of each week; see
+.BR "AUTOMATIC ROTATION" .
 .TP
 .B start
 Record work start
@@ -2226,10 +2511,34 @@ and reminder daemon start/kill (e.g.
 If set (any value), suppresses the "reminders stopped" dialog when
 .B ts\ stop
 is invoked (used by autostart scripts during logout/shutdown).
+.TP
+.B TS_CONFIG
+Path to the configuration file, overriding the default location (see
+.BR FILES ).
+.TP
+.B XDG_CONFIG_HOME
+Configuration directory searched for
+.B timesheet.yml
+when
+.B TS_CONFIG
+is unset; defaults to
+.BR $HOME/.config .
 .SH FILES
 .B $HOME/Documents/timesheet.log
 Default timesheet log (path is compile-time in
 .BR DEFAULT_TIMESHEET ).
+.TP
+.B $XDG_CONFIG_HOME/timesheet.yml
+or
+.B $HOME/.config/timesheet.yml
+Optional settings; see
+.BR CONFIGURATION .
+A
+.B timesheet.yaml
+sibling is used if no
+.B timesheet.yml
+exists. Overridden by
+.BR $TS_CONFIG .
 .TP
 .B $XDG_CACHE_HOME/ts-reminder-interval
 or
@@ -4367,10 +4676,176 @@ mod tests {
     fn test_week_start() {
         // 2023-11-14 12:00:00 UTC-ish Tuesday -> week start is Sunday 2023-11-12 00:00:00 local
         let tuesday = Local.timestamp_opt(1700000000, 0).single().unwrap();
-        let week_start_dt = week_start(tuesday);
+        let week_start_dt = week_start_with(tuesday, RotationBoundary::default());
         assert_eq!(week_start_dt.weekday(), chrono::Weekday::Sun);
         assert_eq!(week_start_dt.hour(), 0);
         assert_eq!(week_start_dt.minute(), 0);
+        assert!(week_start_dt <= tuesday);
+    }
+
+    #[test]
+    fn test_week_start_with_monday_boundary() {
+        let boundary = RotationBoundary {
+            day: Weekday::Mon,
+            time: NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+        };
+        // Tuesday 2023-11-14 -> Monday 2023-11-13 00:00 local.
+        let tuesday = Local.timestamp_opt(1700000000, 0).single().unwrap();
+        let start = week_start_with(tuesday, boundary);
+        assert_eq!(start.weekday(), Weekday::Mon);
+        assert_eq!((start.hour(), start.minute()), (0, 0));
+        assert_eq!(tuesday.signed_duration_since(start).num_days(), 1);
+
+        // Sunday belongs to the week that began the previous Monday, not the coming one.
+        let sunday = tuesday - chrono::Duration::days(2);
+        assert_eq!(sunday.weekday(), Weekday::Sun);
+        let start = week_start_with(sunday, boundary);
+        assert_eq!(start.weekday(), Weekday::Mon);
+        assert!(start < sunday);
+        assert_eq!(sunday.signed_duration_since(start).num_days(), 6);
+    }
+
+    #[test]
+    fn test_week_start_before_boundary_time_uses_previous_week() {
+        let boundary = RotationBoundary {
+            day: Weekday::Mon,
+            time: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+        };
+        // Monday 08:00 local is still the previous week when the boundary is Monday 09:00.
+        let monday_8am = local_datetime_at(
+            NaiveDate::from_ymd_opt(2023, 11, 13).unwrap(),
+            NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
+        );
+        let start = week_start_with(monday_8am, boundary);
+        assert_eq!(start.weekday(), Weekday::Mon);
+        assert_eq!(start.hour(), 9);
+        assert_eq!(monday_8am.signed_duration_since(start).num_days(), 6);
+
+        // One hour later, the new week has begun.
+        let monday_10am = monday_8am + chrono::Duration::hours(2);
+        let start = week_start_with(monday_10am, boundary);
+        assert_eq!(start.hour(), 9);
+        assert_eq!(monday_10am.signed_duration_since(start).num_hours(), 1);
+    }
+
+    #[test]
+    fn test_week_start_exactly_on_boundary() {
+        let boundary = RotationBoundary::default();
+        let sunday_midnight = local_datetime_at(
+            NaiveDate::from_ymd_opt(2023, 11, 12).unwrap(),
+            NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+        );
+        assert_eq!(week_start_with(sunday_midnight, boundary), sunday_midnight);
+    }
+
+    #[test]
+    fn test_parse_simple_yaml_nested_and_comments() {
+        let text = "\
+# rotation settings
+rotate:
+  day: Monday   # start of the work week
+  time: \"00:00\"
+other: value
+";
+        let map = parse_simple_yaml(text);
+        assert_eq!(map.get("rotate.day").map(String::as_str), Some("Monday"));
+        assert_eq!(map.get("rotate.time").map(String::as_str), Some("00:00"));
+        assert_eq!(map.get("other").map(String::as_str), Some("value"));
+        assert!(!map.contains_key("rotate"));
+    }
+
+    #[test]
+    fn test_parse_simple_yaml_ignores_hash_inside_quotes() {
+        let map = parse_simple_yaml("note: \"a # b\"\n");
+        assert_eq!(map.get("note").map(String::as_str), Some("a # b"));
+    }
+
+    #[test]
+    fn test_parse_weekday_and_time_of_day() {
+        assert_eq!(parse_weekday("monday"), Some(Weekday::Mon));
+        assert_eq!(parse_weekday("MON"), Some(Weekday::Mon));
+        assert_eq!(parse_weekday(" Sunday "), Some(Weekday::Sun));
+        assert_eq!(parse_weekday("funday"), None);
+        assert_eq!(parse_time_of_day("9"), NaiveTime::from_hms_opt(9, 0, 0));
+        assert_eq!(
+            parse_time_of_day("09:30"),
+            NaiveTime::from_hms_opt(9, 30, 0)
+        );
+        assert_eq!(
+            parse_time_of_day("23:59:59"),
+            NaiveTime::from_hms_opt(23, 59, 59)
+        );
+        assert_eq!(parse_time_of_day("noon"), None);
+        assert_eq!(parse_time_of_day("25:00"), None);
+    }
+
+    #[test]
+    fn test_rotation_boundary_from_config_forms() {
+        let nested = parse_simple_yaml("rotate:\n  day: monday\n  time: 09:30\n");
+        let (boundary, warnings) = rotation_boundary_from_config(&nested);
+        assert!(warnings.is_empty());
+        assert_eq!(boundary.day, Weekday::Mon);
+        assert_eq!(boundary.time, NaiveTime::from_hms_opt(9, 30, 0).unwrap());
+
+        let scalar = parse_simple_yaml("rotate: monday\n");
+        let (boundary, warnings) = rotation_boundary_from_config(&scalar);
+        assert!(warnings.is_empty());
+        assert_eq!(boundary.day, Weekday::Mon);
+        assert_eq!(boundary.time, NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+
+        let scalar_with_time = parse_simple_yaml("rotate: \"fri 17:00\"\n");
+        let (boundary, warnings) = rotation_boundary_from_config(&scalar_with_time);
+        assert!(warnings.is_empty());
+        assert_eq!(boundary.day, Weekday::Fri);
+        assert_eq!(boundary.time, NaiveTime::from_hms_opt(17, 0, 0).unwrap());
+
+        // Only `day` given: time keeps the midnight default.
+        let day_only = parse_simple_yaml("rotate:\n  day: wed\n");
+        let (boundary, _) = rotation_boundary_from_config(&day_only);
+        assert_eq!(boundary.day, Weekday::Wed);
+        assert_eq!(boundary.time, NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_rotation_boundary_from_config_invalid_values_warn_and_default() {
+        let map = parse_simple_yaml("rotate:\n  day: funday\n  time: half past ten\n");
+        let (boundary, warnings) = rotation_boundary_from_config(&map);
+        assert_eq!(boundary, RotationBoundary::default());
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings.iter().any(|w| w.contains("funday")));
+    }
+
+    #[test]
+    fn test_load_rotation_boundary_missing_and_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("timesheet.yml");
+        assert_eq!(load_rotation_boundary(&path), RotationBoundary::default());
+
+        fs::write(&path, "rotate:\n  day: monday\n").unwrap();
+        assert_eq!(
+            load_rotation_boundary(&path),
+            RotationBoundary {
+                day: Weekday::Mon,
+                time: NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_maybe_rotate_respects_configured_boundary() {
+        // Sunday-boundary weeks and Monday-boundary weeks disagree about Sunday: an entry made
+        // on Sunday is "this week" under the default and "last week" once rotation moves to Monday.
+        let sunday = local_datetime_at(
+            NaiveDate::from_ymd_opt(2023, 11, 12).unwrap(),
+            NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
+        );
+        let monday = sunday + chrono::Duration::days(1);
+        let monday_boundary = RotationBoundary {
+            day: Weekday::Mon,
+            time: NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+        };
+        assert!(sunday >= week_start_with(monday, RotationBoundary::default()));
+        assert!(sunday < week_start_with(monday, monday_boundary));
     }
 
     #[test]
