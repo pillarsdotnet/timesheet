@@ -19,14 +19,21 @@
 //!
 //! ## Configuration
 //!
-//! Optional settings live in `$HOME/.config/timesheet.yml` (see [`config_path`]). Currently the
-//! only setting is `rotate`, which says when a new timesheet week begins — the boundary at which
-//! the log is automatically rotated (default Sunday 00:00 local):
+//! Optional settings live in `$HOME/.config/timesheet.yml` (see [`config_path`]). `rotate` says
+//! when a new timesheet week begins — the boundary at which the log is automatically rotated
+//! (default Sunday 00:00 local). The rest supply defaults for `pdf` and `email`, and may be
+//! written at the top level or, under `prefixes:`, per job tag; see [`settings`] and the
+//! CONFIGURATION section of the man page.
 //!
 //! ```yaml
 //! rotate:
 //!   day: monday
 //!   time: "00:00"
+//! name: "Jane Contractor"
+//! prefixes:
+//!   ST:
+//!     template: "~/Documents/timesheet-fillable.pdf"
+//!     to: "timesheets@employer.example"
 //! ```
 //!
 //! ## Subcommands
@@ -36,11 +43,13 @@
 //! | `alias`    | Interactively replace activity text in this week's START entries (regex). |
 //! | `autostart` | Register `ts start` on login and `ts stop` on logout/shutdown (macOS/Linux). |
 //! | `edit`     | Open the timesheet log in `$EDITOR` (then `$VISUAL`, else `vi`). |
+//! | `email`    | Fill the timesheet PDF as `pdf` does and mail it as an attachment. |
 //! | `help`     | Show the man page in a pager (groff -man -Tascii \| less). |
 //! | `install`  | Copy binary and icon to a directory on PATH (icon embedded on macOS). |
 //! | `interval` | Set or show reminder daemon interval (e.g. 3, 3m, 100s, 1h30m). |
 //! | `list`     | Report % per activity and hours per weekday; optional file/extension arg, date, or negative rotated-log index. |
 //! | `migrate`  | Convert all timesheet.* files in the log directory to strict ISO 8601 timestamps. |
+//! | `pdf`      | Fill a form-fillable PDF template with one week of the timesheet; optional file/date/index arg selects the week. |
 //! | `sprint`   | Report % per activity and hours per weekday across the current log plus the most recently rotated log. |
 //! | `tail`     | Last 10 log entries with timestamps in local time; optional file/extension arg. |
 //! | `manpage`  | Output Unix manual page in groff format to stdout. |
@@ -76,8 +85,15 @@ use std::process::{self, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+mod mail;
+mod pdf;
 #[cfg(target_os = "macos")]
 mod reminder_dialog_macos;
+mod report;
+mod settings;
+mod yaml;
+
+use yaml::{strip_yaml_comment, unquote_yaml_scalar};
 
 /// Default path segment under `$HOME` for the timesheet log file.
 const DEFAULT_TIMESHEET: &str = "Documents/timesheet.log";
@@ -355,34 +371,6 @@ fn config_path() -> PathBuf {
         }
     }
     yml
-}
-
-/// Strips an unquoted `#` comment from a config line.
-fn strip_yaml_comment(line: &str) -> &str {
-    let bytes = line.as_bytes();
-    let mut quote: Option<u8> = None;
-    for (i, &b) in bytes.iter().enumerate() {
-        match quote {
-            Some(q) if b == q => quote = None,
-            Some(_) => {}
-            None if b == b'"' || b == b'\'' => quote = Some(b),
-            None if b == b'#' => return &line[..i],
-            None => {}
-        }
-    }
-    line
-}
-
-/// Removes matching surrounding single or double quotes.
-fn unquote_yaml_scalar(s: &str) -> &str {
-    let bytes = s.as_bytes();
-    if bytes.len() >= 2 {
-        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
-        if (first == b'"' || first == b'\'') && first == last {
-            return &s[1..s.len() - 1];
-        }
-    }
-    s
 }
 
 /// Parses the supported YAML subset: `key: value` pairs, `#` comments, optional quotes, and one
@@ -2114,6 +2102,9 @@ ts \- timesheet CLI (start, stop, list, report by activity and weekday)
 .B ts autostart
 .RI [ uninstall ]
 .PP
+.B ts email
+.RI [ options "] [" week ]
+.PP
 .B ts help
 .PP
 .B ts install
@@ -2133,6 +2124,9 @@ ts \- timesheet CLI (start, stop, list, report by activity and weekday)
 .RI [ file_or_extension ]
 .PP
 .B ts manpage
+.PP
+.B ts pdf
+.RI [ options "] [" week ]
 .PP
 .B ts rebuild
 .RI [ directory ]
@@ -2176,11 +2170,20 @@ Optional settings are read from
 .BR $HOME/.config/timesheet.yml
 (see
 .BR FILES ).
-The file is missing by default and every setting has a default, so no configuration is required.
+The file is missing by default and every setting except the
+.B pdf
+and
+.B email
+template has a default, so no configuration is required to track time.
 Only a small YAML subset is understood:
 .BR "key: value" " pairs, " #
-comments, optional quotes, and one level of indented nesting. Unknown keys are ignored;
-an unusable value prints a warning on stderr and the default is used.
+comments, optional quotes, indented nesting, and sequences (either
+.B "- item"
+lines or
+.BR "[a, b]" ).
+Unknown keys are ignored; an unusable value prints a warning on stderr and the default is
+used. Quote a value whose leading or trailing spaces matter, such as
+.BR "separator: \(dq; \(dq" .
 .PP
 .B "rotate"
 selects when a new timesheet week begins \(em the boundary at which
@@ -2208,6 +2211,119 @@ that runs Monday through Sunday:
 rotate:
   day: monday
   time: "00:00"
+.fi
+.RE
+.PP
+The remaining settings supply defaults for
+.B pdf
+and
+.BR email .
+Each may be written at the top level or under
+.BR "prefixes: " \(-> " " PREFIX ,
+in which case it applies only when that prefix is in use; a per-prefix value wins over the
+top-level one, and a command-line option wins over both. This is what lets a single log
+serve several jobs.
+.TP
+.B name
+Full name, as it should appear on the timesheet. Required by
+.B pdf
+and
+.BR email .
+.TP
+.B prefix
+Default for
+.BR \-\-prefix .
+When absent and exactly one prefix is listed under
+.BR prefixes ,
+that one is used.
+.TP
+.B template
+Default for
+.BR \-\-template :
+the path to the form-fillable PDF. There is no built-in default.
+.TP
+.B output
+Default for
+.BR \-\-output .
+When absent,
+.B pdf
+writes to standard output.
+.TP
+.BR activity ", " separator ", " zero
+Defaults for
+.BR \-\-activity ", " \-\-separator " and " \-\-zero .
+.TP
+.BR to ", " cc
+Default recipients, each either one address or a sequence of them.
+.TP
+.BR from ", " reply
+Default sender and Reply-To addresses.
+.TP
+.BR subject ", " body
+Templates for the message, taking the same placeholders as
+.BR \-\-output ,
+plus
+.BR {total_hours} .
+.TP
+.BR min_font_size ", " max_font_size
+Shrink-to-fit range in points (default 5 and 10). Long descriptions step down from the
+maximum toward the minimum.
+.TP
+.B fields
+Maps each timesheet slot to a form-field name in the template. The slots are
+.BR contractor_name ,
+.BR week_start_month / day / year ,
+.BR week_end_month / day / year ,
+.IR weekday _hours
+and
+.IR weekday _activities
+for each of the seven weekdays, and
+.BR total_hours .
+Values default to the field names of the stock form, and any listed here replace only the
+slots they name. The field names of another form can be listed with
+.BR "mutool show form.pdf form | grep Name:" .
+.TP
+.BR smtp_host ", " smtp_port ", " smtp_starttls
+Relay to submit through (default
+.BR localhost :25).
+.B smtp_starttls
+defaults to true on port 587 and false elsewhere.
+.TP
+.BR smtp_user ", " smtp_password_command
+Credentials for a relay that requires them. Leave
+.B smtp_user
+unset for an unauthenticated relay; otherwise set
+.B smtp_password_command
+to a shell command that prints the password, so that no secret is stored in the config
+file, e.g.\&
+.BR "pass show smtp/me@example.com" .
+A Gmail or Workspace account wants
+.BR smtp.gmail.com :587
+with STARTTLS, the full address as
+.BR smtp_user ,
+and an App Password \(em an account password is rejected.
+.PP
+A configuration for one job, tagged
+.B ST
+in the activity descriptions:
+.PP
+.RS
+.nf
+# ~/.config/timesheet.yml
+name: "Jane Contractor"
+from: "jane@example.com"
+smtp_host: "smtp.gmail.com"
+smtp_port: 587
+smtp_user: "jane@example.com"
+smtp_password_command: "pass show smtp/jane"
+prefixes:
+  ST:
+    template: "~/Documents/timesheet-fillable.pdf"
+    output: "timesheet_Jane_{week_start}-{week_end}.pdf"
+    separator: "; "
+    zero: ""
+    reply: "jane@employer.example"
+    to: "timesheets@employer.example"
 .fi
 .RE
 .SH "AUTOMATIC ROTATION"
@@ -2373,6 +2489,114 @@ in your editor, taken from
 .BR $VISUAL ,
 else
 .BR vi ).
+.TP
+.BI "pdf " "[options] [week]"
+Fill a form-fillable PDF template with one week of the timesheet and write it out.
+.IP
+The optional
+.I week
+argument selects which week to report, taking the same forms as
+.BR list :
+a log file path,
+.B log
+for the current log, a negative rotated-log index
+.RB ( -1
+is the most recently rotated), or a date
+.RB ( YYYYMMDD ", " YYMMDD ", " M/D )
+falling in the wanted week. With no argument, the week in progress is reported on its final
+day and the most recently completed week on any other day \(em so a run late on the last day
+of the week, or at any time in the days after it, both report the week just worked.
+.IP
+Hours are credited to the day each session started on, matching
+.BR list ,
+and the printed total is the sum of the day figures as rounded, so the column adds up. Every
+log is read, so a week that straddles a rotation still reports in full. Options:
+.RS
+.TP
+.BR \-p ", " \-\-prefix " " \fIPREFIX\fR
+Report only activities beginning
+.IR PREFIX :
+(the prefix followed by a colon), and strip that tag from the description that reaches the
+timesheet, so an entry logged as
+.B ST:Setup Jira
+is reported as
+.BR "Setup Jira" .
+Entries without the tag belong to another job and are excluded entirely, their hours as well
+as their descriptions. An empty
+.I PREFIX
+reports every entry unchanged, while still reading the settings of the prefix the
+configuration would otherwise have selected.
+.TP
+.BR \-o ", " \-\-output " " \fIFILE\fR
+Write the PDF to
+.I FILE
+instead of standard output; an existing directory receives the default file name, and
+.B \-
+forces standard output.
+.I FILE
+may contain
+.BR {date} ", " {week_start} ", " {week_end} ", " {name} " and " {prefix} ,
+which are replaced before the file is opened.
+.TP
+.BR \-t ", " \-\-template " " \fIFILE\fR
+The form-fillable PDF to fill.
+.TP
+.BR \-a ", " \-\-activity " " \fITEMPLATE\fR
+Text for one reported activity, taking
+.B {activity}
+and
+.B {hours}
+(default
+.BR {activity} ).
+.TP
+.BR \-s ", " \-\-separator " " \fISTRING\fR
+Separator between adjacent activities within a day (default
+.BR "\(dq; \(dq" ).
+.TP
+.BR \-z ", " \-\-zero " " \fISTRING\fR
+Hours text for a day with no recorded work (default empty, which leaves the cell blank).
+.RE
+.IP
+Text is shrunk to fit its cell and, in the activity columns, wrapped; a description that
+cannot fit even at the minimum size warns on stderr and is clipped. Writing a PDF to a
+terminal is refused.
+.TP
+.BI "email " "[options] [week]"
+Fill the timesheet as
+.B pdf
+does and mail it as an attachment. Takes every
+.B pdf
+option except that
+.B \-t
+means
+.B \-\-to
+here, so the template is named with
+.B \-\-template
+or
+.BR \-T .
+Additional options:
+.RS
+.TP
+.BR \-t ", " \-\-to " " \fIADDRESS\fR
+Recipient. May be repeated, and may take a comma-separated list.
+.TP
+.BR \-c ", " \-\-cc " " \fIADDRESS\fR
+Carbon-copy recipient, likewise repeatable.
+.TP
+.BR \-f ", " \-\-from " " \fIADDRESS\fR
+Sender address.
+.TP
+.BR \-r ", " \-\-reply " " \fIADDRESS\fR
+Reply-To address. Worth setting when the relay rewrites
+.B From
+\(em a Gmail account may only send as itself unless the address is a verified
+"Send mail as" alias \(em so that replies still reach the address you read.
+.RE
+.IP
+The relay, credentials, subject and body come from the configuration file (see
+.BR CONFIGURATION ).
+If the send fails the finished PDF is kept on disk rather than discarded, so the message can
+be retried without rebuilding a week that may have moved on.
 .TP
 .B sprint
 Plaintext report like
@@ -4516,6 +4740,8 @@ fn main() {
         Some("rebuild") => cmd_rebuild(&rest),
         Some("rotate") => do_rotate(&timesheet),
         Some("migrate") => cmd_migrate(&timesheet),
+        Some("pdf") => report::cmd_pdf(&rest, &timesheet),
+        Some("email") => report::cmd_email(&rest, &timesheet),
         Some("interval") => cmd_interval(&rest, &timesheet),
         Some("restart") | Some("reminder") => cmd_interval(&rest, &timesheet),
         Some("autostart") => cmd_autostart(&rest),
