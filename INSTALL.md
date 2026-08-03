@@ -26,6 +26,8 @@ cargo build --release
 
 The binary is written to `target/release/ts` (or `target/debug/ts` if you use `cargo build` without `--release`).
 
+The first build fetches crates from crates.io, so it needs network access; later builds do not. `ts pdf` and `ts email` bring in PDF and SMTP support (`lopdf` and `lettre`, the latter with rustls and bundled roots), which is most of the binary's size and of the build time. TLS is pure Rust, so no system OpenSSL or certificate store is required, on Linux or macOS.
+
 ### 2. Install the binary
 
 **Using the binary's install subcommand** (run from the repo so it can find itself):

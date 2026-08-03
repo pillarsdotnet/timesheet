@@ -2,13 +2,15 @@
 name = "ts"
 version = "0.1.0"
 edition = "2021"
-description = "Timesheet CLI: start, stop, list, started, timeoff, alias, rename, install, rotate, manpage"
+description = "Timesheet CLI: start, stop, list, started, timeoff, alias, rename, install, rotate, pdf, email, manpage"
 authors = ["Robert August Vincent II <pillarsdotnet@gmail.com>"]
 license = "MIT"
 
 [dependencies]
 chrono = "0.4"
+lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "builder", "rustls-tls"] }
 libc = "0.2"
+lopdf = { version = "0.44.0", default-features = false }
 regex = "1.10"
 
 [target.'cfg(target_os = "macos")'.dependencies]
