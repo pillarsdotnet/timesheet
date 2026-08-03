@@ -34,14 +34,116 @@ figure out how it works. For now I'm just glad that it does.
 
   `notify-send` (from `libnotify-bin`) is used for the "reminders stopped" notification, and `systemd --user` for `ts autostart`. With no chooser available at all, reminders fall back to recording a STOP at each interval and `ts start` defaults to misc/unspecified instead of prompting.
 
+- **`ts pdf` and `ts email`:** no extra runtime dependencies. PDF filling and SMTP (including STARTTLS, via rustls with bundled roots) are built into the binary; nothing needs to be installed alongside it. `ts email` runs `smtp_password_command` through `sh`, so whatever that command needs — `pass`, `secret-tool`, `op` — must be on PATH.
+
 ## Data format
 
-The log file contains one entry per line:
+The log file contains one entry per line. The timestamp is the **first** field, in strict ISO 8601 (RFC 3339) with microsecond precision and a local UTC offset:
 
-- `START|unix_epoch|activity`
-- `STOP|unix_epoch`
+- `ISO8601_timestamp|START|activity`
+- `ISO8601_timestamp|STOP`
 
-Start/stop pairs are matched in **LIFO order** (each STOP pairs with the most recent START). The report uses these pairs to compute duration and attribute time to activity and day of week.
+For example:
+
+```text
+2026-08-03T08:00:00.000000-04:00|START|ST:Welcome session
+2026-08-03T09:00:00.000000-04:00|STOP
+```
+
+The wall-clock time in the recorded offset is read back as local time without converting through UTC, so a log stays readable after a timezone change.
+
+Start/stop pairs are matched in **LIFO order** (each STOP pairs with the most recent START). A START also closes any session still open before it, so consecutive STARTs each contribute their own interval. The report uses these pairs to compute duration and attribute time to activity and day of week.
+
+Earlier versions wrote the kind first, as `START|ISO8601_timestamp|activity` and `STOP|ISO8601_timestamp`. **`ts migrate`** converts every `timesheet.*` file in the log directory to the current field order; lines already in it are left alone.
+
+## Configuration
+
+Optional settings live in **`~/.config/timesheet.yml`** (or `$XDG_CONFIG_HOME/timesheet.yml`; `$TS_CONFIG` overrides both, and a `timesheet.yaml` sibling is used if no `.yml` exists). The file does not exist by default, and every setting except the `pdf`/`email` template has a default, so no configuration is needed to track time.
+
+Only a small YAML subset is understood: `key: value` pairs, `#` comments, optional quotes, indented nesting, and sequences (either `- item` lines or `[a, b]`). Unknown keys are ignored, and a value that can't be understood prints a warning on stderr and falls back to the default. Quote a value whose leading or trailing spaces matter, such as `separator: "; "`.
+
+### `rotate` — when a new timesheet week begins
+
+`ts` rotates `timesheet.log` to `timesheet.YYMMDD` at the start of each week, so each rotated file holds exactly one work week. By default the week begins **Sunday at 00:00** local time. If your employer's week runs Monday through Sunday — rotating at midnight between Sunday night and Monday morning — say so:
+
+```yaml
+# ~/.config/timesheet.yml
+rotate:
+  day: monday
+  time: "00:00"
+```
+
+- **`day`** — weekday name or three-letter abbreviation, any case (`monday`, `Mon`, `SUNDAY`). Default: `sunday`.
+- **`time`** — `HH:MM`, `HH:MM:SS`, or a bare hour, in local time. Default: `00:00`.
+
+A scalar shorthand works too: `rotate: monday`, or `rotate: "fri 17:00"` for a week that turns over Friday at 5 pm.
+
+The rotation boundary is checked by `ts start`, `ts stop`, `ts started`, `ts timeoff` and the reminder daemon: if the log's last entry falls before the most recent boundary, the log is rotated before the new entry is recorded. `ts rotate` run by hand always rotates, whatever the boundary. The same boundary defines "this week" for `ts alias`, and the week that `ts pdf` and `ts email` report.
+
+### Settings for `ts pdf` and `ts email`
+
+Each of these may be written at the top level, or under `prefixes:` → _PREFIX_ so that it applies only when that prefix is in use. A per-prefix value beats the top-level one, and a command-line option beats both — which is how one log can serve several jobs, each tagging its activities (`ST:Setup Jira`) and keeping its own name, template, addresses and field map.
+
+| Setting                                   | Meaning                                                                                                                                 |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`                                    | Full name as it should appear on the timesheet. Required.                                                                               |
+| `prefix`                                  | Default for `--prefix`. When absent and exactly one prefix is listed under `prefixes:`, that one is used.                               |
+| `template`                                | Default for `--template`: path to the form-fillable PDF. No built-in default.                                                           |
+| `output`                                  | Default for `--output`. When absent, `ts pdf` writes to stdout.                                                                         |
+| `activity`, `separator`, `zero`           | Defaults for `--activity`, `--separator` and `--zero`.                                                                                  |
+| `to`, `cc`                                | Default recipients; each is either one address or a sequence of them.                                                                   |
+| `from`, `reply`                           | Default sender and Reply-To addresses.                                                                                                  |
+| `subject`, `body`                         | Message templates, taking the same placeholders as `output` plus `{total_hours}`.                                                       |
+| `min_font_size`, `max_font_size`          | Shrink-to-fit range in points (default 5 and 10).                                                                                       |
+| `fields`                                  | Maps each timesheet slot to a form-field name. Defaults suit the stock form; anything listed here replaces only the slots it names.     |
+| `smtp_host`, `smtp_port`, `smtp_starttls` | Relay to submit through (default `localhost:25`). `smtp_starttls` defaults to true on port 587 and false elsewhere.                     |
+| `smtp_user`, `smtp_password_command`      | Credentials, if the relay wants them. `smtp_password_command` is a shell command that prints the password, so no secret is stored here. |
+
+The slots that `fields` maps are `contractor_name`, `week_start_month`/`_day`/`_year`, `week_end_month`/`_day`/`_year`, `<weekday>_hours` and `<weekday>_activities` for each of the seven weekdays, and `total_hours`. The field names of a different form can be listed with `mutool show form.pdf form | grep Name:`.
+
+```yaml
+# ~/.config/timesheet.yml
+name: "Jane Contractor"
+from: "jane@example.com"
+smtp_host: "smtp.gmail.com"
+smtp_port: 587
+smtp_user: "jane@example.com"
+smtp_password_command: "pass show smtp/jane"
+prefixes:
+  ST:
+    template: "~/Documents/timesheet-fillable.pdf"
+    output: "timesheet_Jane_{week_start}-{week_end}.pdf"
+    separator: "; "
+    zero: ""
+    reply: "jane@employer.example"
+    to: "timesheets@employer.example"
+```
+
+A Gmail or Google Workspace account needs `smtp.gmail.com` on port 587 with STARTTLS, the full address as `smtp_user`, and an **App Password** — an account password is rejected. Gmail also rewrites `From` to the authenticated account unless the address is a verified "Send mail as" alias, so set `reply` when the two differ; `ts email` warns if you have not.
+
+## Filling and sending the timesheet
+
+`ts pdf` aggregates one week and fills a form-fillable PDF with it; `ts email` does the same and mails the result as an attachment.
+
+```console
+ts pdf > timesheet.pdf          # the week just worked, to stdout
+ts pdf -o ~/Documents           # into a directory, using the configured file name
+ts pdf -1                       # the most recently rotated week
+ts pdf 260727                   # the week containing 2026-07-27
+ts email                        # fill and send in one step
+```
+
+The optional week argument takes the same forms as `ts list`: a log file path, `log` for the current log, a negative rotated-log index (`-1` is the most recently rotated), or a date (`YYYYMMDD`, `YYMMDD`, `M/D`). With no argument, the week in progress is reported on its final day and the most recently completed week on any other day — so a run late on the last day of the week, or at any time in the days after it, both report the week just worked.
+
+Hours are credited to the day each session started on, exactly as `ts list` accounts for them, and the printed total is the sum of the day figures **as rounded**, so the column adds up on paper. Every log is read, so a week that straddles a rotation still reports in full.
+
+`--prefix ST` reports only activities beginning `ST:` and strips that tag, so an entry logged as `ST:Setup Jira` is reported as `Setup Jira`. Entries without the tag belong to another job and are left out entirely — their hours as well as their descriptions. An empty prefix (`-p ""`) reports every entry unchanged, while still reading the settings of the prefix the configuration would otherwise have selected — so the template and addresses need not be restated.
+
+`--output` accepts `{date}`, `{week_start}`, `{week_end}`, `{name}` and `{prefix}`, an existing directory (which receives the configured file name), or `-` for stdout. Writing a PDF to a terminal is refused.
+
+Text is shrunk to fit its cell and, in the activity columns, wrapped; a description that cannot fit even at `min_font_size` warns on stderr and is clipped. Appearance streams are generated rather than left to the viewer, so the filled text shows up in every reader, when printed, and to text extractors.
+
+If a send fails, the finished PDF is kept on disk rather than discarded, so the message can be retried without rebuilding a week that may have moved on.
 
 ## ts command
 
@@ -54,17 +156,20 @@ Subcommands (alphabetical):
 | `alias`     | Interactively replace activity text in START entries from the current week. Matches the search text literally first; if nothing matches and the search text is a valid regex, falls back to regex search-and-replace.                                                                                                                                                                                        |
 | `autostart` | Register `ts start` on login and `ts stop` on logout/shutdown (macOS: LaunchAgents + logout hook; Linux: systemd user units + a system-level logout hook). Optional first argument: interval (e.g. `5s`, `3m`) to set reminder interval and start the daemon in this session. Without interval: starts the daemon if needed and shows the current reminder interval. Use `ts autostart uninstall` to remove. |
 | `edit`      | Open the timesheet log (`$HOME/Documents/timesheet.log`) in your editor, taken from `$EDITOR` (then `$VISUAL`, else `vi`).                                                                                                                                                                                                                                                                                   |
+| `email`     | Fill the timesheet PDF as `pdf` does and mail it as an attachment. Takes every `pdf` option, except that `-t` means `--to` here (the template is `--template` or `-T`), plus `-c/--cc`, `-f/--from` and `-r/--reply`. See [Filling and sending the timesheet](#filling-and-sending-the-timesheet).                                                                                                           |
 | `help`      | Show the manual page in a pager (groff -man -Tascii \| less).                                                                                                                                                                                                                                                                                                                                                |
 | `install`   | Copy the binary (and on macOS the embedded icon as `ts-icon.svg`) to a directory on PATH. Optional: `ts install [install_dir] [repo_path]`. Works without the source repo on macOS (icon is embedded).                                                                                                                                                                                                       |
 | `interval`  | Set or show the reminder daemon interval (e.g. `3`, `3m`, `100s`, `1h30m`). With an argument, sets the interval and restarts the daemon.                                                                                                                                                                                                                                                                     |
 | `list`      | Plaintext report: % time per activity, hours per day of week; optional file/extension, date, or negative rotated-log index (e.g. `ts list 2/19`, `ts list 260220`, `ts list -1`) to select a log. If work in progress, shows current task and duration.                                                                                                                                                      |
 | `manpage`   | Output the Unix manual page in groff format to stdout.                                                                                                                                                                                                                                                                                                                                                       |
+| `pdf`       | Fill a form-fillable PDF template with one week of the timesheet and write it to a file or to stdout. Optional file/extension, date, or negative rotated-log index selects the week, exactly as for `list`. Options: `-p/--prefix`, `-o/--output`, `-t/--template`, `-a/--activity`, `-s/--separator`, `-z/--zero`. See [Filling and sending the timesheet](#filling-and-sending-the-timesheet).             |
+| `prefix`    | Prepend `<prefix>:` to this week's activities matching a pattern. `ts prefix foo bar` is equivalent to `ts alias bar foo:bar`, prompting per match just like `alias`.                                                                                                                                                                                                                                        |
 | `rebuild`   | Build from source and install into the directory of the running binary. Optional directory argument; see `ts help`.                                                                                                                                                                                                                                                                                          |
 | `uninstall` | Stop the reminder daemon, remove autostart hooks, optionally remove timesheet log files, then remove `ts-icon.svg` and the `ts` binary from the install directory.                                                                                                                                                                                                                                           |
 | `rename`    | Same as `alias`.                                                                                                                                                                                                                                                                                                                                                                                             |
 | `reminder`  | Alias for `interval`.                                                                                                                                                                                                                                                                                                                                                                                        |
 | `restart`   | Alias for `interval` (with no argument, reports current interval and restarts the daemon).                                                                                                                                                                                                                                                                                                                   |
-| `rotate`    | Rename `timesheet.log` to `timesheet.YYMMDD` using the earliest entry's date; if last entry is START, appends a STOP no later than one reminder interval after that entry first. If a file for that date already exists, appends to it.                                                                                                                                                                      |
+| `rotate`    | Rename `timesheet.log` to `timesheet.YYMMDD` using the earliest entry's date; if last entry is START, appends a STOP no later than one reminder interval after that entry first. If a file for that date already exists, appends to it. Happens automatically at the start of each week — see [Configuration](#rotate--when-a-new-timesheet-week-begins).                                                    |
 | `start`     | Record work start **now**. With no activity: shows the reminder dialog to pick/enter an activity (macOS, or Linux with `kdialog`/`zenity` installed); otherwise defaults to misc/unspecified. Starts the reminder daemon if not already running.                                                                                                                                                             |
 | `started`   | Record a work start at a **past time**. Args: `ts started <start_time> [activity...]`. Time formats: e.g. `YYYY-MM-DD HH:MM`, `HH:MM`, or GNU date -d style.                                                                                                                                                                                                                                                 |
 | `stop`      | Record work stop at **now** or at an optional stop time. If the last entry is already STOP and no time is given, nothing happens; if a time is given, the last STOP is amended. If the last entry is START, appends the new STOP. When a stop is recorded, stops the reminder daemon and shows a dialog that reminders have been stopped (skipped during logout/shutdown).                                   |

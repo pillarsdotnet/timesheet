@@ -26,6 +26,8 @@ cargo build --release
 
 The binary is written to `target/release/ts` (or `target/debug/ts` if you use `cargo build` without `--release`).
 
+The first build fetches crates from crates.io, so it needs network access; later builds do not. `ts pdf` and `ts email` bring in PDF and SMTP support (`lopdf` and `lettre`, the latter with rustls and bundled roots), which is most of the binary's size and of the build time. TLS is pure Rust, so no system OpenSSL or certificate store is required, on Linux or macOS.
+
 ### 2. Install the binary
 
 **Using the binary's install subcommand** (run from the repo so it can find itself):
@@ -59,6 +61,18 @@ You can pass an interval (e.g. **`ts autostart 5s`**) to set the reminder interv
 
 The default log file is **`$HOME/Documents/timesheet.log`**. To change it, edit `DEFAULT_TIMESHEET` in `src/main.rs` and rebuild.
 
+Runtime settings are optional and live in **`$HOME/.config/timesheet.yml`** (no file is created by the install). `rotate` controls when a new timesheet week starts — for example, a work week that runs Monday through Sunday:
+
+```yaml
+rotate:
+  day: monday
+  time: "00:00"
+```
+
+Everything else in that file supplies defaults for `ts pdf` and `ts email` — the contractor name, the PDF template, the recipients, and the relay to send through — and may be written per job under `prefixes:`. Those two subcommands are the only ones that need any configuration at all: `template:` has no default, so name it there or pass `--template`.
+
+See the **Configuration** section of `README.md`, or `ts help`, for the full description.
+
 ## Verifying the installation
 
 From any directory (with the install directory on your `PATH`):
@@ -73,6 +87,12 @@ If the log file does not exist yet, you should see "No timesheet data found." Ot
 ts start "test activity"
 ts list
 ts stop
+```
+
+Once `name:` and `template:` are configured, check that the PDF side works too:
+
+```sh
+ts pdf -o /tmp/timesheet.pdf
 ```
 
 ## Building Rust documentation

@@ -17,6 +17,25 @@
 //!
 //! Start/stop pairs are matched in LIFO order (each STOP pairs with the most recent START).
 //!
+//! ## Configuration
+//!
+//! Optional settings live in `$HOME/.config/timesheet.yml` (see [`config_path`]). `rotate` says
+//! when a new timesheet week begins — the boundary at which the log is automatically rotated
+//! (default Sunday 00:00 local). The rest supply defaults for `pdf` and `email`, and may be
+//! written at the top level or, under `prefixes:`, per job tag; see [`settings`] and the
+//! CONFIGURATION section of the man page.
+//!
+//! ```yaml
+//! rotate:
+//!   day: monday
+//!   time: "00:00"
+//! name: "Jane Contractor"
+//! prefixes:
+//!   ST:
+//!     template: "~/Documents/timesheet-fillable.pdf"
+//!     to: "timesheets@employer.example"
+//! ```
+//!
 //! ## Subcommands
 //!
 //! | Command    | Description |
@@ -24,11 +43,14 @@
 //! | `alias`    | Interactively replace activity text in this week's START entries (regex). |
 //! | `autostart` | Register `ts start` on login and `ts stop` on logout/shutdown (macOS/Linux). |
 //! | `edit`     | Open the timesheet log in `$EDITOR` (then `$VISUAL`, else `vi`). |
+//! | `email`    | Fill the timesheet PDF as `pdf` does and mail it as an attachment. |
 //! | `help`     | Show the man page in a pager (groff -man -Tascii \| less). |
 //! | `install`  | Copy binary and icon to a directory on PATH (icon embedded on macOS). |
 //! | `interval` | Set or show reminder daemon interval (e.g. 3, 3m, 100s, 1h30m). |
 //! | `list`     | Report % per activity and hours per weekday; optional file/extension arg, date, or negative rotated-log index. |
 //! | `migrate`  | Convert all timesheet.* files in the log directory to strict ISO 8601 timestamps. |
+//! | `pdf`      | Fill a form-fillable PDF template with one week of the timesheet; optional file/date/index arg selects the week. |
+//! | `prefix`   | `ts prefix foo bar` is `ts alias bar foo:bar`: prepend `foo:` to this week's activities matching `bar`. |
 //! | `sprint`   | Report % per activity and hours per weekday across the current log plus the most recently rotated log. |
 //! | `tail`     | Last 10 log entries with timestamps in local time; optional file/extension arg. |
 //! | `manpage`  | Output Unix manual page in groff format to stdout. |
@@ -42,7 +64,9 @@
 //! | `timeoff`  | Show stop time for 8 h/day average; only requires a START entry (adds one if log empty or last is STOP). |
 //! | `uninstall` | Stop daemon, remove autostart hooks, optionally remove log files, remove binary and icon. |
 
-use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat};
+use chrono::{
+    DateTime, Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat, Weekday,
+};
 #[cfg(target_os = "macos")]
 use libc::getuid;
 #[cfg(unix)]
@@ -62,8 +86,15 @@ use std::process::{self, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+mod mail;
+mod pdf;
 #[cfg(target_os = "macos")]
 mod reminder_dialog_macos;
+mod report;
+mod settings;
+mod yaml;
+
+use yaml::{strip_yaml_comment, unquote_yaml_scalar};
 
 /// Default path segment under `$HOME` for the timesheet log file.
 const DEFAULT_TIMESHEET: &str = "Documents/timesheet.log";
@@ -305,17 +336,201 @@ fn append_stop_entry(timesheet: &Path, dt: DateTime<Local>) -> Result<(), String
     append_log_entry(timesheet, &format_stop_log_entry(dt))
 }
 
-/// DateTime of Sunday 00:00:00 for the week containing `now` (local time).
+/// When a new timesheet week begins: the weekday and local time of day at which
+/// [`maybe_rotate_if_previous_week`] rotates the log. Configurable in `timesheet.yml`
+/// (see [`config_path`]); defaults to Sunday 00:00.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RotationBoundary {
+    day: Weekday,
+    time: NaiveTime,
+}
+
+impl Default for RotationBoundary {
+    fn default() -> Self {
+        RotationBoundary {
+            day: Weekday::Sun,
+            time: NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+        }
+    }
+}
+
+/// Config file path: `$TS_CONFIG`, else `$XDG_CONFIG_HOME/timesheet.yml`, else
+/// `$HOME/.config/timesheet.yml`. A `timesheet.yaml` sibling is used when no `.yml` exists.
+fn config_path() -> PathBuf {
+    if let Some(p) = env::var_os("TS_CONFIG") {
+        return PathBuf::from(p);
+    }
+    let dir = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let yml = dir.join("timesheet.yml");
+    if !yml.exists() {
+        let yaml = dir.join("timesheet.yaml");
+        if yaml.exists() {
+            return yaml;
+        }
+    }
+    yml
+}
+
+/// Parses the supported YAML subset: `key: value` pairs, `#` comments, optional quotes, and one
+/// level of nested mapping. Nested keys are returned dotted (`rotate: {day: monday}` becomes
+/// `rotate.day` -> `monday`). Keys are lowercased; anything else in the file is ignored.
+fn parse_simple_yaml(text: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let mut section: Option<String> = None;
+    for raw in text.lines() {
+        let line = strip_yaml_comment(raw);
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "---" {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        let value = unquote_yaml_scalar(value.trim()).trim().to_string();
+        if indent == 0 {
+            section = if value.is_empty() {
+                Some(key.clone())
+            } else {
+                None
+            };
+            if !value.is_empty() {
+                map.insert(key, value);
+            }
+        } else {
+            match &section {
+                Some(sec) => {
+                    map.insert(format!("{}.{}", sec, key), value);
+                }
+                None => {
+                    map.insert(key, value);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Parses a weekday name (full or three-letter abbreviation, any case).
+fn parse_weekday(s: &str) -> Option<Weekday> {
+    s.trim().parse::<Weekday>().ok()
+}
+
+/// Parses a time of day: `HH:MM`, `HH:MM:SS`, or a bare hour (`0`, `9`).
+fn parse_time_of_day(s: &str) -> Option<NaiveTime> {
+    let s = s.trim();
+    if let Ok(h) = s.parse::<u32>() {
+        return NaiveTime::from_hms_opt(h, 0, 0);
+    }
+    NaiveTime::parse_from_str(s, "%H:%M:%S")
+        .or_else(|_| NaiveTime::parse_from_str(s, "%H:%M"))
+        .ok()
+}
+
+/// Reads the rotation boundary out of a parsed config, collecting a message for each bad value.
+/// Accepted forms: `rotate: monday`, `rotate: "monday 09:00"`, or a `rotate:` mapping with
+/// `day:` and/or `time:` keys. Missing or invalid values fall back to the default (Sunday 00:00).
+fn rotation_boundary_from_config(
+    map: &std::collections::HashMap<String, String>,
+) -> (RotationBoundary, Vec<String>) {
+    let mut boundary = RotationBoundary::default();
+    let mut warnings = Vec::new();
+
+    // Scalar shorthand: `rotate: monday` or `rotate: monday 09:00`.
+    if let Some(scalar) = map.get("rotate") {
+        let mut fields = scalar.split_whitespace();
+        match fields.next().and_then(parse_weekday) {
+            Some(day) => boundary.day = day,
+            None => warnings.push(format!("rotate: unrecognized weekday \"{}\"", scalar)),
+        }
+        if let Some(rest) = fields.next() {
+            match parse_time_of_day(rest) {
+                Some(time) => boundary.time = time,
+                None => warnings.push(format!("rotate: unrecognized time \"{}\"", rest)),
+            }
+        }
+    }
+    if let Some(day) = map.get("rotate.day") {
+        match parse_weekday(day) {
+            Some(d) => boundary.day = d,
+            None => warnings.push(format!("rotate.day: unrecognized weekday \"{}\"", day)),
+        }
+    }
+    if let Some(time) = map.get("rotate.time") {
+        match parse_time_of_day(time) {
+            Some(t) => boundary.time = t,
+            None => warnings.push(format!("rotate.time: unrecognized time \"{}\"", time)),
+        }
+    }
+    (boundary, warnings)
+}
+
+/// Rotation boundary from `path`, or the default when the file is absent. Unreadable files and
+/// invalid values warn on stderr and fall back to the default rather than failing the command.
+fn load_rotation_boundary(path: &Path) -> RotationBoundary {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return RotationBoundary::default(),
+        Err(e) => {
+            eprintln!("ts: {}: {}; using default rotation", path.display(), e);
+            return RotationBoundary::default();
+        }
+    };
+    let (boundary, warnings) = rotation_boundary_from_config(&parse_simple_yaml(&text));
+    for w in warnings {
+        eprintln!("ts: {}: {}", path.display(), w);
+    }
+    boundary
+}
+
+/// The configured rotation boundary (see [`config_path`]).
+fn rotation_boundary() -> RotationBoundary {
+    load_rotation_boundary(&config_path())
+}
+
+/// Resolves a local wall-clock date and time to an instant, tolerating daylight-saving
+/// transitions: an ambiguous time uses the earlier instant, and a time that does not exist
+/// (spring-forward gap) advances to the first instant that does.
+fn local_datetime_at(date: NaiveDate, time: NaiveTime) -> DateTime<Local> {
+    let naive = date.and_time(time);
+    for extra_minutes in [0, 15, 30, 45, 60, 90, 120, 180] {
+        let candidate = naive + chrono::Duration::minutes(extra_minutes);
+        match candidate.and_local_timezone(Local) {
+            chrono::LocalResult::Single(dt) => return dt,
+            chrono::LocalResult::Ambiguous(earliest, _) => return earliest,
+            chrono::LocalResult::None => continue,
+        }
+    }
+    naive.and_utc().with_timezone(&Local)
+}
+
+/// DateTime of the start of the timesheet week containing `now`: the most recent occurrence of
+/// the configured rotation boundary (default Sunday 00:00) at or before `now`, in local time.
 fn week_start(now: DateTime<Local>) -> DateTime<Local> {
-    let today = now.date_naive();
-    let dow = today.weekday().num_days_from_sunday() as u64;
-    today
-        .checked_sub_days(chrono::Days::new(dow))
-        .unwrap_or(today)
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_local_timezone(Local)
-        .unwrap()
+    week_start_with(now, rotation_boundary())
+}
+
+fn week_start_with(now: DateTime<Local>, boundary: RotationBoundary) -> DateTime<Local> {
+    let days_back =
+        (now.weekday().num_days_from_sunday() + 7 - boundary.day.num_days_from_sunday()) % 7;
+    let date = now.date_naive();
+    let date = date
+        .checked_sub_days(chrono::Days::new(days_back as u64))
+        .unwrap_or(date);
+    let start = local_datetime_at(date, boundary.time);
+    if start <= now {
+        return start;
+    }
+    // The boundary has not been reached yet today; the week began a week earlier.
+    let earlier = date.checked_sub_days(chrono::Days::new(7)).unwrap_or(date);
+    local_datetime_at(earlier, boundary.time)
 }
 
 /// Parses a timestamp field: strict ISO 8601 (RFC 3339) only.
@@ -512,7 +727,8 @@ fn do_rotate(timesheet: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// If the last log entry is from the previous week (before this week's Sunday 00:00), runs [`do_rotate`].
+/// If the last log entry is from the previous week (before the most recent rotation boundary —
+/// Sunday 00:00 unless `timesheet.yml` says otherwise), runs [`do_rotate`].
 fn maybe_rotate_if_previous_week(timesheet: &Path) -> Result<(), String> {
     if !timesheet.exists() {
         return Ok(());
@@ -1601,6 +1817,22 @@ fn cmd_workalias(args: &[String], timesheet: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Prepends "<prefix>:" to activities matching a pattern in this week's START entries.
+/// `ts prefix foo bar` is equivalent to `ts alias bar foo:bar`.
+fn cmd_prefix(args: &[String], timesheet: &Path) -> Result<(), String> {
+    let (prefix, pattern) = match args {
+        [p, t, ..] => (p.as_str(), t.as_str()),
+        _ => {
+            eprintln!("Usage: ts prefix <prefix> <pattern>");
+            return Err("missing args".to_string());
+        }
+    };
+    cmd_workalias(
+        &[pattern.to_string(), format!("{}:{}", prefix, pattern)],
+        timesheet,
+    )
+}
+
 /// Copies the binary to a directory on PATH (first writable) or the given directory.
 fn cmd_install(args: &[String]) -> Result<(), String> {
     let dest_dir = args.first().map(String::as_str);
@@ -1887,6 +2119,9 @@ ts \- timesheet CLI (start, stop, list, report by activity and weekday)
 .B ts autostart
 .RI [ uninstall ]
 .PP
+.B ts email
+.RI [ options "] [" week ]
+.PP
 .B ts help
 .PP
 .B ts install
@@ -1906,6 +2141,13 @@ ts \- timesheet CLI (start, stop, list, report by activity and weekday)
 .RI [ file_or_extension ]
 .PP
 .B ts manpage
+.PP
+.B ts pdf
+.RI [ options "] [" week ]
+.PP
+.B ts prefix
+.I prefix
+.I pattern
 .PP
 .B ts rebuild
 .RI [ directory ]
@@ -1944,6 +2186,184 @@ The log file is
 by default (compile-time constant
 .BR DEFAULT_TIMESHEET
 in source).
+.SH CONFIGURATION
+Optional settings are read from
+.BR $HOME/.config/timesheet.yml
+(see
+.BR FILES ).
+The file is missing by default and every setting except the
+.B pdf
+and
+.B email
+template has a default, so no configuration is required to track time.
+Only a small YAML subset is understood:
+.BR "key: value" " pairs, " #
+comments, optional quotes, indented nesting, and sequences (either
+.B "- item"
+lines or
+.BR "[a, b]" ).
+Unknown keys are ignored; an unusable value prints a warning on stderr and the default is
+used. Quote a value whose leading or trailing spaces matter, such as
+.BR "separator: \(dq; \(dq" .
+.PP
+.B "rotate"
+selects when a new timesheet week begins \(em the boundary at which
+.B ts
+automatically rotates the log (see
+.BR "AUTOMATIC ROTATION" ).
+It takes a mapping with
+.B day
+(weekday name or three-letter abbreviation, any case) and
+.B time
+(HH:MM, HH:MM:SS, or a bare hour), or a scalar shorthand
+.RB ( "rotate: monday" ", " "rotate: \(dqfri 17:00\(dq" ).
+Defaults:
+.B day
+Sunday,
+.B time
+00:00 (local time).
+.PP
+Rotating at midnight between Sunday night and Monday morning \(em i.e.\& a work week
+that runs Monday through Sunday:
+.PP
+.RS
+.nf
+# ~/.config/timesheet.yml
+rotate:
+  day: monday
+  time: "00:00"
+.fi
+.RE
+.PP
+The remaining settings supply defaults for
+.B pdf
+and
+.BR email .
+Each may be written at the top level or under
+.BR "prefixes: " \(-> " " PREFIX ,
+in which case it applies only when that prefix is in use; a per-prefix value wins over the
+top-level one, and a command-line option wins over both. This is what lets a single log
+serve several jobs.
+.TP
+.B name
+Full name, as it should appear on the timesheet. Required by
+.B pdf
+and
+.BR email .
+.TP
+.B prefix
+Default for
+.BR \-\-prefix .
+When absent and exactly one prefix is listed under
+.BR prefixes ,
+that one is used.
+.TP
+.B template
+Default for
+.BR \-\-template :
+the path to the form-fillable PDF. There is no built-in default.
+.TP
+.B output
+Default for
+.BR \-\-output .
+When absent,
+.B pdf
+writes to standard output.
+.TP
+.BR activity ", " separator ", " zero
+Defaults for
+.BR \-\-activity ", " \-\-separator " and " \-\-zero .
+.TP
+.BR to ", " cc
+Default recipients, each either one address or a sequence of them.
+.TP
+.BR from ", " reply
+Default sender and Reply-To addresses.
+.TP
+.BR subject ", " body
+Templates for the message, taking the same placeholders as
+.BR \-\-output ,
+plus
+.BR {total_hours} .
+.TP
+.BR min_font_size ", " max_font_size
+Shrink-to-fit range in points (default 5 and 10). Long descriptions step down from the
+maximum toward the minimum.
+.TP
+.B fields
+Maps each timesheet slot to a form-field name in the template. The slots are
+.BR contractor_name ,
+.BR week_start_month / day / year ,
+.BR week_end_month / day / year ,
+.IR weekday _hours
+and
+.IR weekday _activities
+for each of the seven weekdays, and
+.BR total_hours .
+Values default to the field names of the stock form, and any listed here replace only the
+slots they name. The field names of another form can be listed with
+.BR "mutool show form.pdf form | grep Name:" .
+.TP
+.BR smtp_host ", " smtp_port ", " smtp_starttls
+Relay to submit through (default
+.BR localhost :25).
+.B smtp_starttls
+defaults to true on port 587 and false elsewhere.
+.TP
+.BR smtp_user ", " smtp_password_command
+Credentials for a relay that requires them. Leave
+.B smtp_user
+unset for an unauthenticated relay; otherwise set
+.B smtp_password_command
+to a shell command that prints the password, so that no secret is stored in the config
+file, e.g.\&
+.BR "pass show smtp/me@example.com" .
+A Gmail or Workspace account wants
+.BR smtp.gmail.com :587
+with STARTTLS, the full address as
+.BR smtp_user ,
+and an App Password \(em an account password is rejected.
+.PP
+A configuration for one job, tagged
+.B ST
+in the activity descriptions:
+.PP
+.RS
+.nf
+# ~/.config/timesheet.yml
+name: "Jane Contractor"
+from: "jane@example.com"
+smtp_host: "smtp.gmail.com"
+smtp_port: 587
+smtp_user: "jane@example.com"
+smtp_password_command: "pass show smtp/jane"
+prefixes:
+  ST:
+    template: "~/Documents/timesheet-fillable.pdf"
+    output: "timesheet_Jane_{week_start}-{week_end}.pdf"
+    separator: "; "
+    zero: ""
+    reply: "jane@employer.example"
+    to: "timesheets@employer.example"
+.fi
+.RE
+.SH "AUTOMATIC ROTATION"
+.B start,
+.B stop,
+.B started,
+.B timeoff
+and the reminder daemon first check whether the log's last entry predates the most recent
+rotation boundary (by default Sunday 00:00; see
+.BR CONFIGURATION ).
+If so, they run
+.B rotate
+before recording anything, so each
+.B timesheet.YYMMDD
+file holds exactly one work week. The
+.B rotate
+command itself always rotates, regardless of the boundary. The boundary also defines
+"this week" for
+.BR alias .
 .SH "LOG FORMAT"
 One entry per line. The timestamp is the first field, strict ISO 8601 (e.g. 2026-03-06T14:30:00-08:00).
 .TP
@@ -2091,6 +2511,114 @@ in your editor, taken from
 else
 .BR vi ).
 .TP
+.BI "pdf " "[options] [week]"
+Fill a form-fillable PDF template with one week of the timesheet and write it out.
+.IP
+The optional
+.I week
+argument selects which week to report, taking the same forms as
+.BR list :
+a log file path,
+.B log
+for the current log, a negative rotated-log index
+.RB ( -1
+is the most recently rotated), or a date
+.RB ( YYYYMMDD ", " YYMMDD ", " M/D )
+falling in the wanted week. With no argument, the week in progress is reported on its final
+day and the most recently completed week on any other day \(em so a run late on the last day
+of the week, or at any time in the days after it, both report the week just worked.
+.IP
+Hours are credited to the day each session started on, matching
+.BR list ,
+and the printed total is the sum of the day figures as rounded, so the column adds up. Every
+log is read, so a week that straddles a rotation still reports in full. Options:
+.RS
+.TP
+.BR \-p ", " \-\-prefix " " \fIPREFIX\fR
+Report only activities beginning
+.IR PREFIX :
+(the prefix followed by a colon), and strip that tag from the description that reaches the
+timesheet, so an entry logged as
+.B ST:Setup Jira
+is reported as
+.BR "Setup Jira" .
+Entries without the tag belong to another job and are excluded entirely, their hours as well
+as their descriptions. An empty
+.I PREFIX
+reports every entry unchanged, while still reading the settings of the prefix the
+configuration would otherwise have selected.
+.TP
+.BR \-o ", " \-\-output " " \fIFILE\fR
+Write the PDF to
+.I FILE
+instead of standard output; an existing directory receives the default file name, and
+.B \-
+forces standard output.
+.I FILE
+may contain
+.BR {date} ", " {week_start} ", " {week_end} ", " {name} " and " {prefix} ,
+which are replaced before the file is opened.
+.TP
+.BR \-t ", " \-\-template " " \fIFILE\fR
+The form-fillable PDF to fill.
+.TP
+.BR \-a ", " \-\-activity " " \fITEMPLATE\fR
+Text for one reported activity, taking
+.B {activity}
+and
+.B {hours}
+(default
+.BR {activity} ).
+.TP
+.BR \-s ", " \-\-separator " " \fISTRING\fR
+Separator between adjacent activities within a day (default
+.BR "\(dq; \(dq" ).
+.TP
+.BR \-z ", " \-\-zero " " \fISTRING\fR
+Hours text for a day with no recorded work (default empty, which leaves the cell blank).
+.RE
+.IP
+Text is shrunk to fit its cell and, in the activity columns, wrapped; a description that
+cannot fit even at the minimum size warns on stderr and is clipped. Writing a PDF to a
+terminal is refused.
+.TP
+.BI "email " "[options] [week]"
+Fill the timesheet as
+.B pdf
+does and mail it as an attachment. Takes every
+.B pdf
+option except that
+.B \-t
+means
+.B \-\-to
+here, so the template is named with
+.B \-\-template
+or
+.BR \-T .
+Additional options:
+.RS
+.TP
+.BR \-t ", " \-\-to " " \fIADDRESS\fR
+Recipient. May be repeated, and may take a comma-separated list.
+.TP
+.BR \-c ", " \-\-cc " " \fIADDRESS\fR
+Carbon-copy recipient, likewise repeatable.
+.TP
+.BR \-f ", " \-\-from " " \fIADDRESS\fR
+Sender address.
+.TP
+.BR \-r ", " \-\-reply " " \fIADDRESS\fR
+Reply-To address. Worth setting when the relay rewrites
+.B From
+\(em a Gmail account may only send as itself unless the address is a verified
+"Send mail as" alias \(em so that replies still reach the address you read.
+.RE
+.IP
+The relay, credentials, subject and body come from the configuration file (see
+.BR CONFIGURATION ).
+If the send fails the finished PDF is kept on disk rather than discarded, so the message can
+be retried without rebuilding a week that may have moved on.
+.TP
 .B sprint
 Plaintext report like
 .BR list ,
@@ -2144,6 +2672,19 @@ clones
 .B https://github.com/pillarsdotnet/timesheet
 and builds from the clone.
 .TP
+.B prefix
+Prepend
+.IB prefix :
+to this week's activities matching
+.IR pattern .
+.B ts prefix foo bar
+is equivalent to
+.BR "ts alias bar foo:bar" ,
+so matching and the
+.B Replace\ (y/n/a)
+prompt work exactly as for
+.BR alias .
+.TP
 .B rename
 Same as
 .BR alias .
@@ -2162,6 +2703,8 @@ Rename the timesheet log to
 .B timesheet.YYMMDD
 using the timestamp of the log's earliest entry (START or STOP).
 Errors if the log is missing or has no valid entries.
+Rotation also happens on its own at the start of each week; see
+.BR "AUTOMATIC ROTATION" .
 .TP
 .B start
 Record work start
@@ -2226,10 +2769,34 @@ and reminder daemon start/kill (e.g.
 If set (any value), suppresses the "reminders stopped" dialog when
 .B ts\ stop
 is invoked (used by autostart scripts during logout/shutdown).
+.TP
+.B TS_CONFIG
+Path to the configuration file, overriding the default location (see
+.BR FILES ).
+.TP
+.B XDG_CONFIG_HOME
+Configuration directory searched for
+.B timesheet.yml
+when
+.B TS_CONFIG
+is unset; defaults to
+.BR $HOME/.config .
 .SH FILES
 .B $HOME/Documents/timesheet.log
 Default timesheet log (path is compile-time in
 .BR DEFAULT_TIMESHEET ).
+.TP
+.B $XDG_CONFIG_HOME/timesheet.yml
+or
+.B $HOME/.config/timesheet.yml
+Optional settings; see
+.BR CONFIGURATION .
+A
+.B timesheet.yaml
+sibling is used if no
+.B timesheet.yml
+exists. Overridden by
+.BR $TS_CONFIG .
 .TP
 .B $XDG_CACHE_HOME/ts-reminder-interval
 or
@@ -4202,11 +4769,14 @@ fn main() {
         Some("timeoff") => cmd_timeoff(&timesheet),
         Some("alias") => cmd_workalias(&rest, &timesheet),
         Some("rename") => cmd_workalias(&rest, &timesheet),
+        Some("prefix") => cmd_prefix(&rest, &timesheet),
         Some("install") => cmd_install(&rest),
         Some("uninstall") => cmd_uninstall(&rest),
         Some("rebuild") => cmd_rebuild(&rest),
         Some("rotate") => do_rotate(&timesheet),
         Some("migrate") => cmd_migrate(&timesheet),
+        Some("pdf") => report::cmd_pdf(&rest, &timesheet),
+        Some("email") => report::cmd_email(&rest, &timesheet),
         Some("interval") => cmd_interval(&rest, &timesheet),
         Some("restart") | Some("reminder") => cmd_interval(&rest, &timesheet),
         Some("autostart") => cmd_autostart(&rest),
@@ -4367,10 +4937,176 @@ mod tests {
     fn test_week_start() {
         // 2023-11-14 12:00:00 UTC-ish Tuesday -> week start is Sunday 2023-11-12 00:00:00 local
         let tuesday = Local.timestamp_opt(1700000000, 0).single().unwrap();
-        let week_start_dt = week_start(tuesday);
+        let week_start_dt = week_start_with(tuesday, RotationBoundary::default());
         assert_eq!(week_start_dt.weekday(), chrono::Weekday::Sun);
         assert_eq!(week_start_dt.hour(), 0);
         assert_eq!(week_start_dt.minute(), 0);
+        assert!(week_start_dt <= tuesday);
+    }
+
+    #[test]
+    fn test_week_start_with_monday_boundary() {
+        let boundary = RotationBoundary {
+            day: Weekday::Mon,
+            time: NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+        };
+        // Tuesday 2023-11-14 -> Monday 2023-11-13 00:00 local.
+        let tuesday = Local.timestamp_opt(1700000000, 0).single().unwrap();
+        let start = week_start_with(tuesday, boundary);
+        assert_eq!(start.weekday(), Weekday::Mon);
+        assert_eq!((start.hour(), start.minute()), (0, 0));
+        assert_eq!(tuesday.signed_duration_since(start).num_days(), 1);
+
+        // Sunday belongs to the week that began the previous Monday, not the coming one.
+        let sunday = tuesday - chrono::Duration::days(2);
+        assert_eq!(sunday.weekday(), Weekday::Sun);
+        let start = week_start_with(sunday, boundary);
+        assert_eq!(start.weekday(), Weekday::Mon);
+        assert!(start < sunday);
+        assert_eq!(sunday.signed_duration_since(start).num_days(), 6);
+    }
+
+    #[test]
+    fn test_week_start_before_boundary_time_uses_previous_week() {
+        let boundary = RotationBoundary {
+            day: Weekday::Mon,
+            time: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+        };
+        // Monday 08:00 local is still the previous week when the boundary is Monday 09:00.
+        let monday_8am = local_datetime_at(
+            NaiveDate::from_ymd_opt(2023, 11, 13).unwrap(),
+            NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
+        );
+        let start = week_start_with(monday_8am, boundary);
+        assert_eq!(start.weekday(), Weekday::Mon);
+        assert_eq!(start.hour(), 9);
+        assert_eq!(monday_8am.signed_duration_since(start).num_days(), 6);
+
+        // One hour later, the new week has begun.
+        let monday_10am = monday_8am + chrono::Duration::hours(2);
+        let start = week_start_with(monday_10am, boundary);
+        assert_eq!(start.hour(), 9);
+        assert_eq!(monday_10am.signed_duration_since(start).num_hours(), 1);
+    }
+
+    #[test]
+    fn test_week_start_exactly_on_boundary() {
+        let boundary = RotationBoundary::default();
+        let sunday_midnight = local_datetime_at(
+            NaiveDate::from_ymd_opt(2023, 11, 12).unwrap(),
+            NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+        );
+        assert_eq!(week_start_with(sunday_midnight, boundary), sunday_midnight);
+    }
+
+    #[test]
+    fn test_parse_simple_yaml_nested_and_comments() {
+        let text = "\
+# rotation settings
+rotate:
+  day: Monday   # start of the work week
+  time: \"00:00\"
+other: value
+";
+        let map = parse_simple_yaml(text);
+        assert_eq!(map.get("rotate.day").map(String::as_str), Some("Monday"));
+        assert_eq!(map.get("rotate.time").map(String::as_str), Some("00:00"));
+        assert_eq!(map.get("other").map(String::as_str), Some("value"));
+        assert!(!map.contains_key("rotate"));
+    }
+
+    #[test]
+    fn test_parse_simple_yaml_ignores_hash_inside_quotes() {
+        let map = parse_simple_yaml("note: \"a # b\"\n");
+        assert_eq!(map.get("note").map(String::as_str), Some("a # b"));
+    }
+
+    #[test]
+    fn test_parse_weekday_and_time_of_day() {
+        assert_eq!(parse_weekday("monday"), Some(Weekday::Mon));
+        assert_eq!(parse_weekday("MON"), Some(Weekday::Mon));
+        assert_eq!(parse_weekday(" Sunday "), Some(Weekday::Sun));
+        assert_eq!(parse_weekday("funday"), None);
+        assert_eq!(parse_time_of_day("9"), NaiveTime::from_hms_opt(9, 0, 0));
+        assert_eq!(
+            parse_time_of_day("09:30"),
+            NaiveTime::from_hms_opt(9, 30, 0)
+        );
+        assert_eq!(
+            parse_time_of_day("23:59:59"),
+            NaiveTime::from_hms_opt(23, 59, 59)
+        );
+        assert_eq!(parse_time_of_day("noon"), None);
+        assert_eq!(parse_time_of_day("25:00"), None);
+    }
+
+    #[test]
+    fn test_rotation_boundary_from_config_forms() {
+        let nested = parse_simple_yaml("rotate:\n  day: monday\n  time: 09:30\n");
+        let (boundary, warnings) = rotation_boundary_from_config(&nested);
+        assert!(warnings.is_empty());
+        assert_eq!(boundary.day, Weekday::Mon);
+        assert_eq!(boundary.time, NaiveTime::from_hms_opt(9, 30, 0).unwrap());
+
+        let scalar = parse_simple_yaml("rotate: monday\n");
+        let (boundary, warnings) = rotation_boundary_from_config(&scalar);
+        assert!(warnings.is_empty());
+        assert_eq!(boundary.day, Weekday::Mon);
+        assert_eq!(boundary.time, NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+
+        let scalar_with_time = parse_simple_yaml("rotate: \"fri 17:00\"\n");
+        let (boundary, warnings) = rotation_boundary_from_config(&scalar_with_time);
+        assert!(warnings.is_empty());
+        assert_eq!(boundary.day, Weekday::Fri);
+        assert_eq!(boundary.time, NaiveTime::from_hms_opt(17, 0, 0).unwrap());
+
+        // Only `day` given: time keeps the midnight default.
+        let day_only = parse_simple_yaml("rotate:\n  day: wed\n");
+        let (boundary, _) = rotation_boundary_from_config(&day_only);
+        assert_eq!(boundary.day, Weekday::Wed);
+        assert_eq!(boundary.time, NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_rotation_boundary_from_config_invalid_values_warn_and_default() {
+        let map = parse_simple_yaml("rotate:\n  day: funday\n  time: half past ten\n");
+        let (boundary, warnings) = rotation_boundary_from_config(&map);
+        assert_eq!(boundary, RotationBoundary::default());
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings.iter().any(|w| w.contains("funday")));
+    }
+
+    #[test]
+    fn test_load_rotation_boundary_missing_and_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("timesheet.yml");
+        assert_eq!(load_rotation_boundary(&path), RotationBoundary::default());
+
+        fs::write(&path, "rotate:\n  day: monday\n").unwrap();
+        assert_eq!(
+            load_rotation_boundary(&path),
+            RotationBoundary {
+                day: Weekday::Mon,
+                time: NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_maybe_rotate_respects_configured_boundary() {
+        // Sunday-boundary weeks and Monday-boundary weeks disagree about Sunday: an entry made
+        // on Sunday is "this week" under the default and "last week" once rotation moves to Monday.
+        let sunday = local_datetime_at(
+            NaiveDate::from_ymd_opt(2023, 11, 12).unwrap(),
+            NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
+        );
+        let monday = sunday + chrono::Duration::days(1);
+        let monday_boundary = RotationBoundary {
+            day: Weekday::Mon,
+            time: NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+        };
+        assert!(sunday >= week_start_with(monday, RotationBoundary::default()));
+        assert!(sunday < week_start_with(monday, monday_boundary));
     }
 
     #[test]
@@ -5333,6 +6069,45 @@ mod tests {
         fs::File::create(&log_path).unwrap();
         let result = cmd_workalias(&["pattern".to_string()], &log_path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cmd_prefix_missing_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        fs::File::create(&log_path).unwrap();
+        assert!(cmd_prefix(&[], &log_path).is_err());
+        assert!(cmd_prefix(&["foo".to_string()], &log_path).is_err());
+    }
+
+    /// "ts prefix foo bar" searches for "bar" (not "foo:bar"), like "ts alias bar foo:bar".
+    #[test]
+    fn test_cmd_prefix_searches_for_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        let week_start = week_start(Local::now());
+        fs::write(
+            &log_path,
+            format!(
+                "{}|START|other\n{}|STOP\n",
+                fmt_ts(week_start.timestamp()),
+                fmt_ts(week_start.timestamp() + 100)
+            ),
+        )
+        .unwrap();
+        let err = cmd_prefix(&["foo".to_string(), "bar".to_string()], &log_path).unwrap_err();
+        assert!(err.contains("\"bar\""), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn test_cmd_prefix_replacement_is_prefixed_pattern() {
+        let week_start = week_start(Local::now());
+        let week_end = week_start + chrono::Duration::weeks(1) - chrono::Duration::seconds(1);
+        let content = format!("{}|START|bar\n", fmt_ts(week_start.timestamp()));
+        let matches_vec =
+            collect_workalias_matches(&content, week_start, week_end, "bar", "foo:bar");
+        assert_eq!(matches_vec.len(), 1);
+        assert_eq!(matches_vec[0].replacement, "foo:bar");
     }
 
     #[test]
