@@ -50,6 +50,7 @@
 //! | `list`     | Report % per activity and hours per weekday; optional file/extension arg, date, or negative rotated-log index. |
 //! | `migrate`  | Convert all timesheet.* files in the log directory to strict ISO 8601 timestamps. |
 //! | `pdf`      | Fill a form-fillable PDF template with one week of the timesheet; optional file/date/index arg selects the week. |
+//! | `prefix`   | `ts prefix foo bar` is `ts alias bar foo:bar`: prepend `foo:` to this week's activities matching `bar`. |
 //! | `sprint`   | Report % per activity and hours per weekday across the current log plus the most recently rotated log. |
 //! | `tail`     | Last 10 log entries with timestamps in local time; optional file/extension arg. |
 //! | `manpage`  | Output Unix manual page in groff format to stdout. |
@@ -1816,6 +1817,22 @@ fn cmd_workalias(args: &[String], timesheet: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Prepends "<prefix>:" to activities matching a pattern in this week's START entries.
+/// `ts prefix foo bar` is equivalent to `ts alias bar foo:bar`.
+fn cmd_prefix(args: &[String], timesheet: &Path) -> Result<(), String> {
+    let (prefix, pattern) = match args {
+        [p, t, ..] => (p.as_str(), t.as_str()),
+        _ => {
+            eprintln!("Usage: ts prefix <prefix> <pattern>");
+            return Err("missing args".to_string());
+        }
+    };
+    cmd_workalias(
+        &[pattern.to_string(), format!("{}:{}", prefix, pattern)],
+        timesheet,
+    )
+}
+
 /// Copies the binary to a directory on PATH (first writable) or the given directory.
 fn cmd_install(args: &[String]) -> Result<(), String> {
     let dest_dir = args.first().map(String::as_str);
@@ -2127,6 +2144,10 @@ ts \- timesheet CLI (start, stop, list, report by activity and weekday)
 .PP
 .B ts pdf
 .RI [ options "] [" week ]
+.PP
+.B ts prefix
+.I prefix
+.I pattern
 .PP
 .B ts rebuild
 .RI [ directory ]
@@ -2650,6 +2671,19 @@ is omitted and the current directory has no
 clones
 .B https://github.com/pillarsdotnet/timesheet
 and builds from the clone.
+.TP
+.B prefix
+Prepend
+.IB prefix :
+to this week's activities matching
+.IR pattern .
+.B ts prefix foo bar
+is equivalent to
+.BR "ts alias bar foo:bar" ,
+so matching and the
+.B Replace\ (y/n/a)
+prompt work exactly as for
+.BR alias .
 .TP
 .B rename
 Same as
@@ -4735,6 +4769,7 @@ fn main() {
         Some("timeoff") => cmd_timeoff(&timesheet),
         Some("alias") => cmd_workalias(&rest, &timesheet),
         Some("rename") => cmd_workalias(&rest, &timesheet),
+        Some("prefix") => cmd_prefix(&rest, &timesheet),
         Some("install") => cmd_install(&rest),
         Some("uninstall") => cmd_uninstall(&rest),
         Some("rebuild") => cmd_rebuild(&rest),
@@ -6034,6 +6069,45 @@ other: value
         fs::File::create(&log_path).unwrap();
         let result = cmd_workalias(&["pattern".to_string()], &log_path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cmd_prefix_missing_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        fs::File::create(&log_path).unwrap();
+        assert!(cmd_prefix(&[], &log_path).is_err());
+        assert!(cmd_prefix(&["foo".to_string()], &log_path).is_err());
+    }
+
+    /// "ts prefix foo bar" searches for "bar" (not "foo:bar"), like "ts alias bar foo:bar".
+    #[test]
+    fn test_cmd_prefix_searches_for_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        let week_start = week_start(Local::now());
+        fs::write(
+            &log_path,
+            format!(
+                "{}|START|other\n{}|STOP\n",
+                fmt_ts(week_start.timestamp()),
+                fmt_ts(week_start.timestamp() + 100)
+            ),
+        )
+        .unwrap();
+        let err = cmd_prefix(&["foo".to_string(), "bar".to_string()], &log_path).unwrap_err();
+        assert!(err.contains("\"bar\""), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn test_cmd_prefix_replacement_is_prefixed_pattern() {
+        let week_start = week_start(Local::now());
+        let week_end = week_start + chrono::Duration::weeks(1) - chrono::Duration::seconds(1);
+        let content = format!("{}|START|bar\n", fmt_ts(week_start.timestamp()));
+        let matches_vec =
+            collect_workalias_matches(&content, week_start, week_end, "bar", "foo:bar");
+        assert_eq!(matches_vec.len(), 1);
+        assert_eq!(matches_vec[0].replacement, "foo:bar");
     }
 
     #[test]
