@@ -59,6 +59,16 @@ You can pass an interval (e.g. **`ts autostart 5s`**) to set the reminder interv
 
 The default log file is **`$HOME/Documents/timesheet.log`**. To change it, edit `DEFAULT_TIMESHEET` in `src/main.rs` and rebuild.
 
+Runtime settings are optional and live in **`$HOME/.config/timesheet.yml`** (no file is created by the install). The one setting today is `rotate`, which controls when a new timesheet week starts — for example, a work week that runs Monday through Sunday:
+
+```yaml
+rotate:
+  day: monday
+  time: "00:00"
+```
+
+See the **Configuration** section of `README.md`, or `ts help`, for the full description.
+
 ## Verifying the installation
 
 From any directory (with the install directory on your `PATH`):
