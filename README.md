@@ -38,12 +38,23 @@ figure out how it works. For now I'm just glad that it does.
 
 ## Data format
 
-The log file contains one entry per line:
+The log file contains one entry per line. The timestamp is the **first** field, in strict ISO 8601 (RFC 3339) with microsecond precision and a local UTC offset:
 
-- `START|unix_epoch|activity`
-- `STOP|unix_epoch`
+- `ISO8601_timestamp|START|activity`
+- `ISO8601_timestamp|STOP`
 
-Start/stop pairs are matched in **LIFO order** (each STOP pairs with the most recent START). The report uses these pairs to compute duration and attribute time to activity and day of week.
+For example:
+
+```text
+2026-08-03T08:00:00.000000-04:00|START|ST:Welcome session
+2026-08-03T09:00:00.000000-04:00|STOP
+```
+
+The wall-clock time in the recorded offset is read back as local time without converting through UTC, so a log stays readable after a timezone change.
+
+Start/stop pairs are matched in **LIFO order** (each STOP pairs with the most recent START). A START also closes any session still open before it, so consecutive STARTs each contribute their own interval. The report uses these pairs to compute duration and attribute time to activity and day of week.
+
+Earlier versions wrote the kind first, as `START|ISO8601_timestamp|activity` and `STOP|ISO8601_timestamp`. **`ts migrate`** converts every `timesheet.*` file in the log directory to the current field order; lines already in it are left alone.
 
 ## Configuration
 
