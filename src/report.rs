@@ -109,7 +109,7 @@ fn busiest_week(work: &[Session], boundary: RotationBoundary) -> Option<DateTime
 /// Strips the job prefix from an activity, or returns `None` when the entry belongs to
 /// another job and should be left out of this timesheet entirely — its hours as well as its
 /// description. With no prefix configured, every entry counts and none is rewritten.
-fn strip_prefix<'a>(activity: &'a str, prefix: Option<&str>) -> Option<&'a str> {
+pub fn strip_prefix<'a>(activity: &'a str, prefix: Option<&str>) -> Option<&'a str> {
     match prefix {
         None => Some(activity.trim()),
         Some(prefix) => activity

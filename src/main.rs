@@ -47,7 +47,7 @@
 //! | `help`     | Show the man page in a pager (groff -man -Tascii \| less). |
 //! | `install`  | Copy binary and icon to a directory on PATH (icon embedded on macOS). |
 //! | `interval` | Set or show reminder daemon interval (e.g. 3, 3m, 100s, 1h30m). |
-//! | `list`     | Report % per activity and hours per weekday; optional file/extension arg, date, or negative rotated-log index. |
+//! | `list`     | Report % per activity and hours per weekday; optional file/extension arg, date, or negative rotated-log index; `-p/--prefix` reports one job only. |
 //! | `migrate`  | Convert all timesheet.* files in the log directory to strict ISO 8601 timestamps. |
 //! | `pdf`      | Fill a form-fillable PDF template with one week of the timesheet; optional file/date/index arg selects the week. |
 //! | `prefix`   | `ts prefix foo bar` is `ts alias bar foo:bar`: prepend `foo:` to this week's activities matching `bar`. |
@@ -1420,16 +1420,99 @@ fn cmd_edit(timesheet: &Path) -> Result<(), String> {
     }
 }
 
-fn cmd_list(list_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
+/// Parsed command line for `ts list`: at most one week selector plus the options.
+struct ListArgs {
+    input: Option<String>,
+    /// `None` when no filtering was asked for; an empty `--prefix` reports every entry.
+    prefix: Option<String>,
+}
+
+/// Parses `ts list`'s arguments. The selector may be a negative rotated-log index, so a
+/// leading dash followed by digits is a positional rather than an option, and `--` forces
+/// what follows to be positional.
+fn parse_list_args(args: &[String]) -> Result<ListArgs, String> {
+    let mut input: Option<String> = None;
+    let mut prefix: Option<String> = None;
+    let mut positional_only = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = args[index].clone();
+        index += 1;
+        let negative_index = arg.len() > 1 && arg[1..].chars().all(|c| c.is_ascii_digit());
+        if positional_only || !arg.starts_with('-') || arg == "-" || negative_index {
+            if input.is_some() {
+                return Err(format!(
+                    "ts list: unexpected extra argument \"{}\"; only one week may be selected",
+                    arg
+                ));
+            }
+            input = Some(arg);
+            continue;
+        }
+        if arg == "--" {
+            positional_only = true;
+            continue;
+        }
+
+        let (name, inline) = match arg.strip_prefix("--").and_then(|r| r.split_once('=')) {
+            Some((name, value)) => (format!("--{}", name), Some(value.to_string())),
+            None => (arg.clone(), None),
+        };
+        match name.as_str() {
+            "-p" | "--prefix" => {
+                let value = match inline {
+                    Some(v) => v,
+                    None => {
+                        let v = args
+                            .get(index)
+                            .cloned()
+                            .ok_or_else(|| format!("ts list: {} needs a value", name))?;
+                        index += 1;
+                        v
+                    }
+                };
+                prefix = Some(value);
+            }
+            other => return Err(format!("ts list: unknown option \"{}\"", other)),
+        }
+    }
+    Ok(ListArgs { input, prefix })
+}
+
+/// Keeps only the sessions tagged with `prefix:`, stripping the tag from the description.
+/// A START belonging to another job becomes a plain STOP, so it still closes the session
+/// before it while contributing no hours of its own.
+fn filter_lines_by_prefix(lines: &[(usize, LogLine)], prefix: &str) -> Vec<(usize, LogLine)> {
+    lines
+        .iter()
+        .map(|(n, ll)| match ll {
+            LogLine::Start(dt, activity) => match report::strip_prefix(activity, Some(prefix)) {
+                Some(label) => (*n, LogLine::Start(*dt, label.to_string())),
+                None => (*n, LogLine::Stop(*dt)),
+            },
+            LogLine::Stop(dt) => (*n, LogLine::Stop(*dt)),
+        })
+        .collect()
+}
+
+fn cmd_list(args: &[String], timesheet: &Path) -> Result<(), String> {
     if env::var_os("TS_DEBUG").is_some() {
         let _ = std::io::stderr().write_all(b"ts: cmd_list entered\n");
     }
+    let parsed = parse_list_args(args)?;
+    let list_arg = parsed.input.as_deref();
     let list_input = resolve_list_input(list_arg, timesheet)?;
     if !list_input.exists() {
         println!("No timesheet data found.");
         return Ok(());
     }
     let lines = read_log_lines(&list_input)?;
+    // An empty `--prefix` asks for every entry, so it filters nothing.
+    let lines = match parsed.prefix.as_deref() {
+        Some(prefix) if !prefix.is_empty() => filter_lines_by_prefix(&lines, prefix),
+        _ => lines,
+    };
     let is_current = list_arg.is_none() || list_arg == Some("log");
     let current_task = if is_current {
         last_start_entry(&lines)
@@ -2133,7 +2216,7 @@ ts \- timesheet CLI (start, stop, list, report by activity and weekday)
 .RI [ duration ]
 .PP
 .B ts list
-.RI [ file_or_extension ]
+.RI [ options "] [" file_or_extension ]
 .PP
 .B ts sprint
 .PP
@@ -2500,6 +2583,26 @@ selects the most recently rotated
 .BR timesheet.YYMMDD ,
 .B -2
 the one before that, and so on.
+Options:
+.RS
+.TP
+.BR \-p ", " \-\-prefix " " \fIPREFIX\fR
+Report only activities beginning
+.IR PREFIX :
+(the prefix followed by a colon), and strip that tag from the reported description, so an
+entry logged as
+.B ST:Setup Jira
+is reported as
+.BR "Setup Jira" ,
+exactly as
+.B pdf
+reports it. Entries without the tag belong to another job and are excluded entirely, their
+hours as well as their descriptions. Unlike
+.BR pdf ", " list
+consults no configuration for this: without the option every activity is reported, as is an
+empty
+.IR PREFIX .
+.RE
 .TP
 .B edit
 Open the timesheet log
@@ -4761,7 +4864,7 @@ fn main() {
         Some("start") => cmd_start(&rest, &timesheet),
         Some("stop") => cmd_stop(&rest, &timesheet),
         Some("stopped") => cmd_stop(&rest, &timesheet),
-        Some("list") => cmd_list(rest.first().map(String::as_str), &timesheet),
+        Some("list") => cmd_list(&rest, &timesheet),
         Some("edit") => cmd_edit(&timesheet),
         Some("sprint") => cmd_sprint(&timesheet),
         Some("tail") => cmd_tail(rest.first().map(String::as_str), &timesheet),
@@ -5630,6 +5733,55 @@ other: value
     }
 
     #[test]
+    fn list_options_and_week_selector_are_told_apart() {
+        let parse = |args: &[&str]| {
+            parse_list_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        let a = parse(&["-p", "ST"]).unwrap();
+        assert_eq!(a.prefix.as_deref(), Some("ST"));
+        assert_eq!(a.input, None);
+        let a = parse(&["--prefix=ST", "-1"]).unwrap();
+        assert_eq!(a.prefix.as_deref(), Some("ST"));
+        assert_eq!(a.input.as_deref(), Some("-1"));
+        // A rotated-log index stays a selector, and `--prefix ""` reports every entry.
+        let a = parse(&["-2", "--prefix", ""]).unwrap();
+        assert_eq!(a.prefix.as_deref(), Some(""));
+        assert_eq!(a.input.as_deref(), Some("-2"));
+        assert!(parse(&["-p"]).is_err());
+        assert!(parse(&["-x"]).is_err());
+        assert!(parse(&["log", "20250101"]).is_err());
+        // `--` forces a positional, so a file really named `-p` can be selected.
+        let a = parse(&["--", "-p"]).unwrap();
+        assert_eq!(a.input.as_deref(), Some("-p"));
+        assert_eq!(a.prefix, None);
+    }
+
+    #[test]
+    fn the_list_prefix_excludes_other_jobs_hours_and_descriptions() {
+        let at = |s: i64| Local.timestamp_opt(s, 0).single().unwrap();
+        let lines = vec![
+            (1, LogLine::Start(at(1000), "ST:Setup Jira".to_string())),
+            // Another job's START closes the tagged session without counting itself...
+            (2, LogLine::Start(at(4600), "OT:Other work".to_string())),
+            (3, LogLine::Stop(at(8200))),
+        ];
+        let filtered = filter_lines_by_prefix(&lines, "ST");
+        let rendered = render_report(&filtered, None, None, false);
+        assert!(rendered.contains("100.0%  1.00h  Setup Jira"));
+        assert!(!rendered.contains("Other work"));
+        // ...and an untagged entry is excluded the same way.
+        let untagged = vec![
+            (1, LogLine::Start(at(1000), "misc".to_string())),
+            (2, LogLine::Stop(at(4600))),
+        ];
+        let filtered = filter_lines_by_prefix(&untagged, "ST");
+        assert_eq!(
+            render_report(&filtered, None, None, false),
+            "No work recorded.\n"
+        );
+    }
+
+    #[test]
     fn test_parse_start_time_ymd_hm() {
         let dt = parse_start_time("2025-02-20 09:00");
         assert!(dt.is_some());
@@ -5843,7 +5995,7 @@ other: value
     fn test_cmd_list_no_file() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("timesheet.log");
-        let result = cmd_list(None, &log_path);
+        let result = cmd_list(&[], &log_path);
         assert!(result.is_ok());
     }
 
@@ -5860,7 +6012,7 @@ other: value
             ),
         )
         .unwrap();
-        let result = cmd_list(None, &log_path);
+        let result = cmd_list(&[], &log_path);
         assert!(result.is_ok());
     }
 
