@@ -24,11 +24,12 @@ fn mailbox(address: &str, setting: &str) -> Result<Mailbox, String> {
 /// This happens before connecting: a locked keyring is a configuration problem rather than a
 /// mail problem, and a pinentry prompt wants the terminal to itself.
 fn read_password(command: &str) -> Result<String, String> {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .output()
-        .map_err(|e| format!("ts: smtp_password_command failed to run: {}", e))?;
+    let output = if cfg!(windows) {
+        Command::new("cmd").arg("/C").arg(command).output()
+    } else {
+        Command::new("sh").arg("-c").arg(command).output()
+    }
+    .map_err(|e| format!("ts: smtp_password_command failed to run: {}", e))?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let detail = if detail.is_empty() {

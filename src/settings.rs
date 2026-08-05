@@ -119,12 +119,16 @@ pub struct Settings {
     pub smtp_password_command: Option<String>,
 }
 
-/// Expands a leading `~` to `$HOME`. Paths in the config are written by hand, so `~` is
-/// expected to work there even though no shell has touched them.
+/// Expands a leading `~` to `$HOME` (or the platform home directory, e.g. `%USERPROFILE%` on
+/// Windows). Paths in the config are written by hand, so `~` is expected to work there even
+/// though no shell has touched them.
 pub fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir);
+        if let Some(home) = home {
+            return home.join(rest);
         }
     }
     PathBuf::from(path)

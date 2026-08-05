@@ -41,10 +41,10 @@
 //! | Command    | Description |
 //! |------------|-------------|
 //! | `alias`    | Interactively replace activity text in this week's START entries (regex). |
-//! | `autostart` | Register `ts start` on login and `ts stop` on logout/shutdown (macOS/Linux). |
-//! | `edit`     | Open the timesheet log in `$EDITOR` (then `$VISUAL`, else `vi`). |
+//! | `autostart` | Register `ts start` on login and `ts stop` on logout/shutdown (macOS/Linux only). |
+//! | `edit`     | Open the timesheet log in `$EDITOR` (then `$VISUAL`, else `vi`; `notepad` on Windows). |
 //! | `email`    | Fill the timesheet PDF as `pdf` does and mail it as an attachment. |
-//! | `help`     | Show the man page in a pager (groff -man -Tascii \| less). |
+//! | `help`     | Show the man page in a pager (groff -man -Tascii \| less; plain text via `more` on Windows). |
 //! | `install`  | Copy binary and icon to a directory on PATH (icon embedded on macOS). |
 //! | `interval` | Set or show reminder daemon interval (e.g. 3, 3m, 100s, 1h30m). |
 //! | `list`     | Report % per activity and hours per weekday; optional file/extension arg, date, or negative rotated-log index; `-p/--prefix` reports one job only. |
@@ -58,7 +58,7 @@
 //! | `rename`   | Same as `alias`. |
 //! | `restart`, `reminder` | Aliases for `interval`. |
 //! | `rotate`   | Rename log to `timesheet.YYMMDD`; add STOP first if last entry is START; append if same-day exists. |
-//! | `start`    | Record work start now; with no activity, shows reminder chooser to pick/enter (macOS via AppKit; Linux via PyQt single-click chooser, falling back to kdialog/zenity); otherwise optional activity (default: misc/unspecified); adds a STOP first only when the open session is over one reminder interval old (otherwise the START closes it by itself); starts/restarts reminder daemon. |
+//! | `start`    | Record work start now; with no activity, shows reminder chooser to pick/enter (macOS via AppKit; Linux via PyQt single-click chooser, falling back to kdialog/zenity; no chooser on Windows, so it always defaults); otherwise optional activity (default: misc/unspecified); adds a STOP first only when the open session is over one reminder interval old (otherwise the START closes it by itself); starts/restarts reminder daemon (no-op on Windows). |
 //! | `started`  | Record a past start time; inserts at the correct chronological position without discarding entries. |
 //! | `stop`     | Record work stop (optional time); amends previous STOP if work already stopped; stops reminder daemon and shows "stopped" dialog when a stop is recorded (skipped during logout/shutdown). |
 //! | `timeoff`  | Show stop time for 8 h/day average; only requires a START entry (adds one if log empty or last is STOP). |
@@ -158,19 +158,24 @@ fn append_log_entry(timesheet: &Path, entry: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Returns the default timesheet path: `$HOME/Documents/timesheet.log`, or `./Documents/timesheet.log` if `HOME` is unset.
+/// Returns the default timesheet path: `$HOME/Documents/timesheet.log`, falling back to the
+/// platform home directory (e.g. `%USERPROFILE%` on Windows) when `HOME` is unset, or
+/// `./Documents/timesheet.log` if neither is available.
 fn timesheet_path() -> PathBuf {
     env::var_os("HOME")
         .map(PathBuf::from)
+        .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(DEFAULT_TIMESHEET)
 }
 
-/// Path for the reminder daemon PID file (under $HOME/.cache or $XDG_CACHE_HOME).
+/// Path for the reminder daemon PID file (under $HOME/.cache, $XDG_CACHE_HOME, or the
+/// platform cache directory, e.g. `%LOCALAPPDATA%` on Windows).
 fn reminder_pid_path() -> PathBuf {
     let cache = env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")));
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .or_else(dirs::cache_dir);
     cache
         .unwrap_or_else(|| PathBuf::from("."))
         .join("ts-reminder.pid")
@@ -181,7 +186,6 @@ fn reminder_pid_path() -> PathBuf {
 /// This makes the daemon self-deduplicating: if several are spawned in a race (interactive `ts start`,
 /// `ts autostart`, and the systemd start unit can all fire near-simultaneously), only the first to
 /// claim the file runs the loop; the rest see a live owner and exit.
-#[cfg(unix)]
 fn claim_reminder_daemon_ownership(pid_path: &Path) -> bool {
     let my_pid = process::id();
     loop {
@@ -213,7 +217,6 @@ fn claim_reminder_daemon_ownership(pid_path: &Path) -> bool {
 }
 
 /// True if the reminder PID file still names this process (i.e. we are the current owner).
-#[cfg(unix)]
 fn owns_reminder_daemon(pid_path: &Path) -> bool {
     fs::read_to_string(pid_path)
         .ok()
@@ -373,7 +376,8 @@ impl Default for RotationBoundary {
 }
 
 /// Config file path: `$TS_CONFIG`, else `$XDG_CONFIG_HOME/timesheet.yml`, else
-/// `$HOME/.config/timesheet.yml`. A `timesheet.yaml` sibling is used when no `.yml` exists.
+/// `$HOME/.config/timesheet.yml`, else the platform config directory (e.g. `%APPDATA%` on
+/// Windows). A `timesheet.yaml` sibling is used when no `.yml` exists.
 fn config_path() -> PathBuf {
     if let Some(p) = env::var_os("TS_CONFIG") {
         return PathBuf::from(p);
@@ -381,6 +385,7 @@ fn config_path() -> PathBuf {
     let dir = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .or_else(dirs::config_dir)
         .unwrap_or_else(|| PathBuf::from("."));
     let yml = dir.join("timesheet.yml");
     if !yml.exists() {
@@ -1437,7 +1442,13 @@ fn cmd_tail(tail_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
 fn cmd_edit(timesheet: &Path) -> Result<(), String> {
     let editor = env::var_os("EDITOR")
         .or_else(|| env::var_os("VISUAL"))
-        .unwrap_or_else(|| "vi".into());
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "notepad".into()
+            } else {
+                "vi".into()
+            }
+        });
     if let Some(parent) = timesheet.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("ts edit: cannot create {}: {}", parent.display(), e))?;
@@ -2198,6 +2209,7 @@ fn cmd_rebuild(args: &[String]) -> Result<(), String> {
         return Err("ts rebuild: cargo build failed.".to_string());
     }
 
+    #[cfg(not(windows))]
     let exe = build_dir.join("target/release/ts");
     #[cfg(windows)]
     let exe = build_dir.join("target/release/ts.exe");
@@ -2559,11 +2571,14 @@ removes the registration (the logout hook removal also needs
 Without
 .I interval
 : starts the daemon if not running and prints the current reminder interval.
+Not supported on Windows; errors with a message to that effect.
 .TP
 .B help
 Run the equivalent of
 .B "ts manpage | groff \-man \-Tascii | less"
-to show this manual page in the system pager.
+to show this manual page in the system pager. On Windows, where groff and less are not
+available, renders this page as plain text and pages it with
+.BR more .
 .TP
 .B install
 Copy the binary (and on macOS the embedded icon as
@@ -2648,7 +2663,7 @@ in your editor, taken from
 (then
 .BR $VISUAL ,
 else
-.BR vi ).
+.BR vi ", " notepad " on Windows).
 .TP
 .BI "pdf " "[options] [week]"
 Fill a form-fillable PDF template with one week of the timesheet and write it out.
@@ -2851,7 +2866,8 @@ Record work start
 With no
 .IR activity ,
 shows the reminder chooser to pick or enter an activity (macOS via AppKit; Linux via the PyQt
-single-click chooser, falling back to kdialog/zenity). A single click acts immediately.
+single-click chooser, falling back to kdialog/zenity; no chooser on Windows, so it always
+falls back to the default below). A single click acts immediately.
 Otherwise optional
 .I activity
 (default: misc/unspecified). Appends a START line; does not modify existing entries.
@@ -2859,7 +2875,8 @@ If a session is already open, no STOP is added when the new START would close it
 start/stop pairs match in LIFO order, so a STOP at the same instant as the START is redundant.
 A STOP is added only when the open START is more than one reminder interval old, in which case it
 is capped to one interval after that entry, leaving the time you were away unbilled.
-Starts or restarts the reminder daemon (resets the timer).
+Starts or restarts the reminder daemon (resets the timer; no-op on Windows, where the
+reminder daemon is not yet implemented).
 .TP
 .B started
 Record a work start at a
@@ -2986,6 +3003,7 @@ fn help_prelude() -> String {
     format!("{}\n\n", CANONICAL_SOURCE_URL)
 }
 
+#[cfg(unix)]
 fn cmd_help() -> Result<(), String> {
     let man = manpage_content();
     let prelude = help_prelude();
@@ -3028,6 +3046,122 @@ fn cmd_help() -> Result<(), String> {
     }
     let _ = child.wait();
     Ok(())
+}
+
+/// Windows has no groff/less; render the man page source as plain text and page it with `more`,
+/// falling back to printing straight to stdout if even that is unavailable.
+#[cfg(not(unix))]
+fn cmd_help() -> Result<(), String> {
+    let mut text = help_prelude();
+    text.push_str(&render_groff_plain(manpage_content()));
+
+    if let Ok(mut child) = Command::new("more").stdin(Stdio::piped()).spawn() {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+        return Ok(());
+    }
+    print!("{}", text);
+    Ok(())
+}
+
+/// Minimal groff `-man` macro renderer used only where groff itself is unavailable (Windows).
+/// Handles just the macros and escapes this project's man page source actually uses; not a
+/// general-purpose groff interpreter.
+#[cfg(not(unix))]
+fn render_groff_plain(source: &str) -> String {
+    fn unescape(s: &str) -> String {
+        s.replace("\\(dq", "\"")
+            .replace("\\(em", "--")
+            .replace("\\(->", "->")
+            .replace("\\fB", "")
+            .replace("\\fI", "")
+            .replace("\\fR", "")
+            .replace("\\&", "")
+            .replace("\\-", "-")
+            .replace("\\ ", " ")
+    }
+    fn tokenize(s: &str) -> Vec<String> {
+        let chars: Vec<char> = s.chars().collect();
+        let mut tokens = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            if i >= chars.len() {
+                break;
+            }
+            if chars[i] == '"' {
+                i += 1;
+                let start = i;
+                while i < chars.len() && chars[i] != '"' {
+                    i += 1;
+                }
+                tokens.push(chars[start..i].iter().collect());
+                if i < chars.len() {
+                    i += 1;
+                }
+            } else {
+                let start = i;
+                while i < chars.len() && !chars[i].is_whitespace() {
+                    i += 1;
+                }
+                tokens.push(chars[start..i].iter().collect());
+            }
+        }
+        tokens
+    }
+
+    let mut out = String::new();
+    let mut indent = 0usize;
+    for raw_line in source.lines() {
+        let Some(rest) = raw_line.strip_prefix('.') else {
+            out.push_str(&" ".repeat(indent));
+            out.push_str(&unescape(raw_line));
+            out.push('\n');
+            continue;
+        };
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let name = parts.next().unwrap_or("");
+        let arg_str = parts.next().unwrap_or("").trim();
+        match name {
+            "SH" | "SS" => {
+                let heading = unescape(&tokenize(arg_str).join(" "));
+                out.push('\n');
+                out.push_str(&heading);
+                out.push('\n');
+            }
+            "PP" | "LP" | "TP" | "IP" => out.push('\n'),
+            "RS" => indent += 2,
+            "RE" => indent = indent.saturating_sub(2),
+            "br" => out.push('\n'),
+            "B" | "I" => {
+                let toks: Vec<String> = tokenize(arg_str).iter().map(|t| unescape(t)).collect();
+                if !toks.is_empty() {
+                    out.push_str(&" ".repeat(indent));
+                    out.push_str(&toks.join(" "));
+                    out.push('\n');
+                }
+            }
+            "BR" | "IR" | "RB" | "RI" | "BI" | "IB" => {
+                let toks: Vec<String> = tokenize(arg_str).iter().map(|t| unescape(t)).collect();
+                out.push_str(&" ".repeat(indent));
+                out.push_str(&toks.concat());
+                out.push('\n');
+            }
+            "TH" | "nf" | "fi" => {}
+            _ => {
+                if !arg_str.is_empty() {
+                    out.push_str(&" ".repeat(indent));
+                    out.push_str(&unescape(arg_str));
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Register "ts start" on login and "ts stop" on logout/shutdown (macOS: launchd; Linux: systemd user). Use "ts autostart uninstall" to remove.
