@@ -58,7 +58,7 @@
 //! | `rename`   | Same as `alias`. |
 //! | `restart`, `reminder` | Aliases for `interval`. |
 //! | `rotate`   | Rename log to `timesheet.YYMMDD`; add STOP first if last entry is START; append if same-day exists. |
-//! | `start`    | Record work start now; with no activity, shows reminder chooser to pick/enter (macOS via AppKit; Linux via PyQt single-click chooser, falling back to kdialog/zenity); otherwise optional activity (default: misc/unspecified); starts/restarts reminder daemon. |
+//! | `start`    | Record work start now; with no activity, shows reminder chooser to pick/enter (macOS via AppKit; Linux via PyQt single-click chooser, falling back to kdialog/zenity); otherwise optional activity (default: misc/unspecified); adds a STOP first only when the open session is over one reminder interval old (otherwise the START closes it by itself); starts/restarts reminder daemon. |
 //! | `started`  | Record a past start time; inserts at the correct chronological position without discarding entries. |
 //! | `stop`     | Record work stop (optional time); amends previous STOP if work already stopped; stops reminder daemon and shows "stopped" dialog when a stop is recorded (skipped during logout/shutdown). |
 //! | `timeoff`  | Show stop time for 8 h/day average; only requires a START entry (adds one if log empty or last is STOP). |
@@ -336,6 +336,24 @@ fn append_stop_entry(timesheet: &Path, dt: DateTime<Local>) -> Result<(), String
     append_log_entry(timesheet, &format_stop_log_entry(dt))
 }
 
+/// Append the STOP for a reminder prompt left unanswered for one reminder interval (see
+/// [`get_reminder_interval_secs`]), timestamped at `dt` -- the moment the prompt appeared, which is
+/// when you were last known to be working. Deliberately skips [`clamp_auto_stop_time`]: the prompt
+/// appears one reminder interval after the previous entry, so `dt` already satisfies the "never
+/// record work all night" guarantee without the cap pulling the STOP earlier than the prompt.
+///
+/// The prompt stays on screen after this, so picking an activity on your return opens a new session
+/// at the return time and the interval away stays unbilled. Does nothing when no session is open, so
+/// a prompt that is still unanswered on a later check does not add a second STOP.
+fn append_reminder_timeout_stop(timesheet: &Path, dt: DateTime<Local>) -> Result<(), String> {
+    maybe_rotate_if_previous_week(timesheet)?;
+    let content = fs::read_to_string(timesheet).unwrap_or_default();
+    if !matches!(last_recorded_event(&content), Some(LogLine::Start(_, _))) {
+        return Ok(());
+    }
+    append_log_entry(timesheet, &format_stop_log_entry(dt))
+}
+
 /// When a new timesheet week begins: the weekday and local time of day at which
 /// [`maybe_rotate_if_previous_week`] rotates the log. Configurable in `timesheet.yml`
 /// (see [`config_path`]); defaults to Sunday 00:00.
@@ -606,6 +624,24 @@ fn close_open_session(timesheet: &Path, now: DateTime<Local>) -> bool {
         let _ = append_stop_entry(timesheet, now);
     }
     open
+}
+
+/// Close an open session ahead of a new START recorded at `now`, writing a STOP only when one is
+/// actually needed. Start/stop pairs match in LIFO order, so a STOP at the same instant as the new
+/// START is redundant -- the START closes the previous session by itself. A STOP is written only when
+/// [`clamp_auto_stop_time`] places it before `now`, which is the case that matters: it leaves a
+/// deliberate unbilled gap for time spent away from an open session. Returns whether a STOP was
+/// written.
+fn close_open_session_before_start(timesheet: &Path, now: DateTime<Local>) -> bool {
+    let content = fs::read_to_string(timesheet).unwrap_or_default();
+    let open = last_recorded_event(&content)
+        .map(|ll| matches!(ll, LogLine::Start(_, _)))
+        .unwrap_or(false);
+    if !open || clamp_auto_stop_time(timesheet, now) >= now {
+        return false;
+    }
+    let _ = append_stop_entry(timesheet, now);
+    true
 }
 
 /// Reconcile a session left open by a missed shutdown/logout STOP: if the last log entry is a START
@@ -1129,8 +1165,8 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
         args.join(" ")
     };
     let now = Local::now();
-    // Close any open session before starting a new one.
-    close_open_session(timesheet, now);
+    // Close any open session before starting a new one, unless the START below already closes it.
+    close_open_session_before_start(timesheet, now);
     append_log_entry(timesheet, &format_start_log_entry(now, &activity))?;
     println!(
         "Started: {} at {}",
@@ -2568,7 +2604,7 @@ and
 .B reminder
 are aliases for
 .BR interval .
-Reminder daemon behavior: on timeout (no click), records STOP at reminder-appeared time, capped to no more than one reminder interval after the latest log entry, and brings the existing reminder window to the front of the window stack (does not launch a new prompt). Dismissed without choice (close, Escape) re-shows immediately. The "Enter new activity" dialog has no timeout; blank/cancelled re-shows the reminder. At logout/shutdown the open session is stopped: on macOS the daemon itself records STOP when launchd sends it SIGTERM (capped to one reminder interval after the latest entry); on Linux the systemd session unit's ExecStop runs "ts stop" instead, and the daemon stays silent on SIGTERM (systemd may signal it during ordinary teardown, so writing a STOP there would be spurious). Any automatic STOP is capped to one reminder interval (default 5 minutes) after the latest entry, so forgetting to stop never records work all night.
+Reminder daemon behavior: if a prompt goes unanswered for one reminder interval, records a STOP timestamped at the moment the prompt appeared, not when the interval expired. That timestamp is used exactly, without the one-interval cap, because the prompt appears one reminder interval after the previous entry and so already marks the last time you were known to be working. The prompt is then left on screen rather than dismissed (macOS also brings it back to the front of the window stack): choosing an activity when you return records a START at the return time, so the stretch away from the desk falls between the two entries and goes unbilled while your return is logged accurately. No second STOP is added while work is already stopped, so an unattended screen records one STOP rather than one per interval. The reminder window covers the full screen and stays on top on both macOS and Linux, so it cannot be hidden by accident by a mouse action in progress when it appears. Dismissed without choice (close, Escape) re-shows immediately. The "Enter new activity" dialog has no timeout; blank/cancelled re-shows the reminder. At logout/shutdown the open session is stopped: on macOS the daemon itself records STOP when launchd sends it SIGTERM (capped to one reminder interval after the latest entry); on Linux the systemd session unit's ExecStop runs "ts stop" instead, and the daemon stays silent on SIGTERM (systemd may signal it during ordinary teardown, so writing a STOP there would be spurious). Every other automatic STOP is capped to one reminder interval (default 5 minutes) after the latest entry, so forgetting to stop never records work all night.
 .TP
 .B list
 Plaintext report: percentage of time per activity (high to low), and hours per day of week (Sun\-Sat).
@@ -2819,6 +2855,10 @@ single-click chooser, falling back to kdialog/zenity). A single click acts immed
 Otherwise optional
 .I activity
 (default: misc/unspecified). Appends a START line; does not modify existing entries.
+If a session is already open, no STOP is added when the new START would close it anyway:
+start/stop pairs match in LIFO order, so a STOP at the same instant as the START is redundant.
+A STOP is added only when the open START is more than one reminder interval old, in which case it
+is capped to one interval after that entry, leaving the time you were away unbilled.
 Starts or restarts the reminder daemon (resets the timer).
 .TP
 .B started
@@ -3530,7 +3570,6 @@ fn do_autostart_uninstall_linux() -> Result<(), String> {
 }
 
 const REMINDER_SLEEP_SECS: u64 = 300; // 5 minutes (default when no interval file)
-const REMINDER_PROMPT_TIMEOUT_SECS: u64 = 300; // 5 minutes
 
 /// Reminder interval in seconds: from config file if present and valid, else default.
 fn get_reminder_interval_secs() -> u64 {
@@ -3912,8 +3951,11 @@ fn run_reminder_daemon(timesheet: &Path) {
             }
             ReminderResult::ShowAgainImmediate => {} // dismissed without choice; re-show immediately
             ReminderResult::TimeoutAddStop(dt) => {
-                let _ = append_stop_entry(timesheet, dt);
-                // Do not dismiss reminder window; continue loop to re-show
+                // Reached only when no chooser could be shown at all (no PyQt/kdialog/zenity) or the
+                // dialog failed to run. A chooser that did appear keeps itself on screen past the
+                // interval and records this STOP itself, so it returns Activity on your return
+                // instead of coming through here.
+                let _ = append_reminder_timeout_stop(timesheet, dt);
             }
         }
     }
@@ -4015,7 +4057,7 @@ fn resolve_start_activity(timesheet: &Path) -> Option<String> {
                 thread::sleep(Duration::from_millis(500));
             }
             ReminderResult::TimeoutAddStop(dt) => {
-                let _ = append_stop_entry(timesheet, dt);
+                let _ = append_reminder_timeout_stop(timesheet, dt);
                 // re-show immediately
             }
             ReminderResult::EnterNew => {
@@ -4190,6 +4232,11 @@ fn prompt_enter_activity_linux(backend: LinuxDialog) -> Option<String> {
 /// "Enter new activity..." opens an input box in the same window (a non-empty entry returns it; a
 /// blank entry returns to the list). The script writes the chosen string to stdout, or nothing if
 /// the window is dismissed. It exits 3 when no Qt toolkit is available so the caller can fall back.
+///
+/// The window covers the whole screen and stays on top, matching the macOS chooser: a small window
+/// is easy to dismiss by accident when it appears mid-click. The choices sit in a centered panel.
+/// Qt enum access differs between PyQt5 (unscoped) and PyQt6 (scoped), hence the `WindowType`
+/// getattr dance.
 #[cfg(target_os = "linux")]
 const REMINDER_CHOOSER_PY: &str = r#"
 import sys, os
@@ -4199,24 +4246,47 @@ def load_qt():
         try:
             w = __import__(mod + ".QtWidgets", fromlist=["x"])
             c = __import__(mod + ".QtCore", fromlist=["x"])
-            return (w.QApplication, w.QWidget, w.QVBoxLayout, w.QListWidget,
-                    w.QLabel, w.QInputDialog, c.QTimer)
+            return (w.QApplication, w.QWidget, w.QVBoxLayout, w.QHBoxLayout, w.QListWidget,
+                    w.QLabel, w.QInputDialog, c.QTimer, c.Qt)
         except Exception:
             continue
     return None
 bundle = load_qt()
 if bundle is None:
     sys.exit(3)
-QApplication, QWidget, QVBoxLayout, QListWidget, QLabel, QInputDialog, QTimer = bundle
+QApplication, QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QLabel, QInputDialog, QTimer, Qt = bundle
+wintype = getattr(Qt, "WindowType", Qt)
+align = getattr(Qt, "AlignmentFlag", Qt)
 result = {"v": None}
 app = QApplication([])
 w = QWidget()
 w.setWindowTitle("ts")
-lay = QVBoxLayout(w)
-lay.addWidget(QLabel("What are you working on?"))
+try:
+    w.setWindowFlags(w.windowFlags() | wintype.WindowStaysOnTopHint)
+except Exception:
+    pass
 lst = QListWidget()
 lst.addItems(choices)
-lay.addWidget(lst)
+prompt = QLabel("What are you working on?")
+try:
+    prompt.setAlignment(align.AlignCenter)
+except Exception:
+    pass
+# Centered panel: the window is full-screen, but the choices stay a comfortable size.
+panel = QWidget()
+panel_lay = QVBoxLayout(panel)
+panel_lay.addWidget(prompt)
+panel_lay.addWidget(lst)
+panel.setFixedWidth(420)
+lst.setFixedHeight(min(len(choices) * 28 + 20, 520))
+row = QHBoxLayout()
+row.addStretch(1)
+row.addWidget(panel)
+row.addStretch(1)
+lay = QVBoxLayout(w)
+lay.addStretch(1)
+lay.addLayout(row)
+lay.addStretch(1)
 def finish(val):
     result["v"] = val
     app.quit()
@@ -4231,8 +4301,7 @@ def on_click(item):
         return
     finish(text)
 lst.itemClicked.connect(on_click)
-w.resize(380, min(len(choices) * 28 + 90, 520))
-w.show()
+w.showFullScreen()
 try:
     w.raise_()
     w.activateWindow()
@@ -4254,6 +4323,7 @@ if result["v"] is not None:
 fn show_reminder_prompt_pyqt(
     choices: &[String],
     reminder_appeared: DateTime<Local>,
+    timesheet: Option<&Path>,
 ) -> Option<ReminderResult> {
     if !command_on_path("python3") {
         return None;
@@ -4271,9 +4341,13 @@ fn show_reminder_prompt_pyqt(
         .spawn()
         .ok()?;
 
-    // Wait up to the prompt timeout, collecting both exit code and stdout.
-    let timeout = Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS);
+    // Wait for an answer with no deadline, collecting both exit code and stdout. If one reminder
+    // interval passes unanswered, record the STOP at `reminder_appeared` but leave the window up:
+    // whenever you get back and pick an activity, that START lands at your return time and the
+    // interval you were away is left unbilled.
+    let interval = Duration::from_secs(get_reminder_interval_secs());
     let start = std::time::Instant::now();
+    let mut appended_stop = false;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -4295,9 +4369,11 @@ fn show_reminder_prompt_pyqt(
             Ok(None) => {}
             Err(_) => return None,
         }
-        if start.elapsed() >= timeout {
-            let _ = child.kill();
-            return Some(ReminderResult::TimeoutAddStop(reminder_appeared));
+        if !appended_stop && start.elapsed() >= interval {
+            if let Some(ts) = timesheet {
+                let _ = append_reminder_timeout_stop(ts, reminder_appeared);
+            }
+            appended_stop = true;
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -4306,11 +4382,11 @@ fn show_reminder_prompt_pyqt(
 /// Linux reminder prompt: present the activity chooser and map the choice to a ReminderResult.
 /// Prefers the PyQt single-click chooser (no OK/Cancel); falls back to a kdialog/zenity list dialog.
 #[cfg(target_os = "linux")]
-fn show_reminder_prompt_linux(activities: &[String], _timesheet: Option<&Path>) -> ReminderResult {
+fn show_reminder_prompt_linux(activities: &[String], timesheet: Option<&Path>) -> ReminderResult {
     let reminder_appeared = Local::now();
     let choices = reminder_choices(activities);
 
-    if let Some(result) = show_reminder_prompt_pyqt(&choices, reminder_appeared) {
+    if let Some(result) = show_reminder_prompt_pyqt(&choices, reminder_appeared, timesheet) {
         return result;
     }
 
@@ -4360,9 +4436,29 @@ fn show_reminder_prompt_linux(activities: &[String], _timesheet: Option<&Path>) 
         Err(_) => return ReminderResult::TimeoutAddStop(reminder_appeared),
     };
 
-    let timeout = Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS);
-    match wait_with_timeout(child, timeout, true) {
-        WaitOutcome::Finished(Some(stdout)) => {
+    // Wait indefinitely, recording the STOP once one reminder interval passes unanswered and
+    // leaving the dialog up so a later choice starts a new session at the time you return.
+    let interval = Duration::from_secs(get_reminder_interval_secs());
+    let mut child = child;
+    let mut appended_stop = false;
+    let stdout = loop {
+        match wait_with_timeout(child, interval, false) {
+            WaitOutcome::Finished(out) => break out,
+            // kill_on_timeout is false, so the dialog is handed back still running.
+            WaitOutcome::TimedOut => break None,
+            WaitOutcome::TimedOutWithChild(c) => {
+                if !appended_stop {
+                    if let Some(ts) = timesheet {
+                        let _ = append_reminder_timeout_stop(ts, reminder_appeared);
+                    }
+                    appended_stop = true;
+                }
+                child = c;
+            }
+        }
+    };
+    match stdout {
+        Some(stdout) => {
             let s = String::from_utf8_lossy(&stdout).trim().to_string();
             match parse_native_reminder_dialog_output(&s) {
                 Some(ReminderResult::EnterNew) => {
@@ -4377,9 +4473,7 @@ fn show_reminder_prompt_linux(activities: &[String], _timesheet: Option<&Path>) 
                 None => ReminderResult::ShowAgainImmediate,
             }
         }
-        WaitOutcome::Finished(None) => ReminderResult::TimeoutAddStop(reminder_appeared),
-        WaitOutcome::TimedOut => ReminderResult::TimeoutAddStop(reminder_appeared),
-        WaitOutcome::TimedOutWithChild(_) => ReminderResult::TimeoutAddStop(reminder_appeared),
+        None => ReminderResult::TimeoutAddStop(reminder_appeared),
     }
 }
 
@@ -4494,7 +4588,7 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
         // can sit behind Terminal until the first reminder timeout elapses.
         macos_bring_reminder_window_to_front(child.id());
         let appeared = Local::now();
-        let timeout = Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS);
+        let timeout = Duration::from_secs(get_reminder_interval_secs());
         let mut appended_stop_for_this_reminder = false;
         loop {
             match wait_with_timeout(child, timeout, false) {
@@ -4510,7 +4604,7 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
                 WaitOutcome::TimedOutWithChild(c) => {
                     if !appended_stop_for_this_reminder {
                         if let Some(ts) = timesheet {
-                            let _ = append_stop_entry(ts, appeared);
+                            let _ = append_reminder_timeout_stop(ts, appeared);
                         }
                         appended_stop_for_this_reminder = true;
                     }
@@ -4555,7 +4649,7 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
         }
         ReminderResult::TimeoutAddStop(epoch) => {
             if let Some(ts) = timesheet {
-                let _ = append_stop_entry(ts, epoch);
+                let _ = append_reminder_timeout_stop(ts, epoch);
             }
             return ReminderResult::ShowAgainImmediate;
         }
@@ -4592,7 +4686,7 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
         Err(_) => return ReminderResult::TimeoutAddStop(reminder_appeared),
     };
 
-    let timeout = Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS);
+    let timeout = Duration::from_secs(get_reminder_interval_secs());
     let result = match wait_with_timeout(child, timeout, true) {
         WaitOutcome::Finished(Some(stdout)) => {
             let s = String::from_utf8_lossy(&stdout).trim().to_string();
@@ -4629,7 +4723,7 @@ fn show_reminder_prompt_macos_systemui(
     } else {
         Stdio::null()
     };
-    let timeout_dur = Duration::from_secs(REMINDER_PROMPT_TIMEOUT_SECS);
+    let timeout_dur = Duration::from_secs(get_reminder_interval_secs());
 
     // AppleScript display dialog allows max 3 buttons. Build exactly 3: Stop Work, (optional) first activity, Enter new activity...
     let three_buttons: Vec<&str> = {
@@ -4768,9 +4862,9 @@ fn escape_applescript_string(s: &str) -> String {
 enum WaitOutcome {
     Finished(Option<Vec<u8>>),
     TimedOut,
-    /// Child still running (not killed); caller can bring window to front and call wait_with_timeout again.
-    /// The held child is only inspected on macOS (to re-front the dialog); other platforms kill on timeout.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// Child still running (not killed); caller can bring the window to front and call
+    /// wait_with_timeout again. Used by the reminder prompts to record a STOP after one unanswered
+    /// interval while leaving the dialog on screen (macOS also re-fronts the held child).
     TimedOutWithChild(process::Child),
 }
 
@@ -6117,6 +6211,152 @@ other: value
         let wrote = close_open_session(&log_path, Local::now());
 
         assert!(!wrote);
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), original);
+    }
+
+    #[test]
+    fn test_close_open_session_before_start_skips_redundant_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        // Open session younger than one reminder interval: the STOP would land at `now`, exactly
+        // where the new START goes, so LIFO pairing makes it redundant.
+        let original = format!(
+            "{}|START|task\n",
+            format_log_timestamp(Local::now() - chrono::Duration::minutes(1))
+        );
+        fs::write(&log_path, &original).unwrap();
+
+        let wrote = close_open_session_before_start(&log_path, Local::now());
+
+        assert!(!wrote);
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), original);
+    }
+
+    #[test]
+    fn test_close_open_session_before_start_writes_stop_when_clamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        // Open session older than one reminder interval: the STOP is clamped back before `now`,
+        // leaving an unbilled gap, so it must be recorded.
+        let start_dt = Local::now() - chrono::Duration::minutes(30);
+        fs::write(
+            &log_path,
+            format!("{}|START|task\n", format_log_timestamp(start_dt)),
+        )
+        .unwrap();
+
+        let now = Local::now();
+        let wrote = close_open_session_before_start(&log_path, now);
+
+        assert!(wrote);
+        let content = fs::read_to_string(&log_path).unwrap();
+        let Some(LogLine::Stop(stop_dt)) = last_recorded_event(&content) else {
+            panic!("expected a STOP entry, got: {}", content);
+        };
+        assert!(stop_dt < now);
+        // Compare through the log's own format: it truncates to microseconds, so the raw
+        // `Local::now()` nanoseconds never survive the round trip.
+        let expected = start_dt + chrono::Duration::seconds(get_reminder_interval_secs() as i64);
+        assert_eq!(
+            format_stop_log_entry(stop_dt),
+            format_stop_log_entry(expected)
+        );
+    }
+
+    #[test]
+    fn test_close_open_session_before_start_noop_when_already_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        let original = format!(
+            "{}|START|task\n{}|STOP\n",
+            format_log_timestamp(Local::now() - chrono::Duration::minutes(40)),
+            format_log_timestamp(Local::now() - chrono::Duration::minutes(30))
+        );
+        fs::write(&log_path, &original).unwrap();
+
+        let wrote = close_open_session_before_start(&log_path, Local::now());
+
+        assert!(!wrote);
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), original);
+    }
+
+    #[test]
+    fn test_reminder_timeout_stop_uses_prompt_time_unclamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        let start_dt = Local::now() - chrono::Duration::minutes(30);
+        fs::write(
+            &log_path,
+            format!("{}|START|task\n", format_log_timestamp(start_dt)),
+        )
+        .unwrap();
+
+        // The prompt appeared 20 minutes ago -- well past the clamp cap, which would have pulled
+        // the STOP back to start + one interval. The prompt time must survive intact.
+        let appeared = Local::now() - chrono::Duration::minutes(20);
+        append_reminder_timeout_stop(&log_path, appeared).unwrap();
+
+        let content = fs::read_to_string(&log_path).unwrap();
+        let Some(LogLine::Stop(stop_dt)) = last_recorded_event(&content) else {
+            panic!("expected a STOP entry, got: {}", content);
+        };
+        assert_eq!(
+            format_stop_log_entry(stop_dt),
+            format_stop_log_entry(appeared)
+        );
+    }
+
+    #[test]
+    fn test_reminder_timeout_stop_then_return_leaves_away_time_unbilled() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        let interval = chrono::Duration::seconds(get_reminder_interval_secs() as i64);
+        // Worked for an hour, then the prompt went up one interval after the last entry and sat
+        // unanswered while we were away.
+        let start_dt = Local::now() - chrono::Duration::minutes(60);
+        fs::write(
+            &log_path,
+            format!("{}|START|task\n", format_log_timestamp(start_dt)),
+        )
+        .unwrap();
+        let appeared = start_dt + interval;
+
+        append_reminder_timeout_stop(&log_path, appeared).unwrap();
+        // Back at the desk 40 minutes later: picking an activity opens a fresh session now.
+        let returned = Local::now() - chrono::Duration::minutes(10);
+        append_log_entry(&log_path, &format_start_log_entry(returned, "task")).unwrap();
+
+        let lines = read_log_lines(&log_path).unwrap();
+        let (per_activity, _dow, _open) = process_log_for_report(&lines, Some(Local::now()));
+        let (_label, _pct, hours) = per_activity
+            .iter()
+            .find(|(label, _, _)| label == "task")
+            .expect("task should be reported");
+        // Billed: the interval before the prompt plus the 10 minutes since returning. The stretch
+        // between the STOP and the return is a gap and must not appear.
+        let expected = (interval + chrono::Duration::minutes(10)).num_seconds() as f64 / 3600.0;
+        assert!(
+            (hours - expected).abs() < 0.01,
+            "billed {} h, expected {} h",
+            hours,
+            expected
+        );
+    }
+
+    #[test]
+    fn test_reminder_timeout_stop_noop_when_no_session_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        // Work is already stopped: repeated unanswered prompts must not pile up STOP entries.
+        let original = format!(
+            "{}|START|task\n{}|STOP\n",
+            format_log_timestamp(Local::now() - chrono::Duration::minutes(40)),
+            format_log_timestamp(Local::now() - chrono::Duration::minutes(35))
+        );
+        fs::write(&log_path, &original).unwrap();
+
+        append_reminder_timeout_stop(&log_path, Local::now()).unwrap();
+
         assert_eq!(fs::read_to_string(&log_path).unwrap(), original);
     }
 
