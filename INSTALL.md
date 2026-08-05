@@ -26,7 +26,9 @@ cargo build --release
 
 The binary is written to `target/release/ts` (or `target/debug/ts` if you use `cargo build` without `--release`).
 
-The first build fetches crates from crates.io, so it needs network access; later builds do not. `ts pdf` and `ts email` bring in PDF and SMTP support (`lopdf` and `lettre`, the latter with rustls and bundled roots), which is most of the binary's size and of the build time. TLS is pure Rust, so no system OpenSSL or certificate store is required, on Linux or macOS.
+The first build fetches crates from crates.io, so it needs network access; later builds do not. `ts pdf` and `ts email` bring in PDF and SMTP support (`lopdf` and `lettre`, the latter with rustls and bundled roots), which is most of the binary's size and of the build time. TLS is pure Rust, so no system OpenSSL or certificate store is required, on Linux, macOS, or Windows.
+
+On Windows, `cargo build --release` produces `target\release\ts.exe`. Core commands (`start`, `stop`, `list`, `sprint`, `tail`, `alias`/`rename`/`prefix`, `rotate`, `migrate`, `timeoff`, `edit`, `pdf`, `email`) work the same as on Linux/macOS. The reminder daemon, reminder dialog, and `ts autostart` are not implemented on Windows yet, so `ts start` with no activity always defaults to misc/unspecified rather than prompting.
 
 ### 2. Install the binary
 
@@ -47,9 +49,9 @@ chmod +x ~/bin/ts
 
 Ensure `~/bin` (or your chosen directory) is on your `PATH`.
 
-## Autostart (optional)
+## Autostart (optional, macOS/Linux only)
 
-To run **`ts start`** at login and **`ts stop`** at logout/shutdown:
+Not available on Windows (`ts autostart` errors as unsupported there). To run **`ts start`** at login and **`ts stop`** at logout/shutdown on macOS or Linux:
 
 ```sh
 ts autostart

@@ -8,6 +8,7 @@ license = "MIT"
 
 [dependencies]
 chrono = "0.4"
+dirs = "5"
 lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "builder", "rustls-tls"] }
 libc = "0.2"
 lopdf = { version = "0.44.0", default-features = false }
