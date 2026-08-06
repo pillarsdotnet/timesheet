@@ -64,9 +64,7 @@
 //! | `timeoff`  | Show stop time for 8 h/day average; only requires a START entry (adds one if log empty or last is STOP). |
 //! | `uninstall` | Stop daemon, remove autostart hooks, optionally remove log files, remove binary and icon. |
 
-use chrono::{
-    DateTime, Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat, Weekday,
-};
+use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, SecondsFormat, Weekday};
 #[cfg(target_os = "macos")]
 use libc::getuid;
 #[cfg(unix)]
@@ -446,15 +444,75 @@ fn parse_weekday(s: &str) -> Option<Weekday> {
     s.trim().parse::<Weekday>().ok()
 }
 
-/// Parses a time of day: `HH:MM`, `HH:MM:SS`, or a bare hour (`0`, `9`).
-fn parse_time_of_day(s: &str) -> Option<NaiveTime> {
-    let s = s.trim();
-    if let Ok(h) = s.parse::<u32>() {
-        return NaiveTime::from_hms_opt(h, 0, 0);
+/// Strips `suffix` from the end of `s`, ignoring ASCII case. `suffix` must be ASCII.
+fn strip_suffix_ignore_case<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
+    let cut = s.len().checked_sub(suffix.len())?;
+    if s.is_char_boundary(cut) && s[cut..].eq_ignore_ascii_case(suffix) {
+        Some(&s[..cut])
+    } else {
+        None
     }
-    NaiveTime::parse_from_str(s, "%H:%M:%S")
-        .or_else(|_| NaiveTime::parse_from_str(s, "%H:%M"))
-        .ok()
+}
+
+/// Splits a trailing meridiem off a clock time, returning the remainder and whether it was PM.
+/// Accepts `am`/`pm`, `a.m.`/`p.m.`, and a bare `a`/`p`, in any case.
+fn split_meridiem(s: &str) -> (&str, Option<bool>) {
+    for (suffix, is_pm) in [
+        ("a.m.", false),
+        ("p.m.", true),
+        ("am", false),
+        ("pm", true),
+        ("a", false),
+        ("p", true),
+    ] {
+        if let Some(rest) = strip_suffix_ignore_case(s, suffix) {
+            let rest = rest.trim_end();
+            // A meridiem needs digits in front of it; "am" alone is not a time.
+            if !rest.is_empty() {
+                return (rest, Some(is_pm));
+            }
+        }
+    }
+    (s, None)
+}
+
+/// Parses a time of day: `HH:MM`, `HH:MM:SS`, or a bare hour (`0`, `9`), optionally with a
+/// meridiem (`7am`, `7 AM`, `7:30 pm`, `12:15:30a.m.`). Without a meridiem the hour is 24-hour.
+fn parse_time_of_day(s: &str) -> Option<NaiveTime> {
+    let (body, pm) = split_meridiem(s.trim());
+    let mut fields = body.split(':');
+    let mut next_field = |required: bool| -> Option<u32> {
+        match fields.next() {
+            Some(f) => {
+                let f = f.trim();
+                if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+                    None
+                } else {
+                    f.parse().ok()
+                }
+            }
+            None if required => None,
+            None => Some(0),
+        }
+    };
+    let hour = next_field(true)?;
+    let minute = next_field(false)?;
+    let second = next_field(false)?;
+    if fields.next().is_some() {
+        return None;
+    }
+    let hour = match pm {
+        // A meridiem makes the hour 12-hour: 12am is midnight, 12pm is noon.
+        Some(pm) => match (hour, pm) {
+            (0, _) | (13.., _) => return None,
+            (12, false) => 0,
+            (12, true) => 12,
+            (h, false) => h,
+            (h, true) => h + 12,
+        },
+        None => hour,
+    };
+    NaiveTime::from_hms_opt(hour, minute, second)
 }
 
 /// Reads the rotation boundary out of a parsed config, collecting a message for each bad value.
@@ -1184,7 +1242,8 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Records work stop at the given time (or now if no time given). Same time formats as `ts started`.
+/// Records work stop at the given time (or now if no time given). Same time formats as `ts started`
+/// (see [`parse_start_time`]).
 /// If the last entry is already STOP: no stop-time argument → no change; with stop-time → amend that entry.
 fn cmd_stop(args: &[String], timesheet: &Path) -> Result<(), String> {
     maybe_rotate_if_previous_week(timesheet)?;
@@ -1585,41 +1644,41 @@ fn cmd_sprint(timesheet: &Path) -> Result<(), String> {
     print_report(&lines, virtual_stop, current_task, false)
 }
 
-/// Parses a start-time string into a DateTime<Local>; tries strict ISO 8601 first, then several other formats (e.g. `%Y-%m-%d %H:%M`, `%H:%M`, `%I:%M %p`).
+/// Parses a date: `YYYY-MM-DD`, `MM/DD/YYYY`, or `MM/DD` (the year of `now`).
+fn parse_date_part(s: &str, now: DateTime<Local>) -> Option<NaiveDate> {
+    let s = s.trim();
+    NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .or_else(|_| NaiveDate::parse_from_str(s, "%m/%d/%Y"))
+        .or_else(|_| NaiveDate::parse_from_str(&format!("{}/{}", s, now.year()), "%m/%d/%Y"))
+        .ok()
+}
+
+/// Parses a start-time string into a DateTime<Local>. Tries strict ISO 8601 first, then an
+/// optional leading date (`YYYY-MM-DD`, `MM/DD/YYYY`, `MM/DD`) followed by a clock time
+/// ([`parse_time_of_day`]). A bare time means today; a bare date means midnight that day.
 fn parse_start_time(s: &str) -> Option<DateTime<Local>> {
     let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
     if let Some(dt) = parse_timestamp_field(s) {
         return Some(dt);
     }
     let now = Local::now();
-    let today = now.date_naive();
-    let formats = [
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%H:%M",
-        "%H:%M:%S",
-        "%m/%d/%Y %H:%M",
-        "%m/%d %H:%M",
-        "%I:%M %p",
-        "%I:%M%p",
-    ];
-    for fmt in formats {
-        if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
-            return ndt.and_local_timezone(Local).single();
-        }
+    // "2025-02-16 9am" splits into date and time; "9:00 AM" has no date part and is today.
+    let (date, time_str) = match s.split_once(char::is_whitespace) {
+        Some((head, rest)) => match parse_date_part(head, now) {
+            Some(d) => (d, rest.trim()),
+            None => (now.date_naive(), s),
+        },
+        None => (now.date_naive(), s),
+    };
+    if let Some(t) = parse_time_of_day(time_str) {
+        return Some(local_datetime_at(date, t));
     }
-    if let Ok(t) = NaiveTime::parse_from_str(s, "%H:%M") {
-        return today.and_time(t).and_local_timezone(Local).single();
-    }
-    if let Ok(t) = NaiveTime::parse_from_str(s, "%I:%M %p") {
-        return today.and_time(t).and_local_timezone(Local).single();
-    }
-    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        return d
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_local_timezone(Local)
-            .single();
+    // A date with no time at all: the start of that day.
+    if let Some(d) = parse_date_part(s, now) {
+        return Some(local_datetime_at(d, NaiveTime::MIN));
     }
     None
 }
@@ -1631,7 +1690,9 @@ fn cmd_started(args: &[String], timesheet: &Path) -> Result<(), String> {
         Some((st, rest)) => (st.as_str(), rest.join(" ")),
         None => {
             eprintln!("Usage: ts started <start_time> [activity...]");
-            eprintln!("  start_time is required (e.g. \"2025-02-16 09:00\" or \"9:00 AM\").");
+            eprintln!(
+                "  start_time is required (e.g. \"2026-08-06 09:00\", 09:00, 9am, \"9:30 AM\")."
+            );
             return Err("missing start_time".to_string());
         }
     };
@@ -2346,7 +2407,7 @@ It takes a mapping with
 .B day
 (weekday name or three-letter abbreviation, any case) and
 .B time
-(HH:MM, HH:MM:SS, or a bare hour), or a scalar shorthand
+(HH:MM, HH:MM:SS, a bare hour, or a 12-hour time with a meridiem such as 5pm), or a scalar shorthand
 .RB ( "rotate: monday" ", " "rotate: \(dqfri 17:00\(dq" ).
 Defaults:
 .B day
@@ -2506,6 +2567,41 @@ Record the end of a work session at the given time.
 .PP
 Start/stop pairs are matched in LIFO order (each STOP pairs with the most recent START).
 The report uses these pairs to compute duration and attribute time to activity and weekday.
+.SH "TIME FORMATS"
+The
+.I start_time
+of
+.B ts started
+and the
+.I stop_time
+of
+.B ts stop
+accept the same forms. A time with no date means today; a date with no time means midnight
+that day. Quote any argument containing a space.
+.TP
+.B ISO 8601
+2026\-08\-06T07:00:00\-04:00
+.TP
+.B "date and time"
+\(dq2026\-08\-06 07:00\(dq, \(dq08/06/2026 7:00 PM\(dq, \(dq8/6 7am\(dq
+.TP
+.B "24-hour time"
+07:00, 07:00:30, 7
+.TP
+.B "12-hour time"
+7am, \(dq7 AM\(dq, 7pm, 7:30pm, \(dq12:15:30 p.m.\(dq
+.TP
+.B "date only"
+2026\-08\-06, 08/06/2026, 8/6
+.PP
+A bare hour is 24-hour
+.RB ( 19
+is 7 pm), so a bare
+.B 12
+is noon while
+.B 12am
+is midnight. The meridiem is case-insensitive and may be written am/pm, a.m./p.m., or a/p.
+MM/DD without a year means the current year.
 .SH COMMANDS
 .TP
 .B alias
@@ -2882,12 +2978,13 @@ reminder daemon is not yet implemented).
 Record a work start at a
 .IR "past time" .
 .I start_time
-accepts GNU
-.B date \-d
-style, or
-.B YYYY\-MM\-DD\ HH:MM[:SS],
+accepts the forms listed under
+.BR "TIME FORMATS" ,
+e.g.
+.BR "\(dq2026\-08\-06 07:00\(dq" ,
+.BR 07:00 ,
 or
-.B HH:MM
+.B 7am
 (today).
 Inserts the new START entry at the correct chronological position.
 No existing entries are discarded.
@@ -5369,6 +5466,11 @@ other: value
         );
         assert_eq!(parse_time_of_day("noon"), None);
         assert_eq!(parse_time_of_day("25:00"), None);
+        assert_eq!(parse_time_of_day("7am"), NaiveTime::from_hms_opt(7, 0, 0));
+        assert_eq!(
+            parse_time_of_day("7:30 PM"),
+            NaiveTime::from_hms_opt(19, 30, 0)
+        );
     }
 
     #[test]
@@ -6031,9 +6133,75 @@ other: value
     }
 
     #[test]
+    fn test_parse_start_time_short_and_meridiem_forms() {
+        let today = Local::now().date_naive();
+        let cases = [
+            ("7am", 7, 0, 0),
+            ("7AM", 7, 0, 0),
+            ("7 am", 7, 0, 0),
+            ("7 a.m.", 7, 0, 0),
+            ("7pm", 19, 0, 0),
+            ("7", 7, 0, 0),
+            ("19", 19, 0, 0),
+            ("7:30pm", 19, 30, 0),
+            ("12am", 0, 0, 0),
+            ("12:15 AM", 0, 15, 0),
+            ("12pm", 12, 0, 0),
+            ("12:30:45 pm", 12, 30, 45),
+            ("11:59:59", 11, 59, 59),
+        ];
+        for (input, hour, minute, second) in cases {
+            let dt = parse_start_time(input)
+                .unwrap_or_else(|| panic!("failed to parse start time {:?}", input));
+            assert_eq!(dt.date_naive(), today, "{:?} should be today", input);
+            assert_eq!(
+                (dt.hour(), dt.minute(), dt.second()),
+                (hour, minute, second),
+                "{:?}",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_start_time_date_with_meridiem() {
+        let dt = parse_start_time("2025-02-20 9am").unwrap();
+        assert_eq!(
+            dt.date_naive(),
+            NaiveDate::from_ymd_opt(2025, 2, 20).unwrap()
+        );
+        assert_eq!((dt.hour(), dt.minute()), (9, 0));
+
+        let dt = parse_start_time("02/20/2025 9:05 PM").unwrap();
+        assert_eq!(
+            dt.date_naive(),
+            NaiveDate::from_ymd_opt(2025, 2, 20).unwrap()
+        );
+        assert_eq!((dt.hour(), dt.minute()), (21, 5));
+
+        // A bare date is midnight that day; MM/DD assumes the current year.
+        let dt = parse_start_time("2025-02-20").unwrap();
+        assert_eq!(
+            dt.date_naive(),
+            NaiveDate::from_ymd_opt(2025, 2, 20).unwrap()
+        );
+        assert_eq!((dt.hour(), dt.minute()), (0, 0));
+        let dt = parse_start_time("2/20 8am").unwrap();
+        assert_eq!(dt.year(), Local::now().year());
+        assert_eq!((dt.month(), dt.day(), dt.hour()), (2, 20, 8));
+    }
+
+    #[test]
     fn test_parse_start_time_invalid() {
         assert!(parse_start_time("").is_none());
         assert!(parse_start_time("not-a-date").is_none());
+        assert!(parse_start_time("am").is_none());
+        assert!(parse_start_time("0am").is_none());
+        assert!(parse_start_time("13pm").is_none());
+        assert!(parse_start_time("25:00").is_none());
+        assert!(parse_start_time("7:60").is_none());
+        assert!(parse_start_time("7:00:00:00").is_none());
+        assert!(parse_start_time("7xm").is_none());
     }
 
     #[test]
