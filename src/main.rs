@@ -60,7 +60,7 @@
 //! | `rotate`   | Rename log to `timesheet.YYMMDD`; add STOP first if last entry is START; append if same-day exists. |
 //! | `start`    | Record work start now; with no activity, shows reminder chooser to pick/enter (macOS via AppKit; Linux via PyQt single-click chooser, falling back to kdialog/zenity; no chooser on Windows, so it always defaults); otherwise optional activity (default: misc/unspecified); adds a STOP first only when the open session is over one reminder interval old (otherwise the START closes it by itself); starts/restarts reminder daemon (no-op on Windows). |
 //! | `started`  | Record a past start time; inserts at the correct chronological position without discarding entries. |
-//! | `stop`     | Record work stop (optional time); amends previous STOP if work already stopped; stops reminder daemon and shows "stopped" dialog when a stop is recorded (skipped during logout/shutdown). |
+//! | `stop`     | Record work stop (optional time); amends previous STOP if work already stopped; always stops the reminder daemon and closes any prompt it has on screen, and shows the "stopped" dialog (skipped during logout/shutdown). |
 //! | `timeoff`  | Show stop time for 8 h/day average; only requires a START entry (adds one if log empty or last is STOP). |
 //! | `uninstall` | Stop daemon, remove autostart hooks, optionally remove log files, remove binary and icon. |
 
@@ -69,8 +69,8 @@ use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, SecondsFormat, Wee
 use libc::getuid;
 #[cfg(unix)]
 use libc::{
-    kill, pthread_sigmask, setpgid, setsid, sigaddset, sigemptyset, signal, sigwait, SIGHUP,
-    SIGKILL, SIGTERM, SIG_BLOCK, SIG_IGN,
+    getpgid, getpgrp, kill, pthread_sigmask, setpgid, setsid, sigaddset, sigemptyset, signal,
+    sigwait, SIGHUP, SIGKILL, SIGTERM, SIG_BLOCK, SIG_IGN, SIG_SETMASK,
 };
 use regex::Regex;
 use std::env;
@@ -220,6 +220,24 @@ fn owns_reminder_daemon(pid_path: &Path) -> bool {
         .ok()
         .map(|d| d.trim() == process::id().to_string())
         .unwrap_or(false)
+}
+
+/// How often a daemon re-checks that it still owns the PID file, while sleeping between prompts
+/// and while a prompt is on screen.
+const REMINDER_OWNERSHIP_POLL: Duration = Duration::from_millis(500);
+
+/// Set once this process has claimed the daemon role. Code shared with the foreground `ts start`
+/// chooser uses it to tell the two apart: the foreground chooser never owns the PID file and must
+/// not treat that as a reason to close itself.
+static IS_REMINDER_DAEMON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// True when this process is a reminder daemon that no longer owns the PID file — `ts stop` removed
+/// it, or a newer daemon replaced it. Both mean this daemon and any prompt it has on screen should
+/// go away.
+fn reminder_daemon_disowned() -> bool {
+    IS_REMINDER_DAEMON.load(std::sync::atomic::Ordering::Relaxed)
+        && !owns_reminder_daemon(&reminder_pid_path())
 }
 
 /// Path for the reminder interval config file (seconds as decimal string; same dir as PID file).
@@ -1255,6 +1273,17 @@ fn cmd_stop(args: &[String], timesheet: &Path) -> Result<(), String> {
         .unwrap_or(false)
     {
         let Some(t) = args.first().map(String::as_str) else {
+            // The log needs no change, but stopping is still stopping: silence the daemon anyway.
+            // Otherwise a `ts stop` after an unanswered reminder (which records its own STOP)
+            // would leave the daemon running to prompt again one interval later.
+            let was_running = is_reminder_daemon_running();
+            if was_running {
+                show_reminders_stopped_notification();
+            }
+            kill_reminder_daemon_if_running();
+            if was_running {
+                println!("Work already stopped; reminders stopped.");
+            }
             return Ok(());
         };
         let stop_dt = parse_start_time(t)
@@ -2998,13 +3027,21 @@ or at optional
 .BR started ).
 If the last entry is already STOP and no
 .I stop_time
-is given, nothing happens. If
+is given, the log is left unchanged. If
 .I stop_time
 is given, the last STOP entry is amended to that time.
 If the last entry is START, appends the new STOP (normal pairing).
-When a stop is recorded (append or amend), stops the reminder daemon and shows a dialog that reminders have been stopped (skipped when
+In every case the reminder daemon is stopped and any prompt it has on screen is closed, and a
+dialog reports that reminders have been stopped (skipped when
 .B TS_LOGOUT
 is set, e.g.\ during logout/shutdown).
+Stopping the daemon happens even when the log needs no new entry: an unanswered reminder records
+its own STOP, so without this a following
+.B ts stop
+would write nothing and leave the daemon running to prompt again one interval later.
+The daemon runs in its own process group and is signalled as a group, so the chooser it spawned
+goes with it; a stray daemon that no longer owns the PID file notices within half a second and
+exits instead of prompting again.
 .TP
 .B stopped
 Alias for
@@ -3831,6 +3868,24 @@ fn is_pid_running(pid: u32) -> bool {
     }
 }
 
+/// Clear the inherited signal mask in a child process, between fork and exec.
+///
+/// The reminder daemon blocks SIGTERM so a dedicated `sigwait` thread can handle it, and a blocked
+/// mask survives both fork and exec. Without this reset every dialog the daemon spawns inherits the
+/// block and ignores SIGTERM for its whole life, so a chooser left on screen cannot be closed by an
+/// ordinary `ts stop` — only SIGKILL reaches it. Apply this to anything the daemon runs.
+#[cfg(unix)]
+fn reset_child_signal_mask(cmd: &mut Command) {
+    unsafe {
+        cmd.pre_exec(|| {
+            let mut empty = std::mem::zeroed::<libc::sigset_t>();
+            sigemptyset(&mut empty);
+            pthread_sigmask(SIG_SETMASK, &empty, std::ptr::null_mut());
+            Ok(())
+        });
+    }
+}
+
 /// Send a signal to a process by PID. Does not spawn the kill binary. No-op on non-Unix.
 fn signal_pid(pid: u32, sig: i32) {
     #[cfg(unix)]
@@ -3840,6 +3895,32 @@ fn signal_pid(pid: u32, sig: i32) {
     #[cfg(not(unix))]
     {
         let _ = (pid, sig);
+    }
+}
+
+/// Signal the reminder daemon *and* any dialog it currently has on screen.
+///
+/// The daemon calls `setsid()` at spawn, so it leads its own session and process group, and the
+/// chooser it runs (PyQt/kdialog/zenity) inherits that group. Signaling the group therefore closes
+/// a prompt that is still up; signaling the bare PID would leave that window orphaned on screen.
+/// Falls back to the bare PID when the daemon does not lead its own group, or when that group is
+/// ours, so an unrelated group is never signaled.
+/// Returns the daemon's own process group, or None when it does not lead one (or leads ours), in
+/// which case only the bare PID is safe to signal. Read this *before* signaling: once the daemon
+/// exits, `getpgid` fails and the dialogs it left behind can no longer be found this way.
+#[cfg(unix)]
+fn reminder_daemon_group(pid: u32) -> Option<i32> {
+    let pgid = unsafe { getpgid(pid as i32) };
+    (pgid == pid as i32 && pgid != unsafe { getpgrp() }).then_some(pgid)
+}
+
+#[cfg(unix)]
+fn signal_reminder_daemon(group: Option<i32>, pid: u32, sig: i32) {
+    match group {
+        Some(pgid) => {
+            let _ = unsafe { kill(-pgid, sig) };
+        }
+        None => signal_pid(pid, sig),
     }
 }
 
@@ -3919,15 +4000,33 @@ fn kill_reminder_daemon_if_running() {
                     return;
                 }
                 if is_pid_running(pid) {
+                    // Note the group before signaling; it is unreadable once the daemon exits.
+                    let group = reminder_daemon_group(pid);
                     // Remove PID file before signaling: the daemon's SIGTERM handler checks for
                     // the PID file to distinguish intentional kills from system shutdown.
                     let _ = fs::remove_file(&pid_path);
                     ts_debug(&format!("kill_reminder: sending SIGTERM to {}", pid));
-                    signal_pid(pid, SIGTERM);
-                    thread::sleep(Duration::from_millis(150));
+                    signal_reminder_daemon(group, pid, SIGTERM);
+                    // Give the daemon a moment to leave on its own -- on macOS it records a STOP
+                    // from its SIGTERM handler first, which a prompt SIGKILL would cut short.
+                    for _ in 0..20 {
+                        if !is_pid_running(pid) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(50));
+                    }
                     if is_pid_running(pid) {
                         ts_debug(&format!("kill_reminder: sending SIGKILL to {}", pid));
-                        signal_pid(pid, SIGKILL);
+                        signal_reminder_daemon(group, pid, SIGKILL);
+                    } else if let Some(pgid) = group {
+                        // The daemon is gone; SIGKILL whatever it left in its group. A dialog
+                        // spawned by an older build inherited the daemon's blocked SIGTERM and
+                        // survives everything short of SIGKILL, which would strand it on screen.
+                        ts_debug(&format!(
+                            "kill_reminder: SIGKILL leftovers in group {}",
+                            pgid
+                        ));
+                        let _ = unsafe { kill(-pgid, SIGKILL) };
                     }
                     ts_debug("kill_reminder: done");
                     return;
@@ -4147,6 +4246,7 @@ fn run_reminder_daemon(timesheet: &Path) {
         ts_debug("reminder daemon: another daemon already owns the pid file, exiting");
         return;
     }
+    IS_REMINDER_DAEMON.store(true, std::sync::atomic::Ordering::Relaxed);
     let pid_path_guard = pid_path.clone();
     let _cleanup = defer(move || {
         // Only remove the pid file if we still own it, so we never delete a successor's file.
@@ -4163,7 +4263,27 @@ fn run_reminder_daemon(timesheet: &Path) {
         }
         let interval_secs = get_reminder_interval_secs();
         ts_debug(&format!("reminder daemon: sleeping {}s", interval_secs));
-        thread::sleep(Duration::from_secs(interval_secs));
+        // Sleep in slices rather than one long nap, re-checking ownership as we go: `ts stop`
+        // silences a daemon by removing the PID file, and a daemon it could not signal (a stray
+        // that is not the file's owner) must notice within a moment instead of sleeping out the
+        // interval and popping one more prompt.
+        let deadline = std::time::Instant::now() + Duration::from_secs(interval_secs);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            if !owns_reminder_daemon(&pid_path) {
+                ts_debug("reminder daemon: lost pid ownership while sleeping, exiting");
+                return;
+            }
+            thread::sleep(remaining.min(REMINDER_OWNERSHIP_POLL));
+        }
+        // Re-check right before prompting: nothing should put a window on screen after a stop.
+        if !owns_reminder_daemon(&pid_path) {
+            ts_debug("reminder daemon: lost pid ownership before prompting, exiting");
+            return;
+        }
         ts_debug("reminder daemon: showing prompt");
 
         let activities = reminder_activities_most_recent_first(timesheet);
@@ -4381,6 +4501,10 @@ fn detect_linux_dialog() -> Option<LinuxDialog> {
 /// Existing values are never overridden, so an explicit user/session configuration wins.
 #[cfg(target_os = "linux")]
 fn linux_with_display(cmd: &mut Command) {
+    // Every caller is a GUI helper the daemon may spawn, so make sure none of them inherits the
+    // daemon's blocked SIGTERM and becomes an un-closable window.
+    reset_child_signal_mask(cmd);
+
     // Where the Wayland and D-Bus sockets live.
     let runtime_dir = match env::var_os("XDG_RUNTIME_DIR") {
         Some(d) => PathBuf::from(d),
@@ -4600,6 +4724,15 @@ fn show_reminder_prompt_pyqt(
             Ok(None) => {}
             Err(_) => return None,
         }
+        // `ts stop` while this prompt is up: close the window and go. The daemon is a stray if it
+        // reaches this (the one named in the PID file is signaled directly, and the signal takes
+        // its chooser down with it), so there is nothing left for it to do but exit.
+        if reminder_daemon_disowned() {
+            ts_debug("reminder: disowned with a prompt on screen; closing it and exiting");
+            let _ = child.kill();
+            let _ = child.wait();
+            process::exit(0);
+        }
         if !appended_stop && start.elapsed() >= interval {
             if let Some(ts) = timesheet {
                 let _ = append_reminder_timeout_stop(ts, reminder_appeared);
@@ -4751,6 +4884,9 @@ fn macos_run_in_user_session(exe: &str, exe_args: &[&str]) -> Command {
     args.append(&mut all);
     let mut c = Command::new("/usr/bin/launchctl");
     c.args(args);
+    // Same reason as on Linux: a dialog that inherited the daemon's blocked SIGTERM could not be
+    // closed by `ts stop`.
+    reset_child_signal_mask(&mut c);
     c
 }
 
@@ -6349,6 +6485,75 @@ other: value
             before, after,
             "ts stop should not change file when last entry is STOP and no time given"
         );
+    }
+
+    /// The reminder daemon blocks SIGTERM for its sigwait thread. That mask is inherited across
+    /// fork and exec, so without an explicit reset every dialog it spawns ignores SIGTERM for life
+    /// and `ts stop` cannot close a prompt left on screen.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_reset_child_signal_mask_clears_the_inherited_block() {
+        let blocked_mask = |cmd: &mut Command| -> String {
+            let out = cmd.output().expect("read /proc/self/status");
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .find(|l| l.starts_with("SigBlk:"))
+                .and_then(|l| l.split_whitespace().nth(1).map(str::to_string))
+                .expect("SigBlk line")
+        };
+        let status_cmd = || {
+            let mut c = Command::new("cat");
+            c.arg("/proc/self/status");
+            c
+        };
+
+        // Block SIGTERM on this thread, the way run_reminder_daemon does.
+        let mut set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        unsafe {
+            sigemptyset(&mut set);
+            sigaddset(&mut set, SIGTERM);
+            pthread_sigmask(SIG_BLOCK, &set, std::ptr::null_mut());
+        }
+        let inherited = blocked_mask(&mut status_cmd());
+        let mut cleared_cmd = status_cmd();
+        reset_child_signal_mask(&mut cleared_cmd);
+        let cleared = blocked_mask(&mut cleared_cmd);
+        unsafe { pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
+
+        // Bit 15 (0x4000) is SIGTERM: a plain spawn inherits the block, ours does not.
+        assert_eq!(
+            inherited, "0000000000004000",
+            "a plain child should inherit the daemon's blocked SIGTERM"
+        );
+        assert_eq!(
+            cleared, "0000000000000000",
+            "reset_child_signal_mask should hand the child a clear mask"
+        );
+    }
+
+    #[test]
+    fn test_owns_reminder_daemon_tracks_the_pid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("ts-reminder.pid");
+        // Missing file: nobody owns the daemon role.
+        assert!(!owns_reminder_daemon(&pid_path));
+        // Claiming it writes our own pid, which is what the daemon loop polls for.
+        assert!(claim_reminder_daemon_ownership(&pid_path));
+        assert!(owns_reminder_daemon(&pid_path));
+        // `ts stop` silences a daemon by removing the file; the daemon must see that.
+        fs::remove_file(&pid_path).unwrap();
+        assert!(!owns_reminder_daemon(&pid_path));
+        // A successor's pid in the file disowns us just the same.
+        fs::write(&pid_path, format!("{}", process::id() + 1)).unwrap();
+        assert!(!owns_reminder_daemon(&pid_path));
+    }
+
+    #[test]
+    fn test_reminder_daemon_disowned_is_false_outside_the_daemon() {
+        // The foreground `ts start` chooser shares the prompt code but never owns the PID file.
+        // It must not read that as "a stop happened" and close itself.
+        assert!(!IS_REMINDER_DAEMON.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!reminder_daemon_disowned());
     }
 
     #[test]
