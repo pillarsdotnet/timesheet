@@ -76,7 +76,7 @@ rotate:
 ```
 
 - **`day`** — weekday name or three-letter abbreviation, any case (`monday`, `Mon`, `SUNDAY`). Default: `sunday`.
-- **`time`** — `HH:MM`, `HH:MM:SS`, or a bare hour, in local time. Default: `00:00`.
+- **`time`** — `HH:MM`, `HH:MM:SS`, a bare hour, or a 12-hour time with a meridiem (`5pm`, `5:30 PM`), in local time. Default: `00:00`.
 
 A scalar shorthand works too: `rotate: monday`, or `rotate: "fri 17:00"` for a week that turns over Friday at 5 pm.
 
@@ -175,11 +175,28 @@ Subcommands (alphabetical):
 | `restart`   | Alias for `interval` (with no argument, reports current interval and restarts the daemon).                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `rotate`    | Rename `timesheet.log` to `timesheet.YYMMDD` using the earliest entry's date; if last entry is START, appends a STOP no later than one reminder interval after that entry first. If a file for that date already exists, appends to it. Happens automatically at the start of each week — see [Configuration](#rotate--when-a-new-timesheet-week-begins).                                                                                                                                                                                |
 | `start`     | Record work start **now**. With no activity: shows the reminder dialog to pick/enter an activity (macOS, or Linux with `kdialog`/`zenity` installed); otherwise defaults to misc/unspecified (always, on Windows, which has no chooser yet). If a session is already open, a STOP is added only when that START is more than one reminder interval old (capped to one interval after it, leaving the time you were away unbilled) — otherwise the new START closes the previous session on its own, since pairs match in LIFO order. Starts the reminder daemon if not already running (no-op on Windows). |
-| `started`   | Record a work start at a **past time**. Args: `ts started <start_time> [activity...]`. Time formats: e.g. `YYYY-MM-DD HH:MM`, `HH:MM`, or GNU date -d style.                                                                                                                                                                                                                                                                                                                                                                             |
+| `started`   | Record a work start at a **past time**. Args: `ts started <start_time> [activity...]`. See [Time formats](#time-formats).                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `stop`      | Record work stop at **now** or at an optional stop time. If the last entry is already STOP and no time is given, nothing happens; if a time is given, the last STOP is amended. If the last entry is START, appends the new STOP. When a stop is recorded, stops the reminder daemon and shows a dialog that reminders have been stopped (skipped during logout/shutdown).                                                                                                                                                               |
 | `stopped`   | Alias for `stop`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `tail`      | Latest ten log entries with timestamps in local time; START lines show duration. Consecutive STARTs with the same activity are collapsed, then last 10 shown. Optional file/extension or date match to select a log.                                                                                                                                                                                                                                                                                                                     |
 | `timeoff`   | Show the stop-work time for an 8 h/day average. Requires only a START entry (work in progress); no completed session on the current day is required. If the log is empty or the last entry is STOP, appends a START first.                                                                                                                                                                                                                                                                                                               |
+
+### Time formats
+
+`ts started <start_time>` and `ts stop [stop_time]` accept the same forms. A time with no date
+means today; a date with no time means midnight that day. Quote any argument containing a space.
+
+| Form          | Examples                                                  |
+| ------------- | --------------------------------------------------------- |
+| ISO 8601      | `2026-08-06T07:00:00-04:00`                               |
+| Date and time | `"2026-08-06 07:00"`, `"08/06/2026 7:00 PM"`, `"8/6 7am"` |
+| 24-hour time  | `07:00`, `07:00:30`, `7`                                  |
+| 12-hour time  | `7am`, `7 AM`, `7pm`, `7:30pm`, `"12:15:30 p.m."`         |
+| Date only     | `2026-08-06`, `08/06/2026`, `8/6`                         |
+
+A bare hour is 24-hour (`19` is 7 pm), so a bare `12` is noon while `12am` is midnight. The
+meridiem is case-insensitive and may be written `am`/`pm`, `a.m.`/`p.m.`, or `a`/`p`. `MM/DD`
+without a year means the current year.
 
 ### Reminder daemon
 
