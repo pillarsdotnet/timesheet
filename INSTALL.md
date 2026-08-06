@@ -1,6 +1,6 @@
 # Building and installing from source
 
-This document describes how to build and install the **ts** timesheet CLI from the repository.
+This document describes how to build and install the **timesheet** CLI from the repository.
 
 ## Prerequisites
 
@@ -24,40 +24,40 @@ cd timesheet
 cargo build --release
 ```
 
-The binary is written to `target/release/ts` (or `target/debug/ts` if you use `cargo build` without `--release`).
+The binary is written to `target/release/timesheet` (or `target/debug/timesheet` if you use `cargo build` without `--release`).
 
-The first build fetches crates from crates.io, so it needs network access; later builds do not. `ts pdf` and `ts email` bring in PDF and SMTP support (`lopdf` and `lettre`, the latter with rustls and bundled roots), which is most of the binary's size and of the build time. TLS is pure Rust, so no system OpenSSL or certificate store is required, on Linux, macOS, or Windows.
+The first build fetches crates from crates.io, so it needs network access; later builds do not. `timesheet pdf` and `timesheet email` bring in PDF and SMTP support (`lopdf` and `lettre`, the latter with rustls and bundled roots), which is most of the binary's size and of the build time. TLS is pure Rust, so no system OpenSSL or certificate store is required, on Linux, macOS, or Windows.
 
-On Windows, `cargo build --release` produces `target\release\ts.exe`. Core commands (`start`, `stop`, `list`, `sprint`, `tail`, `alias`/`rename`/`prefix`, `rotate`, `migrate`, `timeoff`, `edit`, `pdf`, `email`) work the same as on Linux/macOS. The reminder daemon, reminder dialog, and `ts autostart` are not implemented on Windows yet, so `ts start` with no activity always defaults to misc/unspecified rather than prompting.
+On Windows, `cargo build --release` produces `target\release\timesheet.exe`. Core commands (`start`, `stop`, `list`, `sprint`, `tail`, `alias`/`rename`/`prefix`, `rotate`, `migrate`, `timeoff`, `edit`, `pdf`, `email`) work the same as on Linux/macOS. The reminder daemon, reminder dialog, and `timesheet autostart` are not implemented on Windows yet, so `timesheet start` with no activity always defaults to misc/unspecified rather than prompting.
 
 ### 2. Install the binary
 
 **Using the binary's install subcommand** (run from the repo so it can find itself):
 
 ```sh
-./target/release/ts install
+./target/release/timesheet install
 # or into a specific directory:
-./target/release/ts install ~/bin
+./target/release/timesheet install ~/bin
 ```
 
 **Or copy manually:**
 
 ```sh
-cp target/release/ts ~/bin/ts
-chmod +x ~/bin/ts
+cp target/release/timesheet ~/bin/timesheet
+chmod +x ~/bin/timesheet
 ```
 
 Ensure `~/bin` (or your chosen directory) is on your `PATH`.
 
 ## Autostart (optional, macOS/Linux only)
 
-Not available on Windows (`ts autostart` errors as unsupported there). To run **`ts start`** at login and **`ts stop`** at logout/shutdown on macOS or Linux:
+Not available on Windows (`timesheet autostart` errors as unsupported there). To run **`timesheet start`** at login and **`timesheet stop`** at logout/shutdown on macOS or Linux:
 
 ```sh
-ts autostart
+timesheet autostart
 ```
 
-You can pass an interval (e.g. **`ts autostart 5s`**) to set the reminder interval and start the daemon in this session. Startup skips a new START if the last log entry is a STOP less than 60 seconds old, and if it finds a non-STOP event more than 5 minutes old it backfills a STOP 5 minutes after that event before recording the new START. On macOS this uses LaunchAgents and a logout hook. If the installer prints a `sudo defaults write com.apple.loginwindow LogoutHook ...` command, run it once (it requires your password) so that STOP is recorded when you log out or shut down. To remove: **`ts autostart uninstall`**.
+You can pass an interval (e.g. **`timesheet autostart 5s`**) to set the reminder interval and start the daemon in this session. Startup skips a new START if the last log entry is a STOP less than 60 seconds old, and if it finds a non-STOP event more than 5 minutes old it backfills a STOP 5 minutes after that event before recording the new START. On macOS this uses LaunchAgents and a logout hook. If the installer prints a `sudo defaults write com.apple.loginwindow LogoutHook ...` command, run it once (it requires your password) so that STOP is recorded when you log out or shut down. To remove: **`timesheet autostart uninstall`**.
 
 ## Configuration
 
@@ -71,30 +71,30 @@ rotate:
   time: "00:00"
 ```
 
-Everything else in that file supplies defaults for `ts pdf` and `ts email` — the contractor name, the PDF template, the recipients, and the relay to send through — and may be written per job under `prefixes:`. Those two subcommands are the only ones that need any configuration at all: `template:` has no default, so name it there or pass `--template`.
+Everything else in that file supplies defaults for `timesheet pdf` and `timesheet email` — the contractor name, the PDF template, the recipients, and the relay to send through — and may be written per job under `prefixes:`. Those two subcommands are the only ones that need any configuration at all: `template:` has no default, so name it there or pass `--template`.
 
-See the **Configuration** section of `README.md`, or `ts help`, for the full description.
+See the **Configuration** section of `README.md`, or `timesheet help`, for the full description.
 
 ## Verifying the installation
 
 From any directory (with the install directory on your `PATH`):
 
 ```sh
-ts list
+timesheet list
 ```
 
 If the log file does not exist yet, you should see "No timesheet data found." Otherwise you'll see the report. You can also run:
 
 ```sh
-ts start "test activity"
-ts list
-ts stop
+timesheet start "test activity"
+timesheet list
+timesheet stop
 ```
 
 Once `name:` and `template:` are configured, check that the PDF side works too:
 
 ```sh
-ts pdf -o /tmp/timesheet.pdf
+timesheet pdf -o /tmp/timesheet.pdf
 ```
 
 ## Building Rust documentation
@@ -105,7 +105,7 @@ To generate and open the crate documentation:
 cargo doc --no-deps --open
 ```
 
-Output is under `target/doc/ts/`.
+Output is under `target/doc/timesheet/`.
 
 ## Running tests (Rust)
 

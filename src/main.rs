@@ -1,7 +1,7 @@
 // Copyright (c) 2025 Robert August Vincent II <pillarsdotnet@gmail.com>
 // Co-author: Cursor-AI.
 
-//! # ts — Timesheet CLI
+//! # timesheet — Timesheet CLI
 //!
 //! Tracks work start/stop and reports time by activity and by day of week.
 //! The log file lives at `$HOME/Documents/timesheet.log` by default.
@@ -41,7 +41,7 @@
 //! | Command    | Description |
 //! |------------|-------------|
 //! | `alias`    | Interactively replace activity text in this week's START entries (regex). |
-//! | `autostart` | Register `ts start` on login and `ts stop` on logout/shutdown (macOS/Linux only). |
+//! | `autostart` | Register `timesheet start` on login and `timesheet stop` on logout/shutdown (macOS/Linux only). |
 //! | `edit`     | Open the timesheet log in `$EDITOR` (then `$VISUAL`, else `vi`; `notepad` on Windows). |
 //! | `email`    | Fill the timesheet PDF as `pdf` does and mail it as an attachment. |
 //! | `help`     | Show the man page in a pager (groff -man -Tascii \| less; plain text via `more` on Windows). |
@@ -50,7 +50,7 @@
 //! | `list`     | Report % per activity and hours per weekday; optional file/extension arg, date, or negative rotated-log index; `-p/--prefix` reports one job only. |
 //! | `migrate`  | Convert all timesheet.* files in the log directory to strict ISO 8601 timestamps. |
 //! | `pdf`      | Fill a form-fillable PDF template with one week of the timesheet; optional file/date/index arg selects the week. |
-//! | `prefix`   | `ts prefix foo bar` is `ts alias bar foo:bar`: prepend `foo:` to this week's activities matching `bar`. |
+//! | `prefix`   | `timesheet prefix foo bar` is `timesheet alias bar foo:bar`: prepend `foo:` to this week's activities matching `bar`. |
 //! | `sprint`   | Report % per activity and hours per weekday across the current log plus the most recently rotated log. |
 //! | `tail`     | Last 10 log entries with timestamps in local time; optional file/extension arg. |
 //! | `manpage`  | Output Unix manual page in groff format to stdout. |
@@ -100,7 +100,7 @@ const DEFAULT_TIMESHEET: &str = "Documents/timesheet.log";
 /// Canonical source repository for this project.
 const CANONICAL_SOURCE_URL: &str = "https://github.com/pillarsdotnet/timesheet";
 
-/// Icon for macOS reminder dock; embedded so "ts install" can write it without the repo.
+/// Icon for macOS reminder dock; embedded so "timesheet install" can write it without the repo.
 #[cfg(target_os = "macos")]
 const EMBEDDED_ICON_SVG: &[u8] = include_bytes!("../assets/icon.svg");
 
@@ -181,8 +181,8 @@ fn reminder_pid_path() -> PathBuf {
 
 /// Atomically claim sole ownership of the reminder daemon by creating the PID file with O_EXCL.
 /// Returns true if this process now owns the daemon role, false if a live daemon already owns it.
-/// This makes the daemon self-deduplicating: if several are spawned in a race (interactive `ts start`,
-/// `ts autostart`, and the systemd start unit can all fire near-simultaneously), only the first to
+/// This makes the daemon self-deduplicating: if several are spawned in a race (interactive `timesheet start`,
+/// `timesheet autostart`, and the systemd start unit can all fire near-simultaneously), only the first to
 /// claim the file runs the loop; the rest see a live owner and exit.
 fn claim_reminder_daemon_ownership(pid_path: &Path) -> bool {
     let my_pid = process::id();
@@ -226,13 +226,13 @@ fn owns_reminder_daemon(pid_path: &Path) -> bool {
 /// and while a prompt is on screen.
 const REMINDER_OWNERSHIP_POLL: Duration = Duration::from_millis(500);
 
-/// Set once this process has claimed the daemon role. Code shared with the foreground `ts start`
+/// Set once this process has claimed the daemon role. Code shared with the foreground `timesheet start`
 /// chooser uses it to tell the two apart: the foreground chooser never owns the PID file and must
 /// not treat that as a reason to close itself.
 static IS_REMINDER_DAEMON: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// True when this process is a reminder daemon that no longer owns the PID file — `ts stop` removed
+/// True when this process is a reminder daemon that no longer owns the PID file — `timesheet stop` removed
 /// it, or a newer daemon replaced it. Both mean this daemon and any prompt it has on screen should
 /// go away.
 fn reminder_daemon_disowned() -> bool {
@@ -578,13 +578,13 @@ fn load_rotation_boundary(path: &Path) -> RotationBoundary {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return RotationBoundary::default(),
         Err(e) => {
-            eprintln!("ts: {}: {}; using default rotation", path.display(), e);
+            eprintln!("timesheet: {}: {}; using default rotation", path.display(), e);
             return RotationBoundary::default();
         }
     };
     let (boundary, warnings) = rotation_boundary_from_config(&parse_simple_yaml(&text));
     for w in warnings {
-        eprintln!("ts: {}: {}", path.display(), w);
+        eprintln!("timesheet: {}: {}", path.display(), w);
     }
     boundary
 }
@@ -727,7 +727,7 @@ fn close_open_session_before_start(timesheet: &Path, now: DateTime<Local>) -> bo
 
 /// Reconcile a session left open by a missed shutdown/logout STOP: if the last log entry is a START
 /// older than five minutes, close it with a STOP capped to one reminder interval after that entry
-/// (via clamp_auto_stop_time) so a shutdown without `ts stop` never records work all night. A recent
+/// (via clamp_auto_stop_time) so a shutdown without `timesheet stop` never records work all night. A recent
 /// open session is left untouched so we never close one the user is actively working on. Returns
 /// whether a STOP was written.
 fn reconcile_stale_open_session(timesheet: &Path, now: DateTime<Local>) -> bool {
@@ -803,7 +803,7 @@ fn date_range_in_log(path: &Path) -> Option<(NaiveDate, NaiveDate)> {
 /// If the last entry is START (work in progress), appends a STOP no later than one reminder interval after that entry before rotating.
 fn do_rotate(timesheet: &Path) -> Result<(), String> {
     if !timesheet.exists() {
-        return Err("ts rotate: no timesheet data found.".to_string());
+        return Err("timesheet rotate: no timesheet data found.".to_string());
     }
     let content = fs::read_to_string(timesheet).map_err(|e| e.to_string())?;
     let last = content.lines().rev().find(|l| !l.trim().is_empty());
@@ -820,9 +820,9 @@ fn do_rotate(timesheet: &Path) -> Result<(), String> {
         f.write_all(format!("{}\n", format_stop_log_entry(stop_dt)).as_bytes())
             .map_err(|e| e.to_string())?;
     }
-    let min_dt = min_dt_in_log(timesheet).ok_or("ts rotate: no valid entries in timesheet.")?;
+    let min_dt = min_dt_in_log(timesheet).ok_or("timesheet rotate: no valid entries in timesheet.")?;
     let stamp = min_dt.format("%y%m%d").to_string();
-    let parent = timesheet.parent().ok_or("ts rotate: no parent dir")?;
+    let parent = timesheet.parent().ok_or("timesheet rotate: no parent dir")?;
     let stem = timesheet
         .file_stem()
         .and_then(|s| s.to_str())
@@ -883,7 +883,7 @@ fn migrate_parse_line(line: &str) -> Option<LogLine> {
 
 /// Converts all timesheet.* files in the timesheet directory to current format (timestamp first, ISO 8601).
 fn cmd_migrate(timesheet: &Path) -> Result<(), String> {
-    let dir = timesheet.parent().ok_or("ts migrate: no parent dir")?;
+    let dir = timesheet.parent().ok_or("timesheet migrate: no parent dir")?;
     if !dir.exists() {
         return Ok(());
     }
@@ -901,7 +901,7 @@ fn cmd_migrate(timesheet: &Path) -> Result<(), String> {
     }
     for path in &files {
         let content = fs::read_to_string(path)
-            .map_err(|e| format!("ts migrate: read {}: {}", path.display(), e))?;
+            .map_err(|e| format!("timesheet migrate: read {}: {}", path.display(), e))?;
         let mut out = String::new();
         for line in content.lines() {
             let new_line = match migrate_parse_line(line) {
@@ -920,7 +920,7 @@ fn cmd_migrate(timesheet: &Path) -> Result<(), String> {
             out.push_str(&new_line);
         }
         fs::write(path, &out)
-            .map_err(|e| format!("ts migrate: write {}: {}", path.display(), e))?;
+            .map_err(|e| format!("timesheet migrate: write {}: {}", path.display(), e))?;
         println!("Migrated {}", path.display());
     }
     if files.is_empty() {
@@ -964,7 +964,7 @@ fn resolve_list_input_impl(
                 if let Some(path) = nth_latest_rotated_timesheet(timesheet, rotated_index) {
                     return Ok(path);
                 }
-                return Err(format!("ts list: no timesheet matches \"{}\".", list_arg));
+                return Err(format!("timesheet list: no timesheet matches \"{}\".", list_arg));
             }
         }
     }
@@ -1030,7 +1030,7 @@ fn resolve_list_input_impl(
     }
     if matches.len() > 1 {
         return Err(format!(
-            "ts list: multiple timesheets match \"{}\".",
+            "timesheet list: multiple timesheets match \"{}\".",
             list_arg
         ));
     }
@@ -1097,7 +1097,7 @@ fn resolve_list_input_impl(
             return Ok(path);
         }
     }
-    Err(format!("ts list: no timesheet matches \"{}\".", list_arg))
+    Err(format!("timesheet list: no timesheet matches \"{}\".", list_arg))
 }
 
 fn resolve_list_input(arg: Option<&str>, timesheet: &Path) -> Result<PathBuf, String> {
@@ -1185,7 +1185,7 @@ fn sprint_report_data(timesheet: &Path) -> Result<(ParsedLogLines, CurrentTask),
 
 /// Records work start now; activity is optional. With no argument, shows the reminder chooser to pick/enter an activity (macOS via AppKit; Linux via PyQt single-click chooser, falling back to kdialog/zenity).
 /// On other platforms or if the user declines, falls back to misc/unspecified.
-/// Ensures the reminder daemon is running at entry (so it stays running even when ts start is run at system startup and
+/// Ensures the reminder daemon is running at entry (so it stays running even when timesheet start is run at system startup and
 /// exits before the final start call), then restarts it after recording START to reset the timer.
 fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
     // Guard against shutdown/reload race: if auto-invoked (no args) and the last log
@@ -1201,7 +1201,7 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
             if (0..60).contains(&age) {
                 if env::var_os("TS_DEBUG").is_some() {
                     let _ = std::io::stderr().write_all(
-                        b"ts: skipping start: last STOP was <60s ago (shutdown/reload guard)\n",
+                        b"timesheet: skipping start: last STOP was <60s ago (shutdown/reload guard)\n",
                     );
                 }
                 return Ok(());
@@ -1223,7 +1223,7 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
         // is (re)started after the chooser resolves and a START is recorded (below).
         kill_reminder_daemon_if_running();
     } else {
-        // Start the daemon early so it is running even when ts start is invoked at login
+        // Start the daemon early so it is running even when timesheet start is invoked at login
         // (LaunchAgent / systemd) and exits quickly without prompting.
         start_reminder_daemon_if_needed(timesheet);
     }
@@ -1260,7 +1260,7 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Records work stop at the given time (or now if no time given). Same time formats as `ts started`
+/// Records work stop at the given time (or now if no time given). Same time formats as `timesheet started`
 /// (see [`parse_start_time`]).
 /// If the last entry is already STOP: no stop-time argument → no change; with stop-time → amend that entry.
 fn cmd_stop(args: &[String], timesheet: &Path) -> Result<(), String> {
@@ -1274,7 +1274,7 @@ fn cmd_stop(args: &[String], timesheet: &Path) -> Result<(), String> {
     {
         let Some(t) = args.first().map(String::as_str) else {
             // The log needs no change, but stopping is still stopping: silence the daemon anyway.
-            // Otherwise a `ts stop` after an unanswered reminder (which records its own STOP)
+            // Otherwise a `timesheet stop` after an unanswered reminder (which records its own STOP)
             // would leave the daemon running to prompt again one interval later.
             let was_running = is_reminder_daemon_running();
             if was_running {
@@ -1287,7 +1287,7 @@ fn cmd_stop(args: &[String], timesheet: &Path) -> Result<(), String> {
             return Ok(());
         };
         let stop_dt = parse_start_time(t)
-            .ok_or_else(|| format!("ts stop: could not parse stop time: {}", t))?;
+            .ok_or_else(|| format!("timesheet stop: could not parse stop time: {}", t))?;
         let lines: Vec<&str> = content.lines().collect();
         let without_last = if lines.is_empty() {
             String::new()
@@ -1305,7 +1305,7 @@ fn cmd_stop(args: &[String], timesheet: &Path) -> Result<(), String> {
     }
     let stop_dt = match args.first().map(String::as_str) {
         Some(t) => parse_start_time(t)
-            .ok_or_else(|| format!("ts stop: could not parse stop time: {}", t))?,
+            .ok_or_else(|| format!("timesheet stop: could not parse stop time: {}", t))?,
         None => Local::now(),
     };
     let line = format!("{}\n", format_stop_log_entry(stop_dt));
@@ -1539,30 +1539,30 @@ fn cmd_edit(timesheet: &Path) -> Result<(), String> {
         });
     if let Some(parent) = timesheet.parent() {
         fs::create_dir_all(parent)
-            .map_err(|e| format!("ts edit: cannot create {}: {}", parent.display(), e))?;
+            .map_err(|e| format!("timesheet edit: cannot create {}: {}", parent.display(), e))?;
     }
     let status = Command::new(&editor)
         .arg(timesheet)
         .status()
-        .map_err(|e| format!("ts edit: cannot run editor {:?}: {}", editor, e))?;
+        .map_err(|e| format!("timesheet edit: cannot run editor {:?}: {}", editor, e))?;
     if status.success() {
         Ok(())
     } else {
         Err(format!(
-            "ts edit: editor {:?} exited with {}",
+            "timesheet edit: editor {:?} exited with {}",
             editor, status
         ))
     }
 }
 
-/// Parsed command line for `ts list`: at most one week selector plus the options.
+/// Parsed command line for `timesheet list`: at most one week selector plus the options.
 struct ListArgs {
     input: Option<String>,
     /// `None` when no filtering was asked for; an empty `--prefix` reports every entry.
     prefix: Option<String>,
 }
 
-/// Parses `ts list`'s arguments. The selector may be a negative rotated-log index, so a
+/// Parses `timesheet list`'s arguments. The selector may be a negative rotated-log index, so a
 /// leading dash followed by digits is a positional rather than an option, and `--` forces
 /// what follows to be positional.
 fn parse_list_args(args: &[String]) -> Result<ListArgs, String> {
@@ -1578,7 +1578,7 @@ fn parse_list_args(args: &[String]) -> Result<ListArgs, String> {
         if positional_only || !arg.starts_with('-') || arg == "-" || negative_index {
             if input.is_some() {
                 return Err(format!(
-                    "ts list: unexpected extra argument \"{}\"; only one week may be selected",
+                    "timesheet list: unexpected extra argument \"{}\"; only one week may be selected",
                     arg
                 ));
             }
@@ -1602,14 +1602,14 @@ fn parse_list_args(args: &[String]) -> Result<ListArgs, String> {
                         let v = args
                             .get(index)
                             .cloned()
-                            .ok_or_else(|| format!("ts list: {} needs a value", name))?;
+                            .ok_or_else(|| format!("timesheet list: {} needs a value", name))?;
                         index += 1;
                         v
                     }
                 };
                 prefix = Some(value);
             }
-            other => return Err(format!("ts list: unknown option \"{}\"", other)),
+            other => return Err(format!("timesheet list: unknown option \"{}\"", other)),
         }
     }
     Ok(ListArgs { input, prefix })
@@ -1633,7 +1633,7 @@ fn filter_lines_by_prefix(lines: &[(usize, LogLine)], prefix: &str) -> Vec<(usiz
 
 fn cmd_list(args: &[String], timesheet: &Path) -> Result<(), String> {
     if env::var_os("TS_DEBUG").is_some() {
-        let _ = std::io::stderr().write_all(b"ts: cmd_list entered\n");
+        let _ = std::io::stderr().write_all(b"timesheet: cmd_list entered\n");
     }
     let parsed = parse_list_args(args)?;
     let list_arg = parsed.input.as_deref();
@@ -1718,7 +1718,7 @@ fn cmd_started(args: &[String], timesheet: &Path) -> Result<(), String> {
     let (start_time, activity) = match args.split_first() {
         Some((st, rest)) => (st.as_str(), rest.join(" ")),
         None => {
-            eprintln!("Usage: ts started <start_time> [activity...]");
+            eprintln!("Usage: timesheet started <start_time> [activity...]");
             eprintln!(
                 "  start_time is required (e.g. \"2026-08-06 09:00\", 09:00, 9am, \"9:30 AM\")."
             );
@@ -1731,7 +1731,7 @@ fn cmd_started(args: &[String], timesheet: &Path) -> Result<(), String> {
         activity
     };
     let start_dt = parse_start_time(start_time)
-        .ok_or_else(|| format!("ts started: could not parse start time: {}", start_time))?;
+        .ok_or_else(|| format!("timesheet started: could not parse start time: {}", start_time))?;
     maybe_rotate_if_previous_week(timesheet)?;
     let content = fs::read_to_string(timesheet).unwrap_or_default();
     let new_entry = format_start_log_entry(start_dt, &activity);
@@ -1937,13 +1937,13 @@ fn cmd_workalias(args: &[String], timesheet: &Path) -> Result<(), String> {
     let (search_text, replacement) = match args {
         [p, r, ..] => (p.as_str(), r.to_string()),
         _ => {
-            eprintln!("Usage: ts alias <pattern> <replacement>");
-            eprintln!("       ts rename <pattern> <replacement>");
+            eprintln!("Usage: timesheet alias <pattern> <replacement>");
+            eprintln!("       timesheet rename <pattern> <replacement>");
             return Err("missing args".to_string());
         }
     };
     if !timesheet.exists() {
-        return Err("ts alias: no timesheet data found.".to_string());
+        return Err("timesheet alias: no timesheet data found.".to_string());
     }
     let now = Local::now();
     let week_start_dt = week_start(now);
@@ -1953,7 +1953,7 @@ fn cmd_workalias(args: &[String], timesheet: &Path) -> Result<(), String> {
         collect_workalias_matches(&content, week_start_dt, week_end, search_text, &replacement);
     if matches_vec.is_empty() {
         return Err(format!(
-            "ts alias: no activities matching \"{}\" found for this week.",
+            "timesheet alias: no activities matching \"{}\" found for this week.",
             search_text
         ));
     }
@@ -2038,12 +2038,12 @@ fn cmd_workalias(args: &[String], timesheet: &Path) -> Result<(), String> {
 }
 
 /// Prepends "<prefix>:" to activities matching a pattern in this week's START entries.
-/// `ts prefix foo bar` is equivalent to `ts alias bar foo:bar`.
+/// `timesheet prefix foo bar` is equivalent to `timesheet alias bar foo:bar`.
 fn cmd_prefix(args: &[String], timesheet: &Path) -> Result<(), String> {
     let (prefix, pattern) = match args {
         [p, t, ..] => (p.as_str(), t.as_str()),
         _ => {
-            eprintln!("Usage: ts prefix <prefix> <pattern>");
+            eprintln!("Usage: timesheet prefix <prefix> <pattern>");
             return Err("missing args".to_string());
         }
     };
@@ -2065,10 +2065,10 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
         let p = PathBuf::from(d);
         if !p.exists() {
             fs::create_dir_all(&p)
-                .map_err(|e| format!("ts install: cannot create directory {}: {}", d, e))?;
+                .map_err(|e| format!("timesheet install: cannot create directory {}: {}", d, e))?;
         }
         if !p.is_dir() || !is_writable(&p) {
-            return Err(format!("ts install: directory is not writable: {}", d));
+            return Err(format!("timesheet install: directory is not writable: {}", d));
         }
         p
     } else {
@@ -2086,22 +2086,26 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
             }
         }
         found.ok_or(
-            "ts install: no writable directory on PATH. Specify an installation directory.",
+            "timesheet install: no writable directory on PATH. Specify an installation directory.",
         )?
     };
     // Look for a prebuilt binary under script_dir first (its filename must match this platform's
-    // convention: "ts.exe" on Windows, "ts" elsewhere -- a bare "ts" must never be preferred on
-    // Windows, since a Linux/macOS build of the same repo can leave one sitting right next to
-    // "ts.exe" in a shared target dir, e.g. when accessed through WSL interop), falling back to
-    // the currently running executable.
-    let candidate = script_dir.join(if cfg!(windows) { "ts.exe" } else { "ts" });
+    // convention -- "timesheet.exe" on Windows, "timesheet" elsewhere -- checked via cfg!(windows)
+    // rather than assumed, since a Linux/macOS build of the same repo can leave a same-named
+    // extensionless binary sitting right next to the Windows one in a shared target dir, e.g. when
+    // accessed through WSL interop), falling back to the currently running executable.
+    let candidate = script_dir.join(if cfg!(windows) { "timesheet.exe" } else { "timesheet" });
     let src_to_use = if candidate.exists() { &candidate } else { &exe };
     if !src_to_use.exists() {
-        return Err(format!("ts install: missing {}", src_to_use.display()));
+        return Err(format!("timesheet install: missing {}", src_to_use.display()));
     }
-    let dest_file = dest.join(if cfg!(windows) { "ts.exe" } else { "ts" });
+    // Installed as "timesheet", not "ts", on every platform: "ts" is a name several unrelated
+    // tools already claim -- e.g. BusyBox's "ts" applet and moreutils' timestamp-prefixing "ts"
+    // -- so a bare "ts" ahead of this binary on PATH (a Scoop shim, for instance) would silently
+    // run the wrong program instead.
+    let dest_file = dest.join(if cfg!(windows) { "timesheet.exe" } else { "timesheet" });
     if !paths_refer_to_same_file(src_to_use, &dest_file) {
-        fs::copy(src_to_use, &dest_file).map_err(|e| format!("ts install: copy failed: {}", e))?;
+        fs::copy(src_to_use, &dest_file).map_err(|e| format!("timesheet install: copy failed: {}", e))?;
     }
     #[cfg(unix)]
     {
@@ -2134,17 +2138,17 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
     {
         match install_windows_start_menu_shortcut(&dest_file) {
             Ok(path) => println!("Installed Start Menu shortcut {}", path.display()),
-            Err(e) => eprintln!("ts install: warning: {}", e),
+            Err(e) => eprintln!("timesheet install: warning: {}", e),
         }
     }
     println!("Installed {}", dest_file.display());
-    println!("Done. ts is in {} and executable.", dest.display());
+    println!("Done. timesheet is in {} and executable.", dest.display());
     Ok(())
 }
 
-/// Create (or overwrite) a per-user Start Menu shortcut that runs `ts.exe start`, so starting
-/// work is a point-and-click action. Shells out to PowerShell's WScript.Shell COM object, same
-/// approach as the OS-tool shell-outs used for the macOS install steps above.
+/// Create (or overwrite) a per-user Start Menu shortcut that runs `timesheet.exe start`, so
+/// starting work is a point-and-click action. Shells out to PowerShell's WScript.Shell COM
+/// object, same approach as the OS-tool shell-outs used for the macOS install steps above.
 #[cfg(target_os = "windows")]
 fn install_windows_start_menu_shortcut(dest_file: &Path) -> Result<PathBuf, String> {
     let start_menu = dirs::config_dir()
@@ -2171,7 +2175,7 @@ fn install_windows_start_menu_shortcut(dest_file: &Path) -> Result<PathBuf, Stri
          $s.Arguments = 'start'; \
          $s.WorkingDirectory = '{workdir}'; \
          $s.IconLocation = '{exe}'; \
-         $s.Description = 'Record work start (same as running \"ts start\")'; \
+         $s.Description = 'Record work start (same as running \"timesheet start\")'; \
          $s.Save()"
     );
     let status = Command::new("powershell")
@@ -2187,7 +2191,7 @@ fn install_windows_start_menu_shortcut(dest_file: &Path) -> Result<PathBuf, Stri
     Ok(shortcut)
 }
 
-/// Remove startup/shutdown/login/logout hooks that reference ts. No-op on unsupported platforms.
+/// Remove startup/shutdown/login/logout hooks that reference timesheet. No-op on unsupported platforms.
 fn uninstall_autostart_hooks() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     return do_autostart_uninstall_macos();
@@ -2200,15 +2204,15 @@ fn uninstall_autostart_hooks() -> Result<(), String> {
     }
 }
 
-/// Stop reminder daemon, remove autostart hooks, optionally remove log files, then remove ts-icon.svg and the ts binary.
+/// Stop reminder daemon, remove autostart hooks, optionally remove log files, then remove ts-icon.svg and the timesheet binary.
 fn cmd_uninstall(args: &[String]) -> Result<(), String> {
     let _ = args;
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     let install_dir = exe
         .parent()
-        .ok_or("ts uninstall: could not determine install directory")?;
+        .ok_or("timesheet uninstall: could not determine install directory")?;
 
-    println!("Uninstalling ts from {} ...", install_dir.display());
+    println!("Uninstalling timesheet from {} ...", install_dir.display());
 
     if is_reminder_daemon_running() {
         show_reminders_stopped_notification();
@@ -2262,11 +2266,25 @@ fn cmd_uninstall(args: &[String]) -> Result<(), String> {
     let icon_path = install_dir.join("ts-icon.svg");
     if icon_path.exists() {
         fs::remove_file(&icon_path)
-            .map_err(|e| format!("ts uninstall: could not remove icon: {}", e))?;
+            .map_err(|e| format!("timesheet uninstall: could not remove icon: {}", e))?;
         println!("Removed {}", icon_path.display());
     }
 
-    fs::remove_file(&exe).map_err(|e| format!("ts uninstall: could not remove binary: {}", e))?;
+    #[cfg(target_os = "windows")]
+    if let Some(shortcut) = dirs::config_dir().map(|d| {
+        d.join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs")
+            .join("Start Timesheet.lnk")
+    }) {
+        if shortcut.exists() {
+            let _ = fs::remove_file(&shortcut);
+            println!("Removed {}", shortcut.display());
+        }
+    }
+
+    fs::remove_file(&exe).map_err(|e| format!("timesheet uninstall: could not remove binary: {}", e))?;
     println!("Removed {}", exe.display());
     println!("Uninstall complete.");
     Ok(())
@@ -2292,22 +2310,22 @@ fn cmd_rebuild(args: &[String]) -> Result<(), String> {
     let install_dir = env::current_exe()
         .map_err(|e| e.to_string())?
         .parent()
-        .ok_or("ts rebuild: could not determine install directory")?
+        .ok_or("timesheet rebuild: could not determine install directory")?
         .to_path_buf();
 
     let build_dir_arg = args.first().map(String::as_str).unwrap_or(".");
     let build_dir = if build_dir_arg == "." {
-        env::current_dir().map_err(|e| format!("ts rebuild: {}", e))?
+        env::current_dir().map_err(|e| format!("timesheet rebuild: {}", e))?
     } else {
         let p = PathBuf::from(build_dir_arg);
         if !p.exists() {
-            return Err(format!("ts rebuild: no such directory: {}", p.display()));
+            return Err(format!("timesheet rebuild: no such directory: {}", p.display()));
         }
         if !p.is_dir() {
-            return Err(format!("ts rebuild: not a directory: {}", p.display()));
+            return Err(format!("timesheet rebuild: not a directory: {}", p.display()));
         }
         p.canonicalize()
-            .map_err(|e| format!("ts rebuild: {}: {}", p.display(), e))?
+            .map_err(|e| format!("timesheet rebuild: {}: {}", p.display(), e))?
     };
 
     let cargo_toml = build_dir.join("Cargo.toml");
@@ -2315,7 +2333,7 @@ fn cmd_rebuild(args: &[String]) -> Result<(), String> {
         build_dir
     } else if args.is_empty() {
         // No arg and no Cargo.toml in current dir: clone repo
-        let clone_parent = env::temp_dir().join(format!("ts-rebuild-{}", process::id()));
+        let clone_parent = env::temp_dir().join(format!("timesheet-rebuild-{}", process::id()));
         if clone_parent.exists() {
             fs::remove_dir_all(&clone_parent).map_err(|e| e.to_string())?;
         }
@@ -2324,14 +2342,14 @@ fn cmd_rebuild(args: &[String]) -> Result<(), String> {
             .args(["clone", "https://github.com/pillarsdotnet/timesheet"])
             .current_dir(&clone_parent)
             .status()
-            .map_err(|e| format!("ts rebuild: git clone failed: {}", e))?;
+            .map_err(|e| format!("timesheet rebuild: git clone failed: {}", e))?;
         if !status.success() {
-            return Err("ts rebuild: git clone failed.".to_string());
+            return Err("timesheet rebuild: git clone failed.".to_string());
         }
         clone_parent.join("timesheet")
     } else {
         return Err(format!(
-            "ts rebuild: no Cargo.toml in {}",
+            "timesheet rebuild: no Cargo.toml in {}",
             build_dir.display()
         ));
     };
@@ -2340,18 +2358,18 @@ fn cmd_rebuild(args: &[String]) -> Result<(), String> {
         .args(["build", "--release"])
         .current_dir(&build_dir)
         .status()
-        .map_err(|e| format!("ts rebuild: cargo build failed: {}", e))?;
+        .map_err(|e| format!("timesheet rebuild: cargo build failed: {}", e))?;
     if !status.success() {
-        return Err("ts rebuild: cargo build failed.".to_string());
+        return Err("timesheet rebuild: cargo build failed.".to_string());
     }
 
     #[cfg(not(windows))]
-    let exe = build_dir.join("target/release/ts");
+    let exe = build_dir.join("target/release/timesheet");
     #[cfg(windows)]
-    let exe = build_dir.join("target/release/ts.exe");
+    let exe = build_dir.join("target/release/timesheet.exe");
     if !exe.exists() {
         return Err(format!(
-            "ts rebuild: binary not found after build: {}",
+            "timesheet rebuild: binary not found after build: {}",
             exe.display()
         ));
     }
@@ -2360,9 +2378,9 @@ fn cmd_rebuild(args: &[String]) -> Result<(), String> {
         .arg("install")
         .arg(&install_dir)
         .status()
-        .map_err(|e| format!("ts rebuild: install failed: {}", e))?;
+        .map_err(|e| format!("timesheet rebuild: install failed: {}", e))?;
     if !status.success() {
-        return Err("ts rebuild: install failed.".to_string());
+        return Err("timesheet rebuild: install failed.".to_string());
     }
 
     println!("Rebuilt and installed to {}", install_dir.display());
@@ -2371,82 +2389,82 @@ fn cmd_rebuild(args: &[String]) -> Result<(), String> {
 
 /// Groff man page source (shared by manpage and help).
 fn manpage_content() -> &'static str {
-    r#".TH TS 1 "February 2025" "" "ts"
+    r#".TH TIMESHEET 1 "February 2025" "" "timesheet"
 .SH NAME
-ts \- timesheet CLI (start, stop, list, report by activity and weekday)
+timesheet \- track work time and report by activity and weekday (start, stop, list, ...)
 .SH SYNOPSIS
-.B ts
+.B timesheet
 .I command
 .RI [ args... ]
 .PP
-.B ts alias
+.B timesheet alias
 .I pattern
 .I replacement
 .PP
-.B ts autostart
+.B timesheet autostart
 .RI [ uninstall ]
 .PP
-.B ts email
+.B timesheet email
 .RI [ options "] [" week ]
 .PP
-.B ts help
+.B timesheet help
 .PP
-.B ts install
+.B timesheet install
 .RI [ install_dir " [" repo_path ]]
 .PP
-.B ts uninstall
+.B timesheet uninstall
 .PP
-.B ts interval
+.B timesheet interval
 .RI [ duration ]
 .PP
-.B ts list
+.B timesheet list
 .RI [ options "] [" file_or_extension ]
 .PP
-.B ts sprint
+.B timesheet sprint
 .PP
-.B ts tail
+.B timesheet tail
 .RI [ file_or_extension ]
 .PP
-.B ts manpage
+.B timesheet manpage
 .PP
-.B ts pdf
+.B timesheet pdf
 .RI [ options "] [" week ]
 .PP
-.B ts prefix
+.B timesheet prefix
 .I prefix
 .I pattern
 .PP
-.B ts rebuild
+.B timesheet rebuild
 .RI [ directory ]
 .PP
-.B ts rename
+.B timesheet rename
 .I pattern
 .I replacement
 .PP
-.B ts reminder
+.B timesheet reminder
 .RI [ duration ]
 .PP
-.B ts restart
+.B timesheet restart
 .RI [ duration ]
 .PP
-.B ts rotate
+.B timesheet rotate
 .PP
-.B ts start
+.B timesheet start
 .RI [ activity ]
 .PP
-.B ts started
+.B timesheet started
 .I start_time
 .RI [ activity... ]
 .PP
-.B ts stop
+.B timesheet stop
 .RI [ stop_time ]
 .PP
-.B ts stopped
+.B timesheet stopped
 .RI [ stop_time ]
 .PP
-.B ts timeoff
+.B timesheet timeoff
 .SH DESCRIPTION
-.B ts
+.B timesheet
 tracks work start/stop and reports time by activity and by day of week.
 The log file is
 .BR $HOME /Documents/timesheet.log
@@ -2475,7 +2493,7 @@ used. Quote a value whose leading or trailing spaces matter, such as
 .PP
 .B "rotate"
 selects when a new timesheet week begins \(em the boundary at which
-.B ts
+.B timesheet
 automatically rotates the log (see
 .BR "AUTOMATIC ROTATION" ).
 It takes a mapping with
@@ -2646,11 +2664,11 @@ The report uses these pairs to compute duration and attribute time to activity a
 The
 .I start_time
 of
-.B ts started
+.B timesheet started
 and the
 .I stop_time
 of
-.B ts stop
+.B timesheet stop
 accept the same forms. A time with no date means today; a date with no time means midnight
 that day. Quote any argument containing a space.
 .TP
@@ -2701,9 +2719,9 @@ applies the current replacement and all remaining matches without prompting agai
 .B autostart
 [\fIinterval\fR]
 Register
-.B "ts start"
+.B "timesheet start"
 to run at login and
-.B "ts stop"
+.B "timesheet stop"
 to run at logout or system shutdown. Optional
 .I interval
 (e.g.\ \&5s, 3m) sets the reminder interval and starts the daemon in this session; if the daemon is already running, it is restarted so the new interval takes effect immediately.
@@ -2712,26 +2730,26 @@ On macOS installs two LaunchAgents and a logout hook:
 .TP
 \fBcom.ts.autostart.start\fR
 Runs
-.B "ts start"
+.B "timesheet start"
 at login (RunAtLoad, limited to Aqua sessions).
 A shutdown guard skips the start if the last log entry is a STOP less than 60\ s old.
 If the last recorded event is not STOP and is more than 5 minutes old, startup backfills a STOP one reminder interval after that event before recording the new START.
 .TP
 \fBcom.ts.autostart.session\fR
 Runs
-.B "ts \-\-session\-daemon"
+.B "timesheet \-\-session\-daemon"
 as a persistent launchd job; on logout/shutdown launchd sends it SIGTERM and waits up to 30 s (ExitTimeOut) for it to write the STOP entry and exit.
 .TP
 \fBLogoutHook\fR
 Runs as root before logout/shutdown and macOS blocks the shutdown sequence until it returns, providing a second guarantee that STOP is recorded. Uses
 .B "launchctl asuser"
 to invoke
-.B "ts stop"
+.B "timesheet stop"
 in the console user's launchd context. Requires sudo to register; if it cannot be set the command to run manually is printed.
 .RE
 On Linux uses systemd user services, plus a system-level logout hook
 .RB ( ts-logout- uid .service)
-whose ExecStop runs "ts stop" before shutdown.target as a second guarantee that STOP is recorded on a
+whose ExecStop runs "timesheet stop" before shutdown.target as a second guarantee that STOP is recorded on a
 full shutdown/reboot. Installing the system unit needs administrator access, so the
 .B sudo
 command is printed and offered to run; if declined, run it yourself. Once present, later runs skip it.
@@ -2746,7 +2764,7 @@ Not supported on Windows; errors with a message to that effect.
 .TP
 .B help
 Run the equivalent of
-.B "ts manpage | groff \-man \-Tascii | less"
+.B "timesheet manpage | groff \-man \-Tascii | less"
 to show this manual page in the system pager. On Windows, where groff and less are not
 available, renders this page as plain text and pages it with
 .BR more .
@@ -2767,16 +2785,35 @@ Optional
 .I repo_path
 is the directory containing the binary (default: current executable's directory). On macOS the icon is embedded so
 .B ts-icon.svg
-is always written even without the source repository. On Windows, also creates (or overwrites) a per-user Start Menu shortcut, "Start Timesheet", that runs
-.B "ts start"
+is always written even without the source repository. The binary is installed as
+.B timesheet
+(
+.B timesheet.exe
+on Windows), not the shorter
+.BR ts ,
+since
+.B ts
+is a name several unrelated tools already claim (e.g. BusyBox's
+.B ts
+applet and moreutils'
+.B ts
+timestamp filter) \(em a shadowed
+.B ts
+ahead of this binary on
+.B PATH
+would silently run the wrong program. On Windows, also creates (or overwrites) a per-user Start
+Menu shortcut, "Start Timesheet", that runs
+.B "timesheet.exe start"
 so starting work is a point-and-click action.
 .TP
 .B uninstall
 Stop the reminder daemon, remove startup/shutdown/login/logout hooks (LaunchAgents and LogoutHook on macOS, systemd user units and the system-level logout hook on Linux), prompt to remove timesheet log files (y/N), then remove
-.B ts-icon.svg
-and the
-.B ts
-binary from the directory containing the running executable.
+.BR ts-icon.svg ,
+the Start Menu shortcut (Windows), and the
+.B timesheet
+binary (
+.B timesheet.exe
+on Windows) from the directory containing the running executable.
 .TP
 .B interval
 Set or show the time between reminder daemon prompts. With no argument, print the current interval. With one argument, set the interval and restart the daemon.
@@ -2792,7 +2829,7 @@ and
 .B reminder
 are aliases for
 .BR interval .
-Reminder daemon behavior: if a prompt goes unanswered for one reminder interval, records a STOP timestamped at the moment the prompt appeared, not when the interval expired. That timestamp is used exactly, without the one-interval cap, because the prompt appears one reminder interval after the previous entry and so already marks the last time you were known to be working. The prompt is then left on screen rather than dismissed (macOS also brings it back to the front of the window stack): choosing an activity when you return records a START at the return time, so the stretch away from the desk falls between the two entries and goes unbilled while your return is logged accurately. No second STOP is added while work is already stopped, so an unattended screen records one STOP rather than one per interval. The reminder window covers the full screen and stays on top on both macOS and Linux, so it cannot be hidden by accident by a mouse action in progress when it appears. Dismissed without choice (close, Escape) re-shows immediately. The "Enter new activity" dialog has no timeout; blank/cancelled re-shows the reminder. At logout/shutdown the open session is stopped: on macOS the daemon itself records STOP when launchd sends it SIGTERM (capped to one reminder interval after the latest entry); on Linux the systemd session unit's ExecStop runs "ts stop" instead, and the daemon stays silent on SIGTERM (systemd may signal it during ordinary teardown, so writing a STOP there would be spurious). Every other automatic STOP is capped to one reminder interval (default 5 minutes) after the latest entry, so forgetting to stop never records work all night.
+Reminder daemon behavior: if a prompt goes unanswered for one reminder interval, records a STOP timestamped at the moment the prompt appeared, not when the interval expired. That timestamp is used exactly, without the one-interval cap, because the prompt appears one reminder interval after the previous entry and so already marks the last time you were known to be working. The prompt is then left on screen rather than dismissed (macOS also brings it back to the front of the window stack): choosing an activity when you return records a START at the return time, so the stretch away from the desk falls between the two entries and goes unbilled while your return is logged accurately. No second STOP is added while work is already stopped, so an unattended screen records one STOP rather than one per interval. The reminder window covers the full screen and stays on top on both macOS and Linux, so it cannot be hidden by accident by a mouse action in progress when it appears. Dismissed without choice (close, Escape) re-shows immediately. The "Enter new activity" dialog has no timeout; blank/cancelled re-shows the reminder. At logout/shutdown the open session is stopped: on macOS the daemon itself records STOP when launchd sends it SIGTERM (capped to one reminder interval after the latest entry); on Linux the systemd session unit's ExecStop runs "timesheet stop" instead, and the daemon stays silent on SIGTERM (systemd may signal it during ordinary teardown, so writing a STOP there would be spurious). Every other automatic STOP is capped to one reminder interval (default 5 minutes) after the latest entry, so forgetting to stop never records work all night.
 .TP
 .B list
 Plaintext report: percentage of time per activity (high to low), and hours per day of week (Sun\-Sat).
@@ -2973,7 +3010,7 @@ selects an alternate log path, extension, or date match.
 .TP
 .B manpage
 Write this manual page in groff format to stdout. Example:
-.B "ts manpage | groff \-man \-Tascii | less"
+.B "timesheet manpage | groff \-man \-Tascii | less"
 .TP
 .B rebuild
 Build from source and install into the directory of the currently running binary.
@@ -2984,12 +3021,12 @@ Optional
 Runs
 .B "cargo build \-\-release"
 there, then
-.B "target/release/ts install"
+.B "target/release/timesheet install"
 .I install_dir
 where
 .I install_dir
 is the directory of the running
-.B ts
+.B timesheet
 binary.
 If
 .I directory
@@ -3004,9 +3041,9 @@ Prepend
 .IB prefix :
 to this week's activities matching
 .IR pattern .
-.B ts prefix foo bar
+.B timesheet prefix foo bar
 is equivalent to
-.BR "ts alias bar foo:bar" ,
+.BR "timesheet alias bar foo:bar" ,
 so matching and the
 .B Replace\ (y/n/a)
 prompt work exactly as for
@@ -3085,7 +3122,7 @@ dialog reports that reminders have been stopped (skipped when
 is set, e.g.\ during logout/shutdown).
 Stopping the daemon happens even when the log needs no new entry: an unanswered reminder records
 its own STOP, so without this a following
-.B ts stop
+.B timesheet stop
 would write nothing and leave the daemon running to prompt again one interval later.
 The daemon runs in its own process group and is signalled as a group, so the chooser it spawned
 goes with it; a stray daemon that no longer owns the PID file notices within half a second and
@@ -3105,11 +3142,11 @@ If the log is empty or the last entry is STOP, appends a START first so the calc
 If set (any value), log debug messages to stderr for
 .B restart
 and reminder daemon start/kill (e.g.
-.BR "TS_DEBUG=1 ts restart" ).
+.BR "TS_DEBUG=1 timesheet restart" ).
 .TP
 .B TS_LOGOUT
 If set (any value), suppresses the "reminders stopped" dialog when
-.B ts\ stop
+.B timesheet\ stop
 is invoked (used by autostart scripts during logout/shutdown).
 .TP
 .B TS_CONFIG
@@ -3144,13 +3181,13 @@ exists. Overridden by
 or
 .B $HOME/.cache/ts-reminder-interval
 Reminder interval in seconds (decimal). Used by the reminder daemon; set via
-.BR "ts interval" .
+.BR "timesheet interval" .
 .TP
 .B "$HOME/Library/Application Support/ts/" (macOS)
 Autostart scripts: session script (stop on TERM), logout hook script (stop on logout/shutdown). The logout hook is registered with
 .BR "defaults write com.apple.loginwindow LogoutHook" ;
 if
-.B ts\ autostart
+.B timesheet\ autostart
 cannot set it, run the printed
 .B sudo
 command once.
@@ -3179,7 +3216,7 @@ fn cmd_manpage() -> Result<(), String> {
     Ok(())
 }
 
-/// Show the man page in a pager using groff (ts manpage | groff -man -Tascii | less).
+/// Show the man page in a pager using groff (timesheet manpage | groff -man -Tascii | less).
 /// If groff is not available, pages the raw groff source with less.
 fn help_prelude() -> String {
     format!("{}\n\n", CANONICAL_SOURCE_URL)
@@ -3216,7 +3253,7 @@ fn cmd_help() -> Result<(), String> {
         .spawn()
         .map_err(|e| {
             format!(
-                "no pager available (groff, less): {}. Try: ts manpage | groff -man -Tascii | less",
+                "no pager available (groff, less): {}. Try: timesheet manpage | groff -man -Tascii | less",
                 e
             )
         })?;
@@ -3346,19 +3383,19 @@ fn render_groff_plain(source: &str) -> String {
     out
 }
 
-/// Register "ts start" on login and "ts stop" on logout/shutdown (macOS: launchd; Linux: systemd user). Use "ts autostart uninstall" to remove.
+/// Register "timesheet start" on login and "timesheet stop" on logout/shutdown (macOS: launchd; Linux: systemd user). Use "timesheet autostart uninstall" to remove.
 /// Optional first argument: interval (e.g. 5s, 3m) to set reminder interval and start the daemon in this session so the reminder appears soon.
 fn cmd_autostart(args: &[String]) -> Result<(), String> {
     let uninstall = args.first().map(String::as_str) == Some("uninstall");
     if !uninstall {
-        // Like `ts start`, close a session left open by a previous day's missed shutdown STOP
+        // Like `timesheet start`, close a session left open by a previous day's missed shutdown STOP
         // (capped to one reminder interval) so autostart never leaves an all-night session dangling.
         reconcile_stale_open_session(&timesheet_path(), Local::now());
         let interval_set = if let Some(interval_arg) = args.first() {
             if let Ok(secs) = parse_interval_duration(interval_arg) {
                 let path = reminder_interval_path();
                 if let Err(e) = fs::write(&path, secs.to_string()) {
-                    eprintln!("ts autostart: could not set interval: {}", e);
+                    eprintln!("timesheet autostart: could not set interval: {}", e);
                     false
                 } else {
                     kill_reminder_daemon_if_running();
@@ -3403,7 +3440,7 @@ fn cmd_autostart(args: &[String]) -> Result<(), String> {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = uninstall;
-        Err("ts autostart: not supported on this platform (macOS and Linux only).".to_string())
+        Err("timesheet autostart: not supported on this platform (macOS and Linux only).".to_string())
     }
 }
 
@@ -3411,18 +3448,18 @@ fn cmd_autostart(args: &[String]) -> Result<(), String> {
 fn do_autostart_install_macos() -> Result<(), String> {
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     let exe_path = exe.to_string_lossy();
-    let home = env::var_os("HOME").ok_or("ts autostart: HOME not set")?;
+    let home = env::var_os("HOME").ok_or("timesheet autostart: HOME not set")?;
     let agents = PathBuf::from(&home).join("Library/LaunchAgents");
     let support = PathBuf::from(&home).join("Library/Application Support/ts");
     fs::create_dir_all(&support)
-        .map_err(|e| format!("ts autostart: cannot create {}: {}", support.display(), e))?;
+        .map_err(|e| format!("timesheet autostart: cannot create {}: {}", support.display(), e))?;
 
     // Remove old shell-script session wrapper if present (superseded by --session-daemon).
     let _ = fs::remove_file(support.join("autostart-session.sh"));
 
     // LogoutHook runs as root on logout/shutdown and macOS waits for it to complete before
     // proceeding, making it the most reliable mechanism for recording STOP. It uses
-    // `launchctl asuser` to run ts stop in the console user's launchd context (faster than
+    // `launchctl asuser` to run timesheet stop in the console user's launchd context (faster than
     // `su -` because it does not spawn a full login shell).
     let logout_hook_path = support.join("logout-hook.sh");
     let exe_escaped = exe_path.replace('\\', "\\\\").replace('"', "\\\"");
@@ -3436,7 +3473,7 @@ exec launchctl asuser "$uid" "{}" stop
         exe_escaped
     );
     fs::write(&logout_hook_path, logout_script)
-        .map_err(|e| format!("ts autostart: cannot write logout hook: {}", e))?;
+        .map_err(|e| format!("timesheet autostart: cannot write logout hook: {}", e))?;
     #[allow(clippy::disallowed_methods)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -3513,7 +3550,7 @@ exec launchctl asuser "$uid" "{}" stop
                     .success()
                 {
                     return Err(
-                        "ts autostart: logout hook command failed (sudo may have been cancelled)."
+                        "timesheet autostart: logout hook command failed (sudo may have been cancelled)."
                             .to_string(),
                     );
                 }
@@ -3552,7 +3589,7 @@ exec launchctl asuser "$uid" "{}" stop
             .replace('>', "&gt;")
             .replace('"', "&quot;")
     );
-    // The session plist runs `ts --session-daemon` directly (no shell-script wrapper).
+    // The session plist runs `timesheet --session-daemon` directly (no shell-script wrapper).
     // ExitTimeOut tells launchd to wait up to 30 s after SIGTERM before sending SIGKILL,
     // giving the daemon time to write the STOP entry and exit cleanly.
     let session_plist = format!(
@@ -3582,13 +3619,13 @@ exec launchctl asuser "$uid" "{}" stop
     );
 
     fs::create_dir_all(&agents)
-        .map_err(|e| format!("ts autostart: cannot create {}: {}", agents.display(), e))?;
+        .map_err(|e| format!("timesheet autostart: cannot create {}: {}", agents.display(), e))?;
     let start_plist_path = agents.join("com.ts.autostart.start.plist");
     let session_plist_path = agents.join("com.ts.autostart.session.plist");
     fs::write(&start_plist_path, &start_plist)
-        .map_err(|e| format!("ts autostart: cannot write plist: {}", e))?;
+        .map_err(|e| format!("timesheet autostart: cannot write plist: {}", e))?;
     fs::write(&session_plist_path, &session_plist)
-        .map_err(|e| format!("ts autostart: cannot write plist: {}", e))?;
+        .map_err(|e| format!("timesheet autostart: cannot write plist: {}", e))?;
 
     let _ = Command::new("launchctl")
         .arg("unload")
@@ -3605,7 +3642,7 @@ exec launchctl asuser "$uid" "{}" stop
         .map_err(|e| e.to_string())?
         .success()
     {
-        return Err("ts autostart: launchctl load start plist failed".to_string());
+        return Err("timesheet autostart: launchctl load start plist failed".to_string());
     }
     if !Command::new("launchctl")
         .arg("load")
@@ -3614,21 +3651,21 @@ exec launchctl asuser "$uid" "{}" stop
         .map_err(|e| e.to_string())?
         .success()
     {
-        return Err("ts autostart: launchctl load session plist failed".to_string());
+        return Err("timesheet autostart: launchctl load session plist failed".to_string());
     }
     println!(
-        "Autostart installed: \"ts start\" runs at login, \"ts stop\" runs at logout/shutdown."
+        "Autostart installed: \"timesheet start\" runs at login, \"timesheet stop\" runs at logout/shutdown."
     );
     println!("  Start plist:   {}", start_plist_path.display());
     println!("  Session plist: {}", session_plist_path.display());
     println!("  Logout hook:   {}", logout_hook_path.display());
-    println!("  To remove: ts autostart uninstall");
+    println!("  To remove: timesheet autostart uninstall");
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
 fn do_autostart_uninstall_macos() -> Result<(), String> {
-    let home = env::var_os("HOME").ok_or("ts autostart: HOME not set")?;
+    let home = env::var_os("HOME").ok_or("timesheet autostart: HOME not set")?;
     let agents = PathBuf::from(&home).join("Library/LaunchAgents");
     let start_plist_path = agents.join("com.ts.autostart.start.plist");
     let session_plist_path = agents.join("com.ts.autostart.session.plist");
@@ -3661,7 +3698,7 @@ fn linux_user_units_dir() -> Result<PathBuf, String> {
     let config = match env::var_os("XDG_CONFIG_HOME") {
         Some(c) => PathBuf::from(c),
         None => {
-            let home = env::var_os("HOME").ok_or("ts autostart: HOME not set")?;
+            let home = env::var_os("HOME").ok_or("timesheet autostart: HOME not set")?;
             PathBuf::from(home).join(".config")
         }
     };
@@ -3675,19 +3712,19 @@ fn do_autostart_install_linux() -> Result<(), String> {
     let user_units = linux_user_units_dir()?;
     fs::create_dir_all(&user_units).map_err(|e| {
         format!(
-            "ts autostart: cannot create {}: {}",
+            "timesheet autostart: cannot create {}: {}",
             user_units.display(),
             e
         )
     })?;
 
-    // RemainAfterExit keeps the unit active after `ts start` exits so systemd does not tear down
-    // its control group -- otherwise the reminder daemon `ts start` spawns (which lives in this
+    // RemainAfterExit keeps the unit active after `timesheet start` exits so systemd does not tear down
+    // its control group -- otherwise the reminder daemon `timesheet start` spawns (which lives in this
     // unit's cgroup; setsid only changes the process group, not the cgroup) would be killed the
-    // moment `ts start` returns.
+    // moment `timesheet start` returns.
     let start_unit = format!(
         r#"[Unit]
-Description=ts start on login
+Description=timesheet start on login
 [Service]
 Type=oneshot
 RemainAfterExit=yes
@@ -3699,7 +3736,7 @@ WantedBy=default.target
     );
     let session_unit = format!(
         r#"[Unit]
-Description=ts stop on logout
+Description=timesheet stop on logout
 [Service]
 Type=simple
 Environment=TS_LOGOUT=1
@@ -3714,9 +3751,9 @@ WantedBy=default.target
     let start_path = user_units.join("ts-autostart-start.service");
     let session_path = user_units.join("ts-autostart-session.service");
     fs::write(&start_path, &start_unit)
-        .map_err(|e| format!("ts autostart: cannot write unit: {}", e))?;
+        .map_err(|e| format!("timesheet autostart: cannot write unit: {}", e))?;
     fs::write(&session_path, &session_unit)
-        .map_err(|e| format!("ts autostart: cannot write unit: {}", e))?;
+        .map_err(|e| format!("timesheet autostart: cannot write unit: {}", e))?;
 
     if !Command::new("systemctl")
         .args(["--user", "daemon-reload"])
@@ -3724,18 +3761,18 @@ WantedBy=default.target
         .map_err(|e| e.to_string())?
         .success()
     {
-        return Err("ts autostart: systemctl daemon-reload failed".to_string());
+        return Err("timesheet autostart: systemctl daemon-reload failed".to_string());
     }
-    // Enable the start unit for next login but do NOT --now it: running `ts start` immediately would
+    // Enable the start unit for next login but do NOT --now it: running `timesheet start` immediately would
     // close the caller's already-open session and pop another chooser. The reminder daemon for the
-    // current session is started separately by `ts autostart` (start_reminder_daemon_if_needed).
+    // current session is started separately by `timesheet autostart` (start_reminder_daemon_if_needed).
     if !Command::new("systemctl")
         .args(["--user", "enable", "ts-autostart-start.service"])
         .status()
         .map_err(|e| e.to_string())?
         .success()
     {
-        return Err("ts autostart: systemctl enable start service failed".to_string());
+        return Err("timesheet autostart: systemctl enable start service failed".to_string());
     }
     if !Command::new("systemctl")
         .args(["--user", "enable", "--now", "ts-autostart-session.service"])
@@ -3743,10 +3780,10 @@ WantedBy=default.target
         .map_err(|e| e.to_string())?
         .success()
     {
-        return Err("ts autostart: systemctl enable session service failed".to_string());
+        return Err("timesheet autostart: systemctl enable session service failed".to_string());
     }
     println!(
-        "Autostart installed: \"ts start\" runs at login, \"ts stop\" runs at logout/shutdown."
+        "Autostart installed: \"timesheet start\" runs at login, \"timesheet stop\" runs at logout/shutdown."
     );
     println!(
         "  Units: {}  {}",
@@ -3755,7 +3792,7 @@ WantedBy=default.target
     );
     // Also offer a system-level shutdown hook (like the macOS LogoutHook) as a second guarantee.
     install_linux_logout_hook(&exe_path)?;
-    println!("  To remove: ts autostart uninstall");
+    println!("  To remove: timesheet autostart uninstall");
     Ok(())
 }
 
@@ -3801,17 +3838,17 @@ WantedBy=multi-user.target
         exe = exe_path
     );
 
-    // Stage the unit in a user-writable ts dir; the sudo command installs it system-wide.
+    // Stage the unit in a user-writable timesheet dir; the sudo command installs it system-wide.
     let staged = linux_user_units_dir()?
         .parent() // .../systemd
         .and_then(|p| p.parent()) // .../.config
         .map(|c| c.join("ts"))
-        .ok_or("ts autostart: cannot resolve config dir")?;
+        .ok_or("timesheet autostart: cannot resolve config dir")?;
     fs::create_dir_all(&staged)
-        .map_err(|e| format!("ts autostart: cannot create {}: {}", staged.display(), e))?;
+        .map_err(|e| format!("timesheet autostart: cannot create {}: {}", staged.display(), e))?;
     let staged_unit = staged.join(&unit_name);
     fs::write(&staged_unit, &unit)
-        .map_err(|e| format!("ts autostart: cannot write logout hook: {}", e))?;
+        .map_err(|e| format!("timesheet autostart: cannot write logout hook: {}", e))?;
 
     let inner = format!(
         "install -m644 '{src}' '{dest}' && systemctl daemon-reload && systemctl enable --now {name}",
@@ -3831,7 +3868,7 @@ WantedBy=multi-user.target
             match Command::new("sudo").args(["sh", "-c", &inner]).status() {
                 Ok(s) if s.success() => println!("  Logout hook installed ({}).", dest),
                 _ => println!(
-                    "  ts autostart: logout hook not installed (sudo cancelled or failed); \
+                    "  timesheet autostart: logout hook not installed (sudo cancelled or failed); \
                      run the command above to enable it."
                 ),
             }
@@ -3899,7 +3936,7 @@ fn get_reminder_interval_secs() -> u64 {
 /// Returns true if a process with the given PID is running (Unix: kill -0).
 fn ts_debug(msg: &str) {
     if env::var_os("TS_DEBUG").is_some() {
-        let _ = writeln!(io::stderr(), "ts: {}", msg);
+        let _ = writeln!(io::stderr(), "timesheet: {}", msg);
     }
 }
 
@@ -3921,7 +3958,7 @@ fn is_pid_running(pid: u32) -> bool {
 /// The reminder daemon blocks SIGTERM so a dedicated `sigwait` thread can handle it, and a blocked
 /// mask survives both fork and exec. Without this reset every dialog the daemon spawns inherits the
 /// block and ignores SIGTERM for its whole life, so a chooser left on screen cannot be closed by an
-/// ordinary `ts stop` — only SIGKILL reaches it. Apply this to anything the daemon runs.
+/// ordinary `timesheet stop` — only SIGKILL reaches it. Apply this to anything the daemon runs.
 #[cfg(unix)]
 fn reset_child_signal_mask(cmd: &mut Command) {
     unsafe {
@@ -4029,7 +4066,7 @@ fn show_reminders_stopped_notification() {
 
 /// Kill the reminder daemon if running (read PID from file, remove PID file, then send SIGTERM).
 /// Removing the PID file *before* signaling tells the daemon's SIGTERM handler that this is an
-/// intentional ts kill rather than a system shutdown, so it skips writing a STOP entry.
+/// intentional timesheet kill rather than a system shutdown, so it skips writing a STOP entry.
 /// No-op on non-Unix. Never kills the current process.
 fn kill_reminder_daemon_if_running() {
     #[cfg(not(unix))]
@@ -4126,7 +4163,7 @@ fn start_reminder_daemon_if_needed(_timesheet: &Path) {
             (Stdio::null(), Stdio::null())
         };
         // Use pre_exec to call setsid() in the child after fork but before exec.
-        // This places the reminder daemon in its own session before ts start exits,
+        // This places the reminder daemon in its own session before timesheet start exits,
         // preventing launchd from killing it when the LaunchAgent's process group is cleaned up.
         let result = unsafe {
             Command::new(&exe)
@@ -4180,7 +4217,7 @@ fn cmd_interval(args: &[String], timesheet: &Path) -> Result<(), String> {
         let _ = fs::create_dir_all(parent);
     }
     fs::write(&path, secs.to_string())
-        .map_err(|e| format!("ts interval: cannot write config: {}", e))?;
+        .map_err(|e| format!("timesheet interval: cannot write config: {}", e))?;
     kill_reminder_daemon_if_running();
     thread::sleep(Duration::from_millis(100));
     start_reminder_daemon_if_needed(timesheet);
@@ -4200,7 +4237,7 @@ fn cmd_interval(args: &[String], timesheet: &Path) -> Result<(), String> {
 /// Run the reminder daemon loop: sleep for configured interval, show "What are you working on?" prompt, handle response or timeout.
 /// Long-running session daemon that records a STOP entry when launchd sends SIGTERM
 /// (i.e. at logout or system shutdown). Installed as the `com.ts.autostart.session`
-/// LaunchAgent by `ts autostart`. Because this is a launchd job, launchd delivers a
+/// LaunchAgent by `timesheet autostart`. Because this is a launchd job, launchd delivers a
 /// clean SIGTERM and waits for the process to exit (see ExitTimeOut in the plist) before
 /// proceeding with the shutdown sequence, making STOP recording reliable.
 fn run_session_daemon(timesheet: &Path) {
@@ -4261,12 +4298,12 @@ fn run_reminder_daemon(timesheet: &Path) {
             if unsafe { sigwait(&set_for_sigwait, &mut sig) } == 0 && sig == SIGTERM {
                 // On macOS the reminder daemon IS the session LaunchAgent: launchd SIGTERMs it at
                 // logout/shutdown and it records the STOP here. kill_reminder_daemon_if_running()
-                // removes the PID file before signaling, so an intentional `ts` kill (file gone or
+                // removes the PID file before signaling, so an intentional `timesheet` kill (file gone or
                 // no longer ours) is skipped.
                 //
                 // On Linux the logout STOP is recorded by the systemd session unit's ExecStop
-                // (`ts stop`), and systemd may SIGTERM the daemon during ordinary unit/cgroup
-                // teardown -- e.g. when the oneshot `ts start` that spawned it exits -- not only at
+                // (`timesheet stop`), and systemd may SIGTERM the daemon during ordinary unit/cgroup
+                // teardown -- e.g. when the oneshot `timesheet start` that spawned it exits -- not only at
                 // logout. Writing a STOP here would produce spurious entries, so the daemon stays
                 // silent and just exits.
                 #[cfg(not(target_os = "linux"))]
@@ -4311,7 +4348,7 @@ fn run_reminder_daemon(timesheet: &Path) {
         }
         let interval_secs = get_reminder_interval_secs();
         ts_debug(&format!("reminder daemon: sleeping {}s", interval_secs));
-        // Sleep in slices rather than one long nap, re-checking ownership as we go: `ts stop`
+        // Sleep in slices rather than one long nap, re-checking ownership as we go: `timesheet stop`
         // silences a daemon by removing the PID file, and a daemon it could not signal (a stray
         // that is not the file's owner) must notice within a moment instead of sleeping out the
         // interval and popping one more prompt.
@@ -4401,7 +4438,7 @@ fn parse_native_reminder_dialog_output(output: &str) -> Option<ReminderResult> {
 
 /// Show "What are you working on?" prompt; returns user choice or timeout.
 /// Platform-specific (macOS: AppKit/osascript; Linux: PyQt single-click chooser, else kdialog/zenity).
-/// timesheet: used when appending STOP on timeout (reminder daemon / ts start).
+/// timesheet: used when appending STOP on timeout (reminder daemon / timesheet start).
 fn show_reminder_prompt(activities: &[String], timesheet: Option<&Path>) -> ReminderResult {
     #[cfg(target_os = "macos")]
     return show_reminder_prompt_macos(activities, timesheet);
@@ -4416,10 +4453,10 @@ fn show_reminder_prompt(activities: &[String], timesheet: Option<&Path>) -> Remi
     }
 }
 
-/// Resolve the activity for `ts start` when none was given on the command line.
+/// Resolve the activity for `timesheet start` when none was given on the command line.
 /// Returns `Some(activity)` to start, or `None` if the user chose "Stop Work" (caller should abort the start).
 /// On platforms (or headless setups) without a GUI chooser, returns the default activity without prompting.
-/// Whether `ts start` with no activity can show an interactive GUI chooser on this platform/setup
+/// Whether `timesheet start` with no activity can show an interactive GUI chooser on this platform/setup
 /// (macOS always; Linux when kdialog/zenity is installed). Used both to decide whether to block on
 /// the chooser and to avoid starting the reminder daemon early when we will.
 #[cfg(not(test))]
@@ -4608,10 +4645,10 @@ fn prompt_enter_activity_linux(backend: LinuxDialog) -> Option<String> {
     });
     match backend {
         LinuxDialog::KDialog => {
-            cmd.args(["--title", "ts", "--inputbox", "Enter activity:"]);
+            cmd.args(["--title", "timesheet", "--inputbox", "Enter activity:"]);
         }
         LinuxDialog::Zenity => {
-            cmd.args(["--entry", "--title=ts", "--text=Enter activity:"]);
+            cmd.args(["--entry", "--title=timesheet", "--text=Enter activity:"]);
         }
     }
     linux_with_display(&mut cmd);
@@ -4663,7 +4700,7 @@ align = getattr(Qt, "AlignmentFlag", Qt)
 result = {"v": None}
 app = QApplication([])
 w = QWidget()
-w.setWindowTitle("ts")
+w.setWindowTitle("timesheet")
 try:
     w.setWindowFlags(w.windowFlags() | wintype.WindowStaysOnTopHint)
 except Exception:
@@ -4696,7 +4733,7 @@ def finish(val):
 def on_click(item):
     text = item.text()
     if text == "Enter new activity...":
-        activity, ok = QInputDialog.getText(w, "ts", "Enter activity:")
+        activity, ok = QInputDialog.getText(w, "timesheet", "Enter activity:")
         if ok and activity.strip():
             finish(activity.strip())
         else:
@@ -4772,7 +4809,7 @@ fn show_reminder_prompt_pyqt(
             Ok(None) => {}
             Err(_) => return None,
         }
-        // `ts stop` while this prompt is up: close the window and go. The daemon is a stray if it
+        // `timesheet stop` while this prompt is up: close the window and go. The daemon is a stray if it
         // reaches this (the one named in the PID file is signaled directly, and the signal takes
         // its chooser down with it), so there is nothing left for it to do but exit.
         if reminder_daemon_disowned() {
@@ -4817,7 +4854,7 @@ fn show_reminder_prompt_linux(activities: &[String], timesheet: Option<&Path>) -
     });
     match backend {
         LinuxDialog::KDialog => {
-            cmd.args(["--title", "ts", "--menu", "What are you working on?"]);
+            cmd.args(["--title", "timesheet", "--menu", "What are you working on?"]);
             // kdialog --menu takes (tag, label) pairs; selected tag is printed to stdout.
             for c in &choices {
                 cmd.arg(c).arg(c);
@@ -4826,7 +4863,7 @@ fn show_reminder_prompt_linux(activities: &[String], timesheet: Option<&Path>) -
         LinuxDialog::Zenity => {
             cmd.args([
                 "--list",
-                "--title=ts",
+                "--title=timesheet",
                 "--text=What are you working on?",
                 "--hide-header",
                 "--column=Activity",
@@ -4893,7 +4930,7 @@ fn show_reminder_prompt_linux(activities: &[String], timesheet: Option<&Path>) -
 #[cfg(target_os = "macos")]
 fn prompt_enter_activity_macos(ts_debug: bool) -> Option<String> {
     // Return only the text so stdout is just the activity (no parsing "button returned:OK, text returned:...").
-    let prompt_script = "text returned of (display dialog \"Enter activity:\" with title \"ts\" default answer \"\")";
+    let prompt_script = "text returned of (display dialog \"Enter activity:\" with title \"timesheet\" default answer \"\")";
     let run = |use_launchctl: bool| -> Option<String> {
         let mut cmd: Command = if use_launchctl {
             macos_run_in_user_session("/usr/bin/osascript", &["-e", prompt_script])
@@ -4933,7 +4970,7 @@ fn macos_run_in_user_session(exe: &str, exe_args: &[&str]) -> Command {
     let mut c = Command::new("/usr/bin/launchctl");
     c.args(args);
     // Same reason as on Linux: a dialog that inherited the daemon's blocked SIGTERM could not be
-    // closed by `ts stop`.
+    // closed by `timesheet stop`.
     reset_child_signal_mask(&mut c);
     c
 }
@@ -4963,7 +5000,7 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
     }
     choices.push("Enter new activity...".to_string());
 
-    // Native Rust/AppKit dialog (many buttons, one click). Spawn ts --reminder-dialog in user's GUI session.
+    // Native Rust/AppKit dialog (many buttons, one click). Spawn timesheet --reminder-dialog in user's GUI session.
     let ts_debug = env::var_os("TS_DEBUG").is_some();
     enum NativeOutcome {
         Result(ReminderResult),
@@ -4999,7 +5036,7 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
             Ok(c) => c,
             Err(_) => return NativeOutcome::Unavailable,
         };
-        // Bring the chooser forward as soon as it launches; otherwise `ts start`
+        // Bring the chooser forward as soon as it launches; otherwise `timesheet start`
         // can sit behind Terminal until the first reminder timeout elapses.
         macos_bring_reminder_window_to_front(child.id());
         let appeared = Local::now();
@@ -5052,7 +5089,7 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
     }
     if ts_debug {
         let _ = std::io::stderr().write_fmt(format_args!(
-            "ts: native reminder dialog failed or timed out, using SystemUIServer fallback\n"
+            "timesheet: native reminder dialog failed or timed out, using SystemUIServer fallback\n"
         ));
     }
 
@@ -5087,7 +5124,7 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
         .collect::<Vec<_>>()
         .join(", ");
     let script = format!(
-        "choose from list {{{}}} with title \"ts\" with prompt \"What are you working on?\" default items {{item 1 of {{{}}}}}",
+        "choose from list {{{}}} with title \"timesheet\" with prompt \"What are you working on?\" default items {{item 1 of {{{}}}}}",
         list_script,
         list_script
     );
@@ -5156,7 +5193,7 @@ fn show_reminder_prompt_macos_systemui(
         .collect::<Vec<_>>()
         .join(", ");
     let script = format!(
-        "tell application \"SystemUIServer\" to display dialog \"What are you working on?\" with title \"ts\" buttons {{{}}} default button \"Stop Work\"",
+        "tell application \"SystemUIServer\" to display dialog \"What are you working on?\" with title \"timesheet\" buttons {{{}}} default button \"Stop Work\"",
         buttons_script
     );
     if let Ok(child) = macos_run_in_user_session("/usr/bin/osascript", &["-e", &script])
@@ -5199,7 +5236,7 @@ fn show_reminder_prompt_macos_systemui(
             .collect::<Vec<_>>()
             .join(", ");
         let list_cmd = format!(
-            "tell application \"SystemUIServer\" to choose from list {{{}}} with title \"ts\" with prompt \"What are you working on?\" default items {{item 1 of {{{}}}}}",
+            "tell application \"SystemUIServer\" to choose from list {{{}}} with title \"timesheet\" with prompt \"What are you working on?\" default items {{item 1 of {{{}}}}}",
             list_script,
             list_script
         );
@@ -5227,7 +5264,7 @@ fn show_reminder_prompt_macos_systemui(
         }
     }
     // Text dialog for new activity or when list was cancelled.
-    let script = "tell application \"SystemUIServer\" to display dialog \"What are you working on?\" default answer \"\" with title \"ts\" buttons {\"Stop Work\", \"OK\"} default button \"OK\"";
+    let script = "tell application \"SystemUIServer\" to display dialog \"What are you working on?\" default answer \"\" with title \"timesheet\" buttons {\"Stop Work\", \"OK\"} default button \"OK\"";
     let stderr2 = if env::var_os("TS_DEBUG").is_some() {
         Stdio::inherit()
     } else {
@@ -5329,7 +5366,7 @@ fn wait_no_timeout(mut child: process::Child) -> Option<Vec<u8>> {
 
 fn main() {
     if env::var_os("TS_DEBUG").is_some() {
-        let _ = std::io::stderr().write_all(b"ts: main entered\n");
+        let _ = std::io::stderr().write_all(b"timesheet: main entered\n");
     }
     #[cfg(unix)]
     unsafe {
@@ -5365,7 +5402,7 @@ fn main() {
 
     if env::var_os("TS_DEBUG").is_some() {
         let cmd_name = cmd.as_deref().unwrap_or("(none)");
-        let _ = std::io::stderr().write_fmt(format_args!("ts: dispatching to {:?}\n", cmd_name));
+        let _ = std::io::stderr().write_fmt(format_args!("timesheet: dispatching to {:?}\n", cmd_name));
     }
 
     let result = match cmd.as_deref() {
@@ -6039,7 +6076,7 @@ other: value
         let out = resolve_list_input(Some("250219"), &log_path).unwrap();
         assert_eq!(
             out, later,
-            "ts list 250219 should use log that contains that date"
+            "timesheet list 250219 should use log that contains that date"
         );
     }
 
@@ -6054,7 +6091,7 @@ other: value
         let out = resolve_list_input(Some("2/21"), &log_path).unwrap();
         assert_eq!(
             out, later,
-            "ts list 2/21 should fall back to file with extension date on or before that day"
+            "timesheet list 2/21 should fall back to file with extension date on or before that day"
         );
     }
 
@@ -6531,13 +6568,13 @@ other: value
         let after = fs::read_to_string(&log_path).unwrap();
         assert_eq!(
             before, after,
-            "ts stop should not change file when last entry is STOP and no time given"
+            "timesheet stop should not change file when last entry is STOP and no time given"
         );
     }
 
     /// The reminder daemon blocks SIGTERM for its sigwait thread. That mask is inherited across
     /// fork and exec, so without an explicit reset every dialog it spawns ignores SIGTERM for life
-    /// and `ts stop` cannot close a prompt left on screen.
+    /// and `timesheet stop` cannot close a prompt left on screen.
     #[cfg(target_os = "linux")]
     #[test]
     fn test_reset_child_signal_mask_clears_the_inherited_block() {
@@ -6588,7 +6625,7 @@ other: value
         // Claiming it writes our own pid, which is what the daemon loop polls for.
         assert!(claim_reminder_daemon_ownership(&pid_path));
         assert!(owns_reminder_daemon(&pid_path));
-        // `ts stop` silences a daemon by removing the file; the daemon must see that.
+        // `timesheet stop` silences a daemon by removing the file; the daemon must see that.
         fs::remove_file(&pid_path).unwrap();
         assert!(!owns_reminder_daemon(&pid_path));
         // A successor's pid in the file disowns us just the same.
@@ -6598,7 +6635,7 @@ other: value
 
     #[test]
     fn test_reminder_daemon_disowned_is_false_outside_the_daemon() {
-        // The foreground `ts start` chooser shares the prompt code but never owns the PID file.
+        // The foreground `timesheet start` chooser shares the prompt code but never owns the PID file.
         // It must not read that as "a stop happened" and close itself.
         assert!(!IS_REMINDER_DAEMON.load(std::sync::atomic::Ordering::Relaxed));
         assert!(!reminder_daemon_disowned());
@@ -7027,7 +7064,7 @@ other: value
         assert!(cmd_prefix(&["foo".to_string()], &log_path).is_err());
     }
 
-    /// "ts prefix foo bar" searches for "bar" (not "foo:bar"), like "ts alias bar foo:bar".
+    /// "timesheet prefix foo bar" searches for "bar" (not "foo:bar"), like "timesheet alias bar foo:bar".
     #[test]
     fn test_cmd_prefix_searches_for_pattern() {
         let dir = tempfile::tempdir().unwrap();
@@ -7184,7 +7221,7 @@ other: value
         let dest_path = dest_dir.path().to_path_buf();
         let result = cmd_install(&[dest_path.to_string_lossy().to_string()]);
         assert!(result.is_ok());
-        let exe_name = if cfg!(windows) { "ts.exe" } else { "ts" };
+        let exe_name = if cfg!(windows) { "timesheet.exe" } else { "timesheet" };
         let installed = dest_path.join(exe_name);
         assert!(installed.exists());
     }

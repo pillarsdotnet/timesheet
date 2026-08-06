@@ -1,5 +1,5 @@
 [package]
-name = "ts"
+name = "timesheet"
 version = "0.1.0"
 edition = "2021"
 description = "Timesheet CLI: start, stop, list, started, timeoff, alias, rename, install, rotate, pdf, email, manpage"
