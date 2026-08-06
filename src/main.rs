@@ -41,7 +41,7 @@
 //! | Command    | Description |
 //! |------------|-------------|
 //! | `alias`    | Interactively replace activity text in this week's START entries (regex). |
-//! | `autostart` | Register `timesheet start` on login and `timesheet stop` on logout/shutdown (macOS/Linux only). |
+//! | `autostart` | Register `timesheet start` on login and `timesheet stop` on logout/shutdown (macOS/Linux: LaunchAgents/systemd units plus an admin-installed logout hook; Windows: a Startup-folder shortcut plus the daemon's best-effort console control handler, no admin required or available). |
 //! | `edit`     | Open the timesheet log in `$EDITOR` (then `$VISUAL`, else `vi`; `notepad` on Windows). |
 //! | `email`    | Fill the timesheet PDF as `pdf` does and mail it as an attachment. |
 //! | `help`     | Show the man page in a pager (groff -man -Tascii \| less; plain text via `more` on Windows). |
@@ -58,7 +58,7 @@
 //! | `rename`   | Same as `alias`. |
 //! | `restart`, `reminder` | Aliases for `interval`. |
 //! | `rotate`   | Rename log to `timesheet.YYMMDD`; add STOP first if last entry is START; append if same-day exists. |
-//! | `start`    | Record work start now; with no activity, shows reminder chooser to pick/enter (macOS via AppKit; Linux via PyQt single-click chooser, falling back to kdialog/zenity; no chooser on Windows, so it always defaults); otherwise optional activity (default: misc/unspecified); adds a STOP first only when the open session is over one reminder interval old (otherwise the START closes it by itself); starts/restarts reminder daemon (no-op on Windows). |
+//! | `start`    | Record work start now; with no activity, shows reminder chooser to pick/enter (macOS via AppKit; Linux via PyQt single-click chooser, falling back to kdialog/zenity; Windows via PowerShell/WinForms); otherwise optional activity (default: misc/unspecified); adds a STOP first only when the open session is over one reminder interval old (otherwise the START closes it by itself); starts/restarts reminder daemon. |
 //! | `started`  | Record a past start time; inserts at the correct chronological position without discarding entries. |
 //! | `stop`     | Record work stop (optional time); amends previous STOP if work already stopped; always stops the reminder daemon and closes any prompt it has on screen, and shows the "stopped" dialog (skipped during logout/shutdown). |
 //! | `timeoff`  | Show stop time for 8 h/day average; only requires a START entry (adds one if log empty or last is STOP). |
@@ -79,6 +79,8 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::thread;
@@ -90,6 +92,8 @@ mod pdf;
 mod reminder_dialog_macos;
 mod report;
 mod settings;
+#[cfg(target_os = "windows")]
+mod win_ffi;
 mod yaml;
 
 use yaml::{strip_yaml_comment, unquote_yaml_scalar};
@@ -2146,36 +2150,35 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Create (or overwrite) a per-user Start Menu shortcut that runs `timesheet.exe start`, so
-/// starting work is a point-and-click action. Shells out to PowerShell's WScript.Shell COM
-/// object, same approach as the OS-tool shell-outs used for the macOS install steps above.
+/// Create (or overwrite) a Windows shortcut (.lnk) via PowerShell's WScript.Shell COM object, same
+/// approach as the OS-tool shell-outs used for the macOS install steps above. Shared by the Start
+/// Menu shortcut (`timesheet install`) and the Startup-folder autostart shortcut
+/// (`timesheet autostart`).
 #[cfg(target_os = "windows")]
-fn install_windows_start_menu_shortcut(dest_file: &Path) -> Result<PathBuf, String> {
-    let start_menu = dirs::config_dir()
-        .ok_or("could not determine %APPDATA%")?
-        .join("Microsoft")
-        .join("Windows")
-        .join("Start Menu")
-        .join("Programs");
-    fs::create_dir_all(&start_menu)
-        .map_err(|e| format!("cannot create {}: {}", start_menu.display(), e))?;
-    let shortcut = start_menu.join("Start Timesheet.lnk");
+fn create_windows_shortcut(
+    link_path: &Path,
+    target: &Path,
+    args: &str,
+    workdir: &Path,
+    description: &str,
+) -> Result<(), String> {
+    if let Some(parent) = link_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {}", parent.display(), e))?;
+    }
     let ps_quote = |s: &str| s.replace('\'', "''");
-    let exe = ps_quote(&dest_file.to_string_lossy());
-    let workdir = ps_quote(
-        &dest_file
-            .parent()
-            .unwrap_or(Path::new("."))
-            .to_string_lossy(),
-    );
-    let link = ps_quote(&shortcut.to_string_lossy());
+    let link = ps_quote(&link_path.to_string_lossy());
+    let target_s = ps_quote(&target.to_string_lossy());
+    let args_s = ps_quote(args);
+    let workdir_s = ps_quote(&workdir.to_string_lossy());
+    let description_s = ps_quote(description);
     let script = format!(
         "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{link}'); \
-         $s.TargetPath = '{exe}'; \
-         $s.Arguments = 'start'; \
-         $s.WorkingDirectory = '{workdir}'; \
-         $s.IconLocation = '{exe}'; \
-         $s.Description = 'Record work start (same as running \"timesheet start\")'; \
+         $s.TargetPath = '{target_s}'; \
+         $s.Arguments = '{args_s}'; \
+         $s.WorkingDirectory = '{workdir_s}'; \
+         $s.IconLocation = '{target_s}'; \
+         $s.Description = '{description_s}'; \
          $s.Save()"
     );
     let status = Command::new("powershell")
@@ -2184,10 +2187,32 @@ fn install_windows_start_menu_shortcut(dest_file: &Path) -> Result<PathBuf, Stri
         .map_err(|e| format!("failed to run powershell: {}", e))?;
     if !status.success() {
         return Err(format!(
-            "powershell exited with {} while creating Start Menu shortcut",
-            status
+            "powershell exited with {} while creating shortcut {}",
+            status,
+            link_path.display()
         ));
     }
+    Ok(())
+}
+
+/// Create (or overwrite) a per-user Start Menu shortcut that runs `timesheet.exe start`, so
+/// starting work is a point-and-click action.
+#[cfg(target_os = "windows")]
+fn install_windows_start_menu_shortcut(dest_file: &Path) -> Result<PathBuf, String> {
+    let start_menu = dirs::config_dir()
+        .ok_or("could not determine %APPDATA%")?
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs");
+    let shortcut = start_menu.join("Start Timesheet.lnk");
+    create_windows_shortcut(
+        &shortcut,
+        dest_file,
+        "start",
+        dest_file.parent().unwrap_or(Path::new(".")),
+        "Record work start (same as running \"timesheet start\")",
+    )?;
     Ok(shortcut)
 }
 
@@ -2760,7 +2785,14 @@ removes the registration (the logout hook removal also needs
 Without
 .I interval
 : starts the daemon if not running and prints the current reminder interval.
-Not supported on Windows; errors with a message to that effect.
+On Windows, registers a per-user Startup-folder shortcut ("Timesheet Autostart") that runs
+.B "timesheet start"
+at login; no admin rights are needed for this, but unlike macOS/Linux there is no
+no-admin-required second guarantee for logoff/shutdown available on Windows, so STOP there relies
+solely on the reminder daemon's console control handler (best-effort: Windows does not guarantee
+it waits for the handler to finish). With
+.I uninstall
+removes the Startup-folder shortcut.
 .TP
 .B help
 Run the equivalent of
@@ -3076,8 +3108,8 @@ Record work start
 With no
 .IR activity ,
 shows the reminder chooser to pick or enter an activity (macOS via AppKit; Linux via the PyQt
-single-click chooser, falling back to kdialog/zenity; no chooser on Windows, so it always
-falls back to the default below). A single click acts immediately.
+single-click chooser, falling back to kdialog/zenity; Windows via PowerShell/WinForms). A single
+click acts immediately.
 Otherwise optional
 .I activity
 (default: misc/unspecified). Appends a START line; does not modify existing entries.
@@ -3085,8 +3117,7 @@ If a session is already open, no STOP is added when the new START would close it
 start/stop pairs match in LIFO order, so a STOP at the same instant as the START is redundant.
 A STOP is added only when the open START is more than one reminder interval old, in which case it
 is capped to one interval after that entry, leaving the time you were away unbilled.
-Starts or restarts the reminder daemon (resets the timer; no-op on Windows, where the
-reminder daemon is not yet implemented).
+Starts or restarts the reminder daemon (resets the timer).
 .TP
 .B started
 Record a work start at a
@@ -3437,11 +3468,71 @@ fn cmd_autostart(args: &[String]) -> Result<(), String> {
             do_autostart_install_linux()
         }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        if uninstall {
+            do_autostart_uninstall_windows()
+        } else {
+            do_autostart_install_windows()
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = uninstall;
-        Err("timesheet autostart: not supported on this platform (macOS and Linux only).".to_string())
+        Err("timesheet autostart: not supported on this platform (macOS, Linux, and Windows only).".to_string())
     }
+}
+
+/// Per-user Startup-folder shortcut path used for Windows autostart (run at login, no admin
+/// needed): the direct analog of a macOS LaunchAgent or Linux systemd user unit.
+#[cfg(target_os = "windows")]
+fn windows_startup_shortcut_path() -> Result<PathBuf, String> {
+    Ok(dirs::config_dir()
+        .ok_or("could not determine %APPDATA%")?
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs")
+        .join("Startup")
+        .join("Timesheet Autostart.lnk"))
+}
+
+/// Register `timesheet.exe start` to run at login via a Startup-folder shortcut. STOP at
+/// logoff/shutdown is handled by the reminder daemon's console control handler
+/// (`windows_console_ctrl_handler`) rather than a separate hook: unlike macOS's LogoutHook or
+/// Linux's system-level logout-hook unit, there is no per-user, no-admin-required Windows
+/// mechanism to add a second guarantee, so this one path is best-effort (see the daemon's doc
+/// comment for the same caveat other platforms already carry).
+#[cfg(target_os = "windows")]
+fn do_autostart_install_windows() -> Result<(), String> {
+    let exe = env::current_exe().map_err(|e| e.to_string())?;
+    let shortcut = windows_startup_shortcut_path()?;
+    create_windows_shortcut(
+        &shortcut,
+        &exe,
+        "start",
+        exe.parent().unwrap_or(Path::new(".")),
+        "Record work start at login (same as running \"timesheet start\")",
+    )?;
+    println!("Autostart installed: {}", shortcut.display());
+    println!(
+        "\"timesheet start\" runs at login; STOP at logoff/shutdown is best-effort (no admin rights available for a second guarantee)."
+    );
+    println!("  To remove: timesheet autostart uninstall");
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn do_autostart_uninstall_windows() -> Result<(), String> {
+    let shortcut = windows_startup_shortcut_path()?;
+    if shortcut.exists() {
+        fs::remove_file(&shortcut)
+            .map_err(|e| format!("timesheet autostart: cannot remove {}: {}", shortcut.display(), e))?;
+        println!("Removed {}", shortcut.display());
+    } else {
+        println!("Autostart was not installed.");
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -3946,7 +4037,11 @@ fn is_pid_running(pid: u32) -> bool {
     {
         unsafe { kill(pid as i32, 0) == 0 }
     }
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
+    {
+        win_ffi::is_pid_running(pid)
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
     {
         let _ = pid;
         false
@@ -4009,23 +4104,18 @@ fn signal_reminder_daemon(group: Option<i32>, pid: u32, sig: i32) {
     }
 }
 
-/// Returns true if the reminder daemon is running (PID file exists, PID is alive, and not self). No-op on non-Unix.
+/// Returns true if the reminder daemon is running (PID file exists, PID is alive, and not self).
+/// False on platforms where `is_pid_running` is a no-op.
 fn is_reminder_daemon_running() -> bool {
-    #[cfg(not(unix))]
-    return false;
-
-    #[cfg(unix)]
-    {
-        let pid_path = reminder_pid_path();
-        if let Ok(data) = fs::read_to_string(&pid_path) {
-            if let Ok(pid) = data.trim().parse::<u32>() {
-                if pid != process::id() && is_pid_running(pid) {
-                    return true;
-                }
+    let pid_path = reminder_pid_path();
+    if let Ok(data) = fs::read_to_string(&pid_path) {
+        if let Ok(pid) = data.trim().parse::<u32>() {
+            if pid != process::id() && is_pid_running(pid) {
+                return true;
             }
         }
-        false
     }
+    false
 }
 
 /// Show a dialog/notification that timesheet reminders have been stopped. Spawns and does not block.
@@ -4067,9 +4157,54 @@ fn show_reminders_stopped_notification() {
 /// Kill the reminder daemon if running (read PID from file, remove PID file, then send SIGTERM).
 /// Removing the PID file *before* signaling tells the daemon's SIGTERM handler that this is an
 /// intentional timesheet kill rather than a system shutdown, so it skips writing a STOP entry.
-/// No-op on non-Unix. Never kills the current process.
+/// No-op on unsupported platforms. Never kills the current process.
 fn kill_reminder_daemon_if_running() {
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
+    {
+        ts_debug("kill_reminder: entry");
+        let pid_path = reminder_pid_path();
+        if let Ok(data) = fs::read_to_string(&pid_path) {
+            if let Ok(pid) = data.trim().parse::<u32>() {
+                if pid == process::id() {
+                    ts_debug("kill_reminder: pid is self, removing file and skipping kill");
+                    let _ = fs::remove_file(&pid_path);
+                    return;
+                }
+                if is_pid_running(pid) {
+                    // Remove PID file before terminating, same intentional-kill-vs-shutdown
+                    // distinction the Unix path uses (the daemon's console ctrl handler checks it).
+                    let _ = fs::remove_file(&pid_path);
+                    // Terminate the daemon's job object first: this also closes any chooser dialog
+                    // window it currently has open (a separate powershell.exe process, but a member
+                    // of the same job), same purpose as signaling the whole process group on Unix.
+                    ts_debug(&format!("kill_reminder: terminating job for {}", pid));
+                    win_ffi::terminate_reminder_job(pid);
+                    for _ in 0..20 {
+                        if !is_pid_running(pid) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    if is_pid_running(pid) {
+                        // Job termination didn't take (e.g. the daemon never created one); fall
+                        // back to terminating the bare PID.
+                        ts_debug(&format!("kill_reminder: terminating pid {} directly", pid));
+                        win_ffi::terminate_process(pid);
+                    }
+                    ts_debug("kill_reminder: done");
+                    return;
+                }
+                ts_debug("kill_reminder: process not running");
+            }
+        } else {
+            ts_debug("kill_reminder: no pid file or unreadable");
+        }
+        let _ = fs::remove_file(&pid_path);
+        ts_debug("kill_reminder: done");
+        return;
+    }
+
+    #[cfg(not(any(unix, target_os = "windows")))]
     return;
 
     #[cfg(unix)]
@@ -4129,7 +4264,80 @@ fn kill_reminder_daemon_if_running() {
 
 /// Start the reminder daemon in the background if not already running. No-op on non-Unix or if daemon already running.
 fn start_reminder_daemon_if_needed(_timesheet: &Path) {
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
+    {
+        ts_debug("start_reminder: entry");
+        let pid_path = reminder_pid_path();
+        if let Ok(data) = fs::read_to_string(&pid_path) {
+            if let Ok(pid) = data.trim().parse::<u32>() {
+                if is_pid_running(pid) {
+                    ts_debug("start_reminder: daemon already running, skipping spawn");
+                    return;
+                }
+            }
+        }
+        let exe = match env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                ts_debug(&format!("start_reminder: current_exe failed: {}", e));
+                return;
+            }
+        };
+        let use_debug = env::var_os("TS_DEBUG").is_some();
+        if use_debug {
+            ts_debug("start_reminder: TS_DEBUG set, spawning daemon with inherited stdio");
+        } else {
+            ts_debug(&format!("start_reminder: spawning {}", exe.display()));
+            // Stop this process's own stdio handles from riding along into the daemon: Windows
+            // handle inheritance is all-or-nothing, so without this a caller capturing this
+            // process's output (a script, `$out = & timesheet.exe start`, ...) would block forever
+            // waiting for EOF, since the long-lived daemon keeps the pipe's write end open. Only
+            // safe to do here, not when TS_DEBUG wants the daemon to inherit these same handles.
+            win_ffi::make_own_std_handles_noninheritable();
+        }
+        // CREATE_NO_WINDOW keeps a hidden (not absent) console so the daemon's console ctrl
+        // handler can still receive logoff/shutdown events. Try to also break away from any
+        // enclosing job (e.g. Windows Terminal's per-tab job, which may kill-on-close) so the
+        // daemon survives after the spawning terminal closes -- the Windows analog of setsid()
+        // detaching from the controlling terminal on Unix. CreateProcess fails outright if the
+        // enclosing job forbids breakaway, so retry once without that flag on failure.
+        let base_flags = win_ffi::CREATE_NO_WINDOW | win_ffi::CREATE_NEW_PROCESS_GROUP;
+        let spawn = |flags: u32| {
+            Command::new(&exe)
+                .arg("--reminder-daemon")
+                .stdin(Stdio::null())
+                .stdout(if use_debug {
+                    Stdio::inherit()
+                } else {
+                    Stdio::null()
+                })
+                .stderr(if use_debug {
+                    Stdio::inherit()
+                } else {
+                    Stdio::null()
+                })
+                .creation_flags(flags)
+                .spawn()
+        };
+        let result =
+            spawn(base_flags | win_ffi::CREATE_BREAKAWAY_FROM_JOB).or_else(|_| spawn(base_flags));
+        match result {
+            Ok(child) => {
+                ts_debug(&format!(
+                    "start_reminder: spawned daemon pid {}",
+                    child.id()
+                ));
+                drop(child);
+            }
+            Err(e) => {
+                ts_debug(&format!("start_reminder: spawn failed: {}", e));
+            }
+        }
+        ts_debug("start_reminder: done");
+        return;
+    }
+
+    #[cfg(not(any(unix, target_os = "windows")))]
     return;
 
     #[cfg(unix)]
@@ -4276,7 +4484,51 @@ fn run_session_daemon(timesheet: &Path) {
     }
 }
 
+/// Timesheet path stashed for `windows_console_ctrl_handler`, which -- being a raw function
+/// pointer passed to `SetConsoleCtrlHandler` -- cannot capture it as a closure would.
+#[cfg(target_os = "windows")]
+static REMINDER_TIMESHEET_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Console control handler: the Windows analog of the Unix SIGTERM handler in this same function.
+/// Unlike SIGTERM, `kill_reminder_daemon_if_running`'s intentional-kill path never reaches this
+/// handler on Windows (it terminates the job/process directly, bypassing control handlers
+/// entirely), so -- unlike the Unix version -- there is no need to distinguish an intentional kill
+/// from a real logoff/shutdown here: every call is a genuine one. Records a STOP if a session is
+/// open, then exits. Windows does not guarantee it waits for this to finish the way launchd/
+/// systemd wait for their equivalents, so this is best-effort, same as the other platforms.
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn windows_console_ctrl_handler(ctrl_type: u32) -> i32 {
+    if ctrl_type == win_ffi::CTRL_LOGOFF_EVENT
+        || ctrl_type == win_ffi::CTRL_SHUTDOWN_EVENT
+        || ctrl_type == win_ffi::CTRL_CLOSE_EVENT
+    {
+        if let Some(timesheet) = REMINDER_TIMESHEET_PATH.get() {
+            let content = fs::read_to_string(timesheet).unwrap_or_default();
+            let last = content.lines().rev().find(|l| !l.trim().is_empty());
+            if last
+                .and_then(parse_line)
+                .map(|ll| matches!(ll, LogLine::Start(_, _)))
+                .unwrap_or(false)
+            {
+                let _ = append_stop_entry(timesheet, Local::now());
+            }
+        }
+        process::exit(0);
+    }
+    0
+}
+
 fn run_reminder_daemon(timesheet: &Path) {
+    #[cfg(target_os = "windows")]
+    {
+        // Join our own kill-on-close Job Object (the Windows analog of setsid() below): anything
+        // this daemon later spawns, e.g. a chooser dialog, becomes a member too, so terminating
+        // the job (kill_reminder_daemon_if_running) closes both in one call.
+        let _ =
+            win_ffi::create_and_join_kill_on_close_job(&win_ffi::reminder_job_name(process::id()));
+        let _ = REMINDER_TIMESHEET_PATH.set(timesheet.to_path_buf());
+        win_ffi::set_console_ctrl_handler(windows_console_ctrl_handler);
+    }
     #[cfg(unix)]
     {
         let _ = unsafe { signal(SIGHUP, SIG_IGN) };
@@ -4437,7 +4689,8 @@ fn parse_native_reminder_dialog_output(output: &str) -> Option<ReminderResult> {
 }
 
 /// Show "What are you working on?" prompt; returns user choice or timeout.
-/// Platform-specific (macOS: AppKit/osascript; Linux: PyQt single-click chooser, else kdialog/zenity).
+/// Platform-specific (macOS: AppKit/osascript; Linux: PyQt single-click chooser, else kdialog/zenity;
+/// Windows: PowerShell/WinForms chooser).
 /// timesheet: used when appending STOP on timeout (reminder daemon / timesheet start).
 fn show_reminder_prompt(activities: &[String], timesheet: Option<&Path>) -> ReminderResult {
     #[cfg(target_os = "macos")]
@@ -4446,7 +4699,10 @@ fn show_reminder_prompt(activities: &[String], timesheet: Option<&Path>) -> Remi
     #[cfg(target_os = "linux")]
     return show_reminder_prompt_linux(activities, timesheet);
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    return show_reminder_prompt_windows(activities, timesheet);
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = (activities, timesheet);
         ReminderResult::TimeoutAddStop(Local::now())
@@ -4457,11 +4713,11 @@ fn show_reminder_prompt(activities: &[String], timesheet: Option<&Path>) -> Remi
 /// Returns `Some(activity)` to start, or `None` if the user chose "Stop Work" (caller should abort the start).
 /// On platforms (or headless setups) without a GUI chooser, returns the default activity without prompting.
 /// Whether `timesheet start` with no activity can show an interactive GUI chooser on this platform/setup
-/// (macOS always; Linux when kdialog/zenity is installed). Used both to decide whether to block on
-/// the chooser and to avoid starting the reminder daemon early when we will.
+/// (macOS and Windows always; Linux when kdialog/zenity is installed). Used both to decide whether to
+/// block on the chooser and to avoid starting the reminder daemon early when we will.
 #[cfg(not(test))]
 fn start_chooser_available() -> bool {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         true
     }
@@ -4469,7 +4725,7 @@ fn start_chooser_available() -> bool {
     {
         detect_linux_dialog().is_some()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         false
     }
@@ -4504,7 +4760,7 @@ fn resolve_start_activity(timesheet: &Path) -> Option<String> {
 }
 
 /// Build the `Stop Work` / activities / `Enter new activity...` choice list shown in the reminder dialog.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn reminder_choices(activities: &[String]) -> Vec<String> {
     let mut choices = vec!["Stop Work".to_string()];
     for a in activities.iter().rev() {
@@ -4917,6 +5173,224 @@ fn show_reminder_prompt_linux(activities: &[String], timesheet: Option<&Path>) -
                         ReminderResult::ShowAgainImmediate
                     }
                 }
+                Some(result) => result,
+                // Cancelled or dismissed without a choice: re-show immediately.
+                None => ReminderResult::ShowAgainImmediate,
+            }
+        }
+        None => ReminderResult::TimeoutAddStop(reminder_appeared),
+    }
+}
+
+/// PowerShell's `-EncodedCommand` expects the script as base64-encoded UTF-16LE; this sidesteps
+/// every shell-quoting hazard a multi-line WinForms script would otherwise hit.
+#[cfg(target_os = "windows")]
+fn encode_powershell_command(script: &str) -> String {
+    let mut utf16le = Vec::with_capacity(script.len() * 2);
+    for unit in script.encode_utf16() {
+        utf16le.push(unit as u8);
+        utf16le.push((unit >> 8) as u8);
+    }
+    base64_encode(&utf16le)
+}
+
+#[cfg(target_os = "windows")]
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        out.push(ALPHABET[(n >> 18 & 0x3F) as usize] as char);
+        out.push(ALPHABET[(n >> 12 & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6 & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Full-screen, topmost, single-click chooser implemented with PowerShell/WinForms (mirrors the
+/// Linux PyQt chooser's feel more than kdialog/zenity's list+OK). Picking "Enter new activity..."
+/// opens a small inline input dialog in the same script (like the PyQt chooser does), so the whole
+/// interaction is one process and one round trip. Writes the chosen string to stdout, or nothing
+/// if the window is dismissed without a choice.
+/// `{CHOICES}` is replaced with a PowerShell array literal before encoding. Choices are embedded
+/// directly in the script rather than passed as trailing argv, because -EncodedCommand does not
+/// support trailing positional arguments the way -Command does (passing them anyway makes
+/// powershell.exe silently fall back to printing its own usage text instead of running the
+/// script).
+#[cfg(target_os = "windows")]
+const REMINDER_CHOOSER_PS1: &str = r#"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$choices = @({CHOICES})
+$script:result = $null
+
+function Prompt-NewActivity {
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = "timesheet"
+    $dlg.StartPosition = "CenterScreen"
+    $dlg.TopMost = $true
+    $dlg.Width = 400
+    $dlg.Height = 150
+    $dlg.FormBorderStyle = "FixedDialog"
+    $dlg.MinimizeBox = $false
+    $dlg.MaximizeBox = $false
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = "Enter activity:"
+    $lbl.Location = New-Object System.Drawing.Point(10, 10)
+    $lbl.AutoSize = $true
+    $txt = New-Object System.Windows.Forms.TextBox
+    $txt.Location = New-Object System.Drawing.Point(10, 35)
+    $txt.Width = 360
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = "OK"
+    $ok.Location = New-Object System.Drawing.Point(210, 70)
+    $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = "Cancel"
+    $cancel.Location = New-Object System.Drawing.Point(295, 70)
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dlg.Controls.AddRange(@($lbl, $txt, $ok, $cancel))
+    $dlg.AcceptButton = $ok
+    $dlg.CancelButton = $cancel
+    $r = $dlg.ShowDialog()
+    if ($r -eq [System.Windows.Forms.DialogResult]::OK -and $txt.Text.Trim().Length -gt 0) {
+        return $txt.Text.Trim()
+    }
+    return $null
+}
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "timesheet"
+$form.FormBorderStyle = "None"
+$form.WindowState = "Maximized"
+$form.TopMost = $true
+$form.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
+$form.KeyPreview = $true
+$form.Add_KeyDown({ if ($_.KeyCode -eq "Escape") { $form.Close() } })
+
+$label = New-Object System.Windows.Forms.Label
+$label.Text = "What are you working on?"
+$label.ForeColor = [System.Drawing.Color]::White
+$label.Font = New-Object System.Drawing.Font("Segoe UI", 16)
+$label.AutoSize = $true
+$label.Location = New-Object System.Drawing.Point(10, 10)
+
+$listBox = New-Object System.Windows.Forms.ListBox
+$listBox.Font = New-Object System.Drawing.Font("Segoe UI", 12)
+$listBox.Width = 420
+$listBox.Height = [Math]::Min(28 * $choices.Count + 20, 520)
+$listBox.Location = New-Object System.Drawing.Point(10, ($label.Bottom + 10))
+foreach ($c in $choices) { [void]$listBox.Items.Add($c) }
+
+$panel = New-Object System.Windows.Forms.Panel
+$panel.Width = 440
+$panel.Height = $listBox.Bottom + 10
+$panel.Controls.Add($label)
+$panel.Controls.Add($listBox)
+$form.Controls.Add($panel)
+$form.Add_Shown({
+    $panel.Left = [int](($form.ClientSize.Width - $panel.Width) / 2)
+    $panel.Top = [int](($form.ClientSize.Height - $panel.Height) / 2)
+    $form.Activate()
+})
+
+$listBox.Add_Click({
+    if ($listBox.SelectedItem -eq $null) { return }
+    $item = $listBox.SelectedItem.ToString()
+    if ($item -eq "Enter new activity...") {
+        $activity = Prompt-NewActivity
+        if ($activity) {
+            $script:result = $activity
+            $form.Close()
+        } else {
+            $listBox.ClearSelected()
+        }
+        return
+    }
+    $script:result = $item
+    $form.Close()
+})
+
+[void]$form.ShowDialog()
+if ($script:result) {
+    Write-Output $script:result
+}
+"#;
+
+#[cfg(target_os = "windows")]
+fn show_reminder_prompt_windows(
+    activities: &[String],
+    timesheet: Option<&Path>,
+) -> ReminderResult {
+    let reminder_appeared = Local::now();
+    let choices = reminder_choices(activities);
+    let ps_quote = |s: &str| s.replace('\'', "''");
+    let choices_literal = choices
+        .iter()
+        .map(|c| format!("'{}'", ps_quote(c)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let script = REMINDER_CHOOSER_PS1.replace("{CHOICES}", &choices_literal);
+    let encoded = encode_powershell_command(&script);
+
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Sta",
+        "-WindowStyle",
+        "Hidden",
+        "-EncodedCommand",
+        &encoded,
+    ]);
+
+    let child = match cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return ReminderResult::TimeoutAddStop(reminder_appeared),
+    };
+
+    // Same leave-it-on-screen-and-record-STOP-once behavior as the Linux dialog: wait indefinitely,
+    // recording the STOP once one reminder interval passes unanswered.
+    let interval = Duration::from_secs(get_reminder_interval_secs());
+    let mut child = child;
+    let mut appended_stop = false;
+    let stdout = loop {
+        match wait_with_timeout(child, interval, false) {
+            WaitOutcome::Finished(out) => break out,
+            WaitOutcome::TimedOut => break None,
+            WaitOutcome::TimedOutWithChild(c) => {
+                if !appended_stop {
+                    if let Some(ts) = timesheet {
+                        let _ = append_reminder_timeout_stop(ts, reminder_appeared);
+                    }
+                    appended_stop = true;
+                }
+                child = c;
+            }
+        }
+    };
+    match stdout {
+        Some(stdout) => {
+            let s = String::from_utf8_lossy(&stdout).trim().to_string();
+            match parse_native_reminder_dialog_output(&s) {
                 Some(result) => result,
                 // Cancelled or dismissed without a choice: re-show immediately.
                 None => ReminderResult::ShowAgainImmediate,
