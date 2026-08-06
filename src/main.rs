@@ -2089,19 +2089,13 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
             "ts install: no writable directory on PATH. Specify an installation directory.",
         )?
     };
-    let src = script_dir.join("ts");
-    let src_exe = if script_dir == exe.parent().unwrap_or(Path::new(".")) {
-        exe.clone()
-    } else {
-        script_dir.join(if cfg!(windows) { "ts.exe" } else { "ts" })
-    };
-    let src_to_use = if src.exists() {
-        &src
-    } else if src_exe.exists() {
-        &src_exe
-    } else {
-        &exe
-    };
+    // Look for a prebuilt binary under script_dir first (its filename must match this platform's
+    // convention: "ts.exe" on Windows, "ts" elsewhere -- a bare "ts" must never be preferred on
+    // Windows, since a Linux/macOS build of the same repo can leave one sitting right next to
+    // "ts.exe" in a shared target dir, e.g. when accessed through WSL interop), falling back to
+    // the currently running executable.
+    let candidate = script_dir.join(if cfg!(windows) { "ts.exe" } else { "ts" });
+    let src_to_use = if candidate.exists() { &candidate } else { &exe };
     if !src_to_use.exists() {
         return Err(format!("ts install: missing {}", src_to_use.display()));
     }
@@ -2136,9 +2130,61 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
             println!("Installed icon {}", dest_icon.display());
         }
     }
+    #[cfg(target_os = "windows")]
+    {
+        match install_windows_start_menu_shortcut(&dest_file) {
+            Ok(path) => println!("Installed Start Menu shortcut {}", path.display()),
+            Err(e) => eprintln!("ts install: warning: {}", e),
+        }
+    }
     println!("Installed {}", dest_file.display());
     println!("Done. ts is in {} and executable.", dest.display());
     Ok(())
+}
+
+/// Create (or overwrite) a per-user Start Menu shortcut that runs `ts.exe start`, so starting
+/// work is a point-and-click action. Shells out to PowerShell's WScript.Shell COM object, same
+/// approach as the OS-tool shell-outs used for the macOS install steps above.
+#[cfg(target_os = "windows")]
+fn install_windows_start_menu_shortcut(dest_file: &Path) -> Result<PathBuf, String> {
+    let start_menu = dirs::config_dir()
+        .ok_or("could not determine %APPDATA%")?
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs");
+    fs::create_dir_all(&start_menu)
+        .map_err(|e| format!("cannot create {}: {}", start_menu.display(), e))?;
+    let shortcut = start_menu.join("Start Timesheet.lnk");
+    let ps_quote = |s: &str| s.replace('\'', "''");
+    let exe = ps_quote(&dest_file.to_string_lossy());
+    let workdir = ps_quote(
+        &dest_file
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_string_lossy(),
+    );
+    let link = ps_quote(&shortcut.to_string_lossy());
+    let script = format!(
+        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{link}'); \
+         $s.TargetPath = '{exe}'; \
+         $s.Arguments = 'start'; \
+         $s.WorkingDirectory = '{workdir}'; \
+         $s.IconLocation = '{exe}'; \
+         $s.Description = 'Record work start (same as running \"ts start\")'; \
+         $s.Save()"
+    );
+    let status = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .status()
+        .map_err(|e| format!("failed to run powershell: {}", e))?;
+    if !status.success() {
+        return Err(format!(
+            "powershell exited with {} while creating Start Menu shortcut",
+            status
+        ));
+    }
+    Ok(shortcut)
 }
 
 /// Remove startup/shutdown/login/logout hooks that reference ts. No-op on unsupported platforms.
@@ -2721,7 +2767,9 @@ Optional
 .I repo_path
 is the directory containing the binary (default: current executable's directory). On macOS the icon is embedded so
 .B ts-icon.svg
-is always written even without the source repository.
+is always written even without the source repository. On Windows, also creates (or overwrites) a per-user Start Menu shortcut, "Start Timesheet", that runs
+.B "ts start"
+so starting work is a point-and-click action.
 .TP
 .B uninstall
 Stop the reminder daemon, remove startup/shutdown/login/logout hooks (LaunchAgents and LogoutHook on macOS, systemd user units and the system-level logout hook on Linux), prompt to remove timesheet log files (y/N), then remove
