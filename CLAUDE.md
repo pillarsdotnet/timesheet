@@ -1,4 +1,4 @@
-# Claude instructions for the `ts` timesheet project
+# Claude instructions for the `timesheet` project
 
 These mirror the project's Cursor rules (`.cursor/rules/*.mdc`) as native Claude
 instructions. Keep them in sync if either set changes.
@@ -21,6 +21,6 @@ Do not commit until docs have been updated when the changes warrant it.
 When the user says "rebuild and reinstall" (or equivalent) in this project:
 
 1. Run `cargo build --release`
-2. Run `./target/release/ts install ~/bin`
+2. Run `./target/release/timesheet install ~/bin`
 
 Install to `~/bin` specifically, not the first writable directory on PATH.

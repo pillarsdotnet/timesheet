@@ -1272,6 +1272,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "timesheet"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dirs",
+ "lettre",
+ "libc",
+ "lopdf",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "regex",
+ "tempfile",
+]
+
+[[package]]
 name = "tinystr"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1307,22 +1323,6 @@ dependencies = [
  "pin-project-lite",
  "socket2",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "ts"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "dirs",
- "lettre",
- "libc",
- "lopdf",
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
- "regex",
- "tempfile",
 ]
 
 [[package]]
