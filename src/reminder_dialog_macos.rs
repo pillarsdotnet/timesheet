@@ -402,52 +402,80 @@ define_class!(
             panel.setContentView(Some(&content));
             panel.setInitialFirstResponder(Some(content.as_ref() as &NSView));
 
-            // Vertical stack for buttons. Height = ~32pt per button (24pt + 8pt spacing).
+            // Grid of per-column vertical stacks instead of one column with vertical
+            // scroll: with the panel full-screen, splitting into as many columns as fit
+            // the available height uses the space instead of forcing a scrollbar. Filled
+            // column-major (top-to-bottom, then next column) so the first choice
+            // ("Stop Work") lands top of the leftmost column and the last ("Enter new
+            // activity...") lands bottom of the rightmost column.
             let button_width: f64 = 280.0;
             let button_height: f64 = 32.0;
-            let stack_height = (choices.len() as f64 * button_height).max(160.0);
-            let stack_frame = NSRect::new(
-                NSPoint::new(0.0, 0.0),
-                NSSize::new(button_width, stack_height),
-            );
-            let stack_alloc = NSStackView::alloc(mtm);
-            let stack: Retained<NSStackView> =
-                unsafe { msg_send![stack_alloc, initWithFrame: stack_frame] };
-            stack.setOrientation(NS_USER_INTERFACE_LAYOUT_ORIENTATION_VERTICAL);
-            stack.setSpacing(8.0);
-            stack.setDistribution(NSStackViewDistribution::FillEqually);
+            let col_spacing: f64 = 24.0;
 
-            for choice in choices.iter() {
-                let btn = unsafe {
-                    NSButton::buttonWithTitle_target_action(
-                        &NSString::from_str(choice),
-                        Some(handler.as_ref() as &AnyObject),
-                        Some(sel_choice_clicked),
-                        mtm,
-                    )
-                };
-                stack.addArrangedSubview(&btn);
-            }
-
-            // Container to center the stack horizontally within the scroll area.
             let scroll_width = content_rect.size.width - 40.0;
             let scroll_height = content_rect.size.height - 40.0;
-            let doc_height = scroll_height.max(stack_height);
-            let stack_center_x = (scroll_width - button_width) / 2.0;
+
+            let n = choices.len();
+            let max_rows = ((scroll_height / button_height).floor() as usize).max(1);
+            let columns = ((n + max_rows - 1) / max_rows).max(1);
+            let rows_per_col = (n + columns - 1) / columns;
+
+            let overall_width =
+                columns as f64 * button_width + (columns.saturating_sub(1)) as f64 * col_spacing;
+            let overall_height = (rows_per_col as f64 * button_height).max(160.0);
+            let doc_width = scroll_width.max(overall_width);
+            let doc_height = scroll_height.max(overall_height);
+            let grid_origin_x = (doc_width - overall_width) / 2.0;
+
             let container_frame = NSRect::new(
                 NSPoint::new(0.0, 0.0),
-                NSSize::new(scroll_width, doc_height),
+                NSSize::new(doc_width, doc_height),
             );
             let container_alloc = NSView::alloc(mtm);
             let container: Retained<NSView> =
                 unsafe { msg_send![container_alloc, initWithFrame: container_frame] };
-            stack.setFrame(NSRect::new(
-                NSPoint::new(stack_center_x, doc_height - stack_height),
-                NSSize::new(button_width, stack_height),
-            ));
-            container.addSubview(&stack);
 
-            // Scroll view: fill content (with insets for padding).
+            let mut idx = 0usize;
+            for col in 0..columns {
+                let count_in_col = rows_per_col.min(n - idx);
+                let col_height = (count_in_col as f64 * button_height).max(160.0);
+                let col_frame = NSRect::new(
+                    NSPoint::new(0.0, 0.0),
+                    NSSize::new(button_width, col_height),
+                );
+                let col_stack_alloc = NSStackView::alloc(mtm);
+                let col_stack: Retained<NSStackView> =
+                    unsafe { msg_send![col_stack_alloc, initWithFrame: col_frame] };
+                col_stack.setOrientation(NS_USER_INTERFACE_LAYOUT_ORIENTATION_VERTICAL);
+                col_stack.setSpacing(8.0);
+                col_stack.setDistribution(NSStackViewDistribution::FillEqually);
+
+                for choice in &choices[idx..idx + count_in_col] {
+                    let btn = unsafe {
+                        NSButton::buttonWithTitle_target_action(
+                            &NSString::from_str(choice),
+                            Some(handler.as_ref() as &AnyObject),
+                            Some(sel_choice_clicked),
+                            mtm,
+                        )
+                    };
+                    col_stack.addArrangedSubview(&btn);
+                }
+
+                col_stack.setFrame(NSRect::new(
+                    NSPoint::new(
+                        grid_origin_x + col as f64 * (button_width + col_spacing),
+                        doc_height - col_height,
+                    ),
+                    NSSize::new(button_width, col_height),
+                ));
+                container.addSubview(&col_stack);
+                idx += count_in_col;
+            }
+
+            // Scroll view: fill content (with insets for padding). Both scrollers stay
+            // available as a fallback for pathological choice counts, though the column
+            // math above normally makes the grid fit without scrolling.
             let scroll_frame = NSRect::new(
                 NSPoint::new(20.0, 20.0),
                 NSSize::new(scroll_width, scroll_height),
@@ -465,7 +493,7 @@ define_class!(
             );
             scroll.setDocumentView(Some(&container));
             scroll.setHasVerticalScroller(true);
-            scroll.setHasHorizontalScroller(false);
+            scroll.setHasHorizontalScroller(true);
             scroll.setAutohidesScrollers(true);
             content.addSubview(&scroll);
             panel.orderFrontRegardless();

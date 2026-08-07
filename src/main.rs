@@ -4961,20 +4961,41 @@ try:
     w.setWindowFlags(w.windowFlags() | wintype.WindowStaysOnTopHint)
 except Exception:
     pass
-lst = QListWidget()
-lst.addItems(choices)
 prompt = QLabel("What are you working on?")
 try:
     prompt.setAlignment(align.AlignCenter)
 except Exception:
     pass
+# Lay the choices out in columns instead of one tall scrolling list: with the
+# window full-screen, a grid uses the available space instead of forcing a
+# scrollbar. Column count is derived from screen height so the grid fits
+# without scrolling for any realistic number of choices; filled column-major
+# so the first choice ("Stop Work") lands top-of-first-column and the last
+# ("Enter new activity...") lands bottom-of-last-column.
+item_h = 28
+screen = app.primaryScreen()
+avail_h = (screen.availableGeometry().height() if screen else 800) - 220
+max_rows = max(1, avail_h // item_h)
+n = len(choices)
+columns = max(1, -(-n // max_rows))  # ceil division
+rows_per_col = -(-n // columns)  # ceil division
+grid = QHBoxLayout()
+lists = []
+idx = 0
+for col in range(columns):
+    count = min(rows_per_col, n - idx)
+    lst = QListWidget()
+    lst.addItems(choices[idx:idx + count])
+    lst.setFixedWidth(420)
+    lst.setFixedHeight(count * item_h + 20)
+    lists.append((lst, idx))
+    grid.addWidget(lst)
+    idx += count
 # Centered panel: the window is full-screen, but the choices stay a comfortable size.
 panel = QWidget()
 panel_lay = QVBoxLayout(panel)
 panel_lay.addWidget(prompt)
-panel_lay.addWidget(lst)
-panel.setFixedWidth(420)
-lst.setFixedHeight(min(len(choices) * 28 + 20, 520))
+panel_lay.addLayout(grid)
 row = QHBoxLayout()
 row.addStretch(1)
 row.addWidget(panel)
@@ -4993,10 +5014,11 @@ def on_click(item):
         if ok and activity.strip():
             finish(activity.strip())
         else:
-            lst.clearSelection()
+            item.listWidget().clearSelection()
         return
     finish(text)
-lst.itemClicked.connect(on_click)
+for lst, _ in lists:
+    lst.itemClicked.connect(on_click)
 w.showFullScreen()
 try:
     w.raise_()
@@ -5005,7 +5027,11 @@ except Exception:
     pass
 autopick = os.environ.get("TS_CHOOSER_AUTOPICK")
 if autopick is not None:
-    QTimer.singleShot(200, lambda: on_click(lst.item(int(autopick))))
+    ai = int(autopick)
+    for lst, base in lists:
+        if base <= ai < base + lst.count():
+            QTimer.singleShot(200, lambda lst=lst, i=ai - base: on_click(lst.item(i)))
+            break
 run = getattr(app, "exec", None) or getattr(app, "exec_")
 run()
 if result["v"] is not None:
@@ -5288,18 +5314,42 @@ $label.Font = New-Object System.Drawing.Font("Segoe UI", 16)
 $label.AutoSize = $true
 $label.Location = New-Object System.Drawing.Point(10, 10)
 
-$listBox = New-Object System.Windows.Forms.ListBox
-$listBox.Font = New-Object System.Drawing.Font("Segoe UI", 12)
-$listBox.Width = 420
-$listBox.Height = [Math]::Min(28 * $choices.Count + 20, 520)
-$listBox.Location = New-Object System.Drawing.Point(10, ($label.Bottom + 10))
-foreach ($c in $choices) { [void]$listBox.Items.Add($c) }
+# Lay the choices out in columns instead of one tall scrolling list: with the
+# window full-screen (borderless + maximized above), a grid uses the
+# available space instead of forcing a scrollbar. Column count is derived
+# from screen height so the grid fits without scrolling for any realistic
+# number of choices; filled column-major so the first choice ("Stop Work")
+# lands top-of-first-column and the last ("Enter new activity...") lands
+# bottom-of-last-column.
+$itemHeight = 28
+$screenHeight = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Height
+$maxRows = [Math]::Max(1, [Math]::Floor(($screenHeight - 220) / $itemHeight))
+$n = $choices.Count
+$columns = [Math]::Max(1, [Math]::Ceiling($n / $maxRows))
+$rowsPerCol = [Math]::Ceiling($n / $columns)
+$colWidth = 420
+$colSpacing = 20
+
+$listBoxes = @()
+$idx = 0
+for ($col = 0; $col -lt $columns; $col++) {
+    $count = [Math]::Min($rowsPerCol, $n - $idx)
+    $lb = New-Object System.Windows.Forms.ListBox
+    $lb.Font = New-Object System.Drawing.Font("Segoe UI", 12)
+    $lb.Width = $colWidth
+    $lb.Height = ($count * $itemHeight) + 20
+    $lb.Location = New-Object System.Drawing.Point((10 + $col * ($colWidth + $colSpacing)), ($label.Bottom + 10))
+    for ($j = 0; $j -lt $count; $j++) { [void]$lb.Items.Add($choices[$idx + $j]) }
+    $listBoxes += $lb
+    $idx += $count
+}
+$maxListHeight = ($listBoxes | ForEach-Object { $_.Height } | Measure-Object -Maximum).Maximum
 
 $panel = New-Object System.Windows.Forms.Panel
-$panel.Width = 440
-$panel.Height = $listBox.Bottom + 10
+$panel.Width = 20 + ($columns * $colWidth) + (($columns - 1) * $colSpacing)
+$panel.Height = $label.Bottom + 10 + $maxListHeight + 10
 $panel.Controls.Add($label)
-$panel.Controls.Add($listBox)
+foreach ($lb in $listBoxes) { $panel.Controls.Add($lb) }
 $form.Controls.Add($panel)
 $form.Add_Shown({
     $panel.Left = [int](($form.ClientSize.Width - $panel.Width) / 2)
@@ -5307,22 +5357,25 @@ $form.Add_Shown({
     $form.Activate()
 })
 
-$listBox.Add_Click({
-    if ($listBox.SelectedItem -eq $null) { return }
-    $item = $listBox.SelectedItem.ToString()
+# $this is bound to whichever ListBox raised the event, so one handler
+# shared across all columns is enough.
+$onListClick = {
+    if ($this.SelectedItem -eq $null) { return }
+    $item = $this.SelectedItem.ToString()
     if ($item -eq "Enter new activity...") {
         $activity = Prompt-NewActivity
         if ($activity) {
             $script:result = $activity
             $form.Close()
         } else {
-            $listBox.ClearSelected()
+            $this.ClearSelected()
         }
         return
     }
     $script:result = $item
     $form.Close()
-})
+}
+foreach ($lb in $listBoxes) { $lb.Add_Click($onListClick) }
 
 [void]$form.ShowDialog()
 if ($script:result) {
