@@ -42,7 +42,7 @@
 //! |------------|-------------|
 //! | `alias`    | Interactively replace activity text in this week's START entries (regex). |
 //! | `autostart` | Register `timesheet start` on login and `timesheet stop` on logout/shutdown (macOS/Linux: LaunchAgents/systemd units plus an admin-installed logout hook; Windows: a Startup-folder shortcut plus the daemon's best-effort console control handler, no admin required or available). |
-//! | `edit`     | Open the timesheet log in `$EDITOR` (then `$VISUAL`, else `vi`; `notepad` on Windows). |
+//! | `edit`     | Open the timesheet log in `$EDITOR` (then `$VISUAL`, else `vi`; the `.txt`-associated program on Windows). |
 //! | `email`    | Fill the timesheet PDF as `pdf` does and mail it as an attachment. |
 //! | `help`     | Show the man page in a pager (groff -man -Tascii \| less; plain text via `more` on Windows). |
 //! | `install`  | Copy binary and icon to a directory on PATH (icon embedded on macOS). |
@@ -1530,31 +1530,55 @@ fn cmd_tail(tail_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
 }
 
 /// Prints report: % per activity and hours per weekday; optional arg selects file (e.g. `log`, `0220`, `-1`, path).
-/// Opens the timesheet log in the user's editor (`$EDITOR`, falling back to `$VISUAL` then `vi`).
+/// Opens the timesheet log in the user's editor (`$EDITOR`, falling back to `$VISUAL`, then the
+/// OS default: the program associated with `.txt` files on Windows, `vi` elsewhere).
 fn cmd_edit(timesheet: &Path) -> Result<(), String> {
-    let editor = env::var_os("EDITOR")
-        .or_else(|| env::var_os("VISUAL"))
-        .unwrap_or_else(|| {
-            if cfg!(windows) {
-                "notepad".into()
-            } else {
-                "vi".into()
-            }
-        });
     if let Some(parent) = timesheet.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("timesheet edit: cannot create {}: {}", parent.display(), e))?;
     }
-    let status = Command::new(&editor)
-        .arg(timesheet)
+    let editor = env::var_os("EDITOR").or_else(|| env::var_os("VISUAL"));
+    let (mut cmd, label) = match editor {
+        Some(editor) => {
+            let mut c = Command::new(&editor);
+            c.arg(timesheet);
+            (c, format!("{:?}", editor))
+        }
+        None if cfg!(windows) => {
+            // No $EDITOR/$VISUAL: use whatever program Windows has associated with .txt files
+            // (via `cmd /c start`) instead of hardcoding notepad, so this respects the user's
+            // actual default text editor if they've changed it in Windows Settings > Default
+            // Apps. The empty "" after /wait is the window-title argument `start` always expects
+            // before the target path -- omitting it would make `start` treat the log path itself
+            // as the title and fail to open it.
+            let mut c = Command::new("cmd");
+            c.args(["/c", "start", "/wait", ""]);
+            c.arg(timesheet);
+            // cmd.exe rejects a UNC current directory ("UNC paths are not supported") and warns
+            // on stderr before falling back on its own -- which is exactly what timesheet.exe's
+            // own cwd is whenever it's launched through WSL interop (e.g. from a WSL shell). The
+            // log path argument above is already absolute, so this only silences a harmless but
+            // alarming-looking warning; any real local directory works here.
+            if let Some(parent) = timesheet.parent() {
+                c.current_dir(parent);
+            }
+            (c, "the program associated with .txt files".to_string())
+        }
+        None => {
+            let mut c = Command::new("vi");
+            c.arg(timesheet);
+            (c, "vi".to_string())
+        }
+    };
+    let status = cmd
         .status()
-        .map_err(|e| format!("timesheet edit: cannot run editor {:?}: {}", editor, e))?;
+        .map_err(|e| format!("timesheet edit: cannot run editor ({}): {}", label, e))?;
     if status.success() {
         Ok(())
     } else {
         Err(format!(
-            "timesheet edit: editor {:?} exited with {}",
-            editor, status
+            "timesheet edit: editor ({}) exited with {}",
+            label, status
         ))
     }
 }
@@ -2066,15 +2090,17 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
         .map(PathBuf::from)
         .unwrap_or_else(|| exe.parent().unwrap_or(Path::new(".")).to_path_buf());
     let dest = if let Some(d) = dest_dir {
-        let p = PathBuf::from(d);
-        if !p.exists() {
-            fs::create_dir_all(&p)
-                .map_err(|e| format!("timesheet install: cannot create directory {}: {}", d, e))?;
-        }
-        if !p.is_dir() || !is_writable(&p) {
-            return Err(format!("timesheet install: directory is not writable: {}", d));
-        }
-        p
+        create_and_verify_writable(&PathBuf::from(d))?
+    } else if cfg!(windows) {
+        // Windows default install location. The reminder chooser is a real full-screen window now
+        // (WinForms, like the AppKit/PyQt choosers on the other two platforms), not console-only
+        // output, so it belongs in the per-user "Programs" location Windows documents for
+        // no-admin-required app installs, rather than a PATH-searched bin-style directory.
+        let local_app_data = env::var_os("LOCALAPPDATA")
+            .ok_or("timesheet install: %LOCALAPPDATA% is not set")?;
+        create_and_verify_writable(
+            &PathBuf::from(local_app_data).join("Programs").join("timesheet"),
+        )?
     } else {
         let path_env = env::var_os("PATH").unwrap_or_default();
         let mut found = None;
@@ -2319,6 +2345,27 @@ fn is_writable(p: &Path) -> bool {
     fs::metadata(p)
         .map(|m| !m.permissions().readonly())
         .unwrap_or(false)
+}
+
+/// Create `p` if it doesn't exist yet, then verify it's a writable directory. Shared by an
+/// explicit `timesheet install <dir>` argument and the Windows default install location.
+fn create_and_verify_writable(p: &Path) -> Result<PathBuf, String> {
+    if !p.exists() {
+        fs::create_dir_all(p).map_err(|e| {
+            format!(
+                "timesheet install: cannot create directory {}: {}",
+                p.display(),
+                e
+            )
+        })?;
+    }
+    if !p.is_dir() || !is_writable(p) {
+        return Err(format!(
+            "timesheet install: directory is not writable: {}",
+            p.display()
+        ));
+    }
+    Ok(p.to_path_buf())
 }
 
 fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
@@ -2808,11 +2855,15 @@ to a directory on
 .BR PATH .
 If
 .I install_dir
+is given, installs there (directory created if needed). Otherwise, on Windows,
+installs to
+.B "%LOCALAPPDATA%\\Programs\\timesheet"
+(created if needed) \(em the per-user, no-admin-required location Windows documents for app
+installs, matching the fact that the reminder chooser is a real window (WinForms) rather than
+console-only output. On other platforms, if
+.I install_dir
 is omitted, uses the first writable directory on
 .BR PATH .
-If
-.I install_dir
-is given, installs there (directory created if needed).
 Optional
 .I repo_path
 is the directory containing the binary (default: current executable's directory). On macOS the icon is embedded so
@@ -2905,7 +2956,10 @@ in your editor, taken from
 (then
 .BR $VISUAL ,
 else
-.BR vi ", " notepad " on Windows).
+.B vi
+on other platforms; on Windows, the program associated with
+.B .txt
+files, same as double-clicking the log in Explorer).
 .TP
 .BI "pdf " "[options] [week]"
 Fill a form-fillable PDF template with one week of the timesheet and write it out.
