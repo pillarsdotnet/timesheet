@@ -398,23 +398,67 @@ impl Default for RotationBoundary {
 /// Config file path: `$TS_CONFIG`, else `$XDG_CONFIG_HOME/timesheet.yml`, else
 /// `$HOME/.config/timesheet.yml`, else the platform config directory (e.g. `%APPDATA%` on
 /// Windows). A `timesheet.yaml` sibling is used when no `.yml` exists.
+///
+/// Under `cargo test` this resolves to a generated config instead, so the suite never depends on
+/// the machine it runs on — see [`test_config_path`].
 fn config_path() -> PathBuf {
-    if let Some(p) = env::var_os("TS_CONFIG") {
-        return PathBuf::from(p);
+    #[cfg(test)]
+    {
+        test_config_path()
     }
-    let dir = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .or_else(dirs::config_dir)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let yml = dir.join("timesheet.yml");
-    if !yml.exists() {
-        let yaml = dir.join("timesheet.yaml");
-        if yaml.exists() {
-            return yaml;
+    #[cfg(not(test))]
+    {
+        if let Some(p) = env::var_os("TS_CONFIG") {
+            return PathBuf::from(p);
         }
+        let dir = env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .or_else(dirs::config_dir)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let yml = dir.join("timesheet.yml");
+        if !yml.exists() {
+            let yaml = dir.join("timesheet.yaml");
+            if yaml.exists() {
+                return yaml;
+            }
+        }
+        yml
     }
-    yml
+}
+
+/// The `timesheet.yml` the test suite runs against, generated once per test process under
+/// `target/tmp/` and never read from the developer's home directory.
+///
+/// Several tests write a log entry minutes or hours in the past and then call an append path,
+/// every one of which runs [`maybe_rotate_if_previous_week`]. Whether that backdated entry counts
+/// as "previous week" depends entirely on the configured rotation boundary, so with no config of
+/// its own the suite inherited whatever the machine had: green on a developer box set to Monday,
+/// red on CI, which has no config at all and so fell back to the Sunday-00:00 default.
+///
+/// Any *fixed* boundary just moves the problem, because it leaves a window immediately after
+/// itself in which a backdated entry lands in the previous week and the log is rotated out from
+/// under the test. Pinning the boundary to *tomorrow's* weekday removes the window instead: the
+/// most recent boundary is then always six to seven days behind, far enough that no backdated
+/// entry the tests create can reach across it, whatever day and time the suite runs.
+#[cfg(test)]
+fn test_config_path() -> PathBuf {
+    static CONFIG: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            // Per-process so concurrent `cargo test` runs cannot write each other's config.
+            let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("tmp")
+                .join(format!("test-config-{}", std::process::id()));
+            fs::create_dir_all(&dir).expect("create test config dir");
+            let path = dir.join("timesheet.yml");
+            let tomorrow = (Local::now() + chrono::Duration::days(1)).weekday();
+            fs::write(&path, format!("rotate: {:?}\n", tomorrow))
+                .expect("write test timesheet.yml");
+            path
+        })
+        .clone()
 }
 
 /// Parses the supported YAML subset: `key: value` pairs, `#` comments, optional quotes, and one
