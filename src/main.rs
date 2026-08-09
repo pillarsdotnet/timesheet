@@ -582,7 +582,11 @@ fn load_rotation_boundary(path: &Path) -> RotationBoundary {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return RotationBoundary::default(),
         Err(e) => {
-            eprintln!("timesheet: {}: {}; using default rotation", path.display(), e);
+            eprintln!(
+                "timesheet: {}: {}; using default rotation",
+                path.display(),
+                e
+            );
             return RotationBoundary::default();
         }
     };
@@ -824,9 +828,12 @@ fn do_rotate(timesheet: &Path) -> Result<(), String> {
         f.write_all(format!("{}\n", format_stop_log_entry(stop_dt)).as_bytes())
             .map_err(|e| e.to_string())?;
     }
-    let min_dt = min_dt_in_log(timesheet).ok_or("timesheet rotate: no valid entries in timesheet.")?;
+    let min_dt =
+        min_dt_in_log(timesheet).ok_or("timesheet rotate: no valid entries in timesheet.")?;
     let stamp = min_dt.format("%y%m%d").to_string();
-    let parent = timesheet.parent().ok_or("timesheet rotate: no parent dir")?;
+    let parent = timesheet
+        .parent()
+        .ok_or("timesheet rotate: no parent dir")?;
     let stem = timesheet
         .file_stem()
         .and_then(|s| s.to_str())
@@ -887,7 +894,9 @@ fn migrate_parse_line(line: &str) -> Option<LogLine> {
 
 /// Converts all timesheet.* files in the timesheet directory to current format (timestamp first, ISO 8601).
 fn cmd_migrate(timesheet: &Path) -> Result<(), String> {
-    let dir = timesheet.parent().ok_or("timesheet migrate: no parent dir")?;
+    let dir = timesheet
+        .parent()
+        .ok_or("timesheet migrate: no parent dir")?;
     if !dir.exists() {
         return Ok(());
     }
@@ -968,7 +977,10 @@ fn resolve_list_input_impl(
                 if let Some(path) = nth_latest_rotated_timesheet(timesheet, rotated_index) {
                     return Ok(path);
                 }
-                return Err(format!("timesheet list: no timesheet matches \"{}\".", list_arg));
+                return Err(format!(
+                    "timesheet list: no timesheet matches \"{}\".",
+                    list_arg
+                ));
             }
         }
     }
@@ -1101,7 +1113,10 @@ fn resolve_list_input_impl(
             return Ok(path);
         }
     }
-    Err(format!("timesheet list: no timesheet matches \"{}\".", list_arg))
+    Err(format!(
+        "timesheet list: no timesheet matches \"{}\".",
+        list_arg
+    ))
 }
 
 fn resolve_list_input(arg: Option<&str>, timesheet: &Path) -> Result<PathBuf, String> {
@@ -1758,8 +1773,12 @@ fn cmd_started(args: &[String], timesheet: &Path) -> Result<(), String> {
     } else {
         activity
     };
-    let start_dt = parse_start_time(start_time)
-        .ok_or_else(|| format!("timesheet started: could not parse start time: {}", start_time))?;
+    let start_dt = parse_start_time(start_time).ok_or_else(|| {
+        format!(
+            "timesheet started: could not parse start time: {}",
+            start_time
+        )
+    })?;
     maybe_rotate_if_previous_week(timesheet)?;
     let content = fs::read_to_string(timesheet).unwrap_or_default();
     let new_entry = format_start_log_entry(start_dt, &activity);
@@ -2096,10 +2115,12 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
         // (WinForms, like the AppKit/PyQt choosers on the other two platforms), not console-only
         // output, so it belongs in the per-user "Programs" location Windows documents for
         // no-admin-required app installs, rather than a PATH-searched bin-style directory.
-        let local_app_data = env::var_os("LOCALAPPDATA")
-            .ok_or("timesheet install: %LOCALAPPDATA% is not set")?;
+        let local_app_data =
+            env::var_os("LOCALAPPDATA").ok_or("timesheet install: %LOCALAPPDATA% is not set")?;
         create_and_verify_writable(
-            &PathBuf::from(local_app_data).join("Programs").join("timesheet"),
+            &PathBuf::from(local_app_data)
+                .join("Programs")
+                .join("timesheet"),
         )?
     } else {
         let path_env = env::var_os("PATH").unwrap_or_default();
@@ -2124,18 +2145,30 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
     // rather than assumed, since a Linux/macOS build of the same repo can leave a same-named
     // extensionless binary sitting right next to the Windows one in a shared target dir, e.g. when
     // accessed through WSL interop), falling back to the currently running executable.
-    let candidate = script_dir.join(if cfg!(windows) { "timesheet.exe" } else { "timesheet" });
+    let candidate = script_dir.join(if cfg!(windows) {
+        "timesheet.exe"
+    } else {
+        "timesheet"
+    });
     let src_to_use = if candidate.exists() { &candidate } else { &exe };
     if !src_to_use.exists() {
-        return Err(format!("timesheet install: missing {}", src_to_use.display()));
+        return Err(format!(
+            "timesheet install: missing {}",
+            src_to_use.display()
+        ));
     }
     // Installed as "timesheet", not "ts", on every platform: "ts" is a name several unrelated
     // tools already claim -- e.g. BusyBox's "ts" applet and moreutils' timestamp-prefixing "ts"
     // -- so a bare "ts" ahead of this binary on PATH (a Scoop shim, for instance) would silently
     // run the wrong program instead.
-    let dest_file = dest.join(if cfg!(windows) { "timesheet.exe" } else { "timesheet" });
+    let dest_file = dest.join(if cfg!(windows) {
+        "timesheet.exe"
+    } else {
+        "timesheet"
+    });
     if !paths_refer_to_same_file(src_to_use, &dest_file) {
-        fs::copy(src_to_use, &dest_file).map_err(|e| format!("timesheet install: copy failed: {}", e))?;
+        fs::copy(src_to_use, &dest_file)
+            .map_err(|e| format!("timesheet install: copy failed: {}", e))?;
     }
     #[cfg(unix)]
     {
@@ -2335,7 +2368,8 @@ fn cmd_uninstall(args: &[String]) -> Result<(), String> {
         }
     }
 
-    fs::remove_file(&exe).map_err(|e| format!("timesheet uninstall: could not remove binary: {}", e))?;
+    fs::remove_file(&exe)
+        .map_err(|e| format!("timesheet uninstall: could not remove binary: {}", e))?;
     println!("Removed {}", exe.display());
     println!("Uninstall complete.");
     Ok(())
@@ -2391,10 +2425,16 @@ fn cmd_rebuild(args: &[String]) -> Result<(), String> {
     } else {
         let p = PathBuf::from(build_dir_arg);
         if !p.exists() {
-            return Err(format!("timesheet rebuild: no such directory: {}", p.display()));
+            return Err(format!(
+                "timesheet rebuild: no such directory: {}",
+                p.display()
+            ));
         }
         if !p.is_dir() {
-            return Err(format!("timesheet rebuild: not a directory: {}", p.display()));
+            return Err(format!(
+                "timesheet rebuild: not a directory: {}",
+                p.display()
+            ));
         }
         p.canonicalize()
             .map_err(|e| format!("timesheet rebuild: {}: {}", p.display(), e))?
@@ -3533,7 +3573,10 @@ fn cmd_autostart(args: &[String]) -> Result<(), String> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = uninstall;
-        Err("timesheet autostart: not supported on this platform (macOS, Linux, and Windows only).".to_string())
+        Err(
+            "timesheet autostart: not supported on this platform (macOS, Linux, and Windows only)."
+                .to_string(),
+        )
     }
 }
 
@@ -3580,8 +3623,13 @@ fn do_autostart_install_windows() -> Result<(), String> {
 fn do_autostart_uninstall_windows() -> Result<(), String> {
     let shortcut = windows_startup_shortcut_path()?;
     if shortcut.exists() {
-        fs::remove_file(&shortcut)
-            .map_err(|e| format!("timesheet autostart: cannot remove {}: {}", shortcut.display(), e))?;
+        fs::remove_file(&shortcut).map_err(|e| {
+            format!(
+                "timesheet autostart: cannot remove {}: {}",
+                shortcut.display(),
+                e
+            )
+        })?;
         println!("Removed {}", shortcut.display());
     } else {
         println!("Autostart was not installed.");
@@ -3596,8 +3644,13 @@ fn do_autostart_install_macos() -> Result<(), String> {
     let home = env::var_os("HOME").ok_or("timesheet autostart: HOME not set")?;
     let agents = PathBuf::from(&home).join("Library/LaunchAgents");
     let support = PathBuf::from(&home).join("Library/Application Support/ts");
-    fs::create_dir_all(&support)
-        .map_err(|e| format!("timesheet autostart: cannot create {}: {}", support.display(), e))?;
+    fs::create_dir_all(&support).map_err(|e| {
+        format!(
+            "timesheet autostart: cannot create {}: {}",
+            support.display(),
+            e
+        )
+    })?;
 
     // Remove old shell-script session wrapper if present (superseded by --session-daemon).
     let _ = fs::remove_file(support.join("autostart-session.sh"));
@@ -3763,8 +3816,13 @@ exec launchctl asuser "$uid" "{}" stop
             .replace('"', "&quot;")
     );
 
-    fs::create_dir_all(&agents)
-        .map_err(|e| format!("timesheet autostart: cannot create {}: {}", agents.display(), e))?;
+    fs::create_dir_all(&agents).map_err(|e| {
+        format!(
+            "timesheet autostart: cannot create {}: {}",
+            agents.display(),
+            e
+        )
+    })?;
     let start_plist_path = agents.join("com.ts.autostart.start.plist");
     let session_plist_path = agents.join("com.ts.autostart.session.plist");
     fs::write(&start_plist_path, &start_plist)
@@ -3989,8 +4047,13 @@ WantedBy=multi-user.target
         .and_then(|p| p.parent()) // .../.config
         .map(|c| c.join("ts"))
         .ok_or("timesheet autostart: cannot resolve config dir")?;
-    fs::create_dir_all(&staged)
-        .map_err(|e| format!("timesheet autostart: cannot create {}: {}", staged.display(), e))?;
+    fs::create_dir_all(&staged).map_err(|e| {
+        format!(
+            "timesheet autostart: cannot create {}: {}",
+            staged.display(),
+            e
+        )
+    })?;
     let staged_unit = staged.join(&unit_name);
     fs::write(&staged_unit, &unit)
         .map_err(|e| format!("timesheet autostart: cannot write logout hook: {}", e))?;
@@ -5276,8 +5339,7 @@ fn encode_powershell_command(script: &str) -> String {
 
 #[cfg(target_os = "windows")]
 fn base64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0];
@@ -5438,10 +5500,7 @@ if ($script:result) {
 "#;
 
 #[cfg(target_os = "windows")]
-fn show_reminder_prompt_windows(
-    activities: &[String],
-    timesheet: Option<&Path>,
-) -> ReminderResult {
+fn show_reminder_prompt_windows(activities: &[String], timesheet: Option<&Path>) -> ReminderResult {
     let reminder_appeared = Local::now();
     let choices = reminder_choices(activities);
     let ps_quote = |s: &str| s.replace('\'', "''");
@@ -5983,7 +6042,8 @@ fn main() {
 
     if env::var_os("TS_DEBUG").is_some() {
         let cmd_name = cmd.as_deref().unwrap_or("(none)");
-        let _ = std::io::stderr().write_fmt(format_args!("timesheet: dispatching to {:?}\n", cmd_name));
+        let _ =
+            std::io::stderr().write_fmt(format_args!("timesheet: dispatching to {:?}\n", cmd_name));
     }
 
     let result = match cmd.as_deref() {
@@ -7802,7 +7862,11 @@ other: value
         let dest_path = dest_dir.path().to_path_buf();
         let result = cmd_install(&[dest_path.to_string_lossy().to_string()]);
         assert!(result.is_ok());
-        let exe_name = if cfg!(windows) { "timesheet.exe" } else { "timesheet" };
+        let exe_name = if cfg!(windows) {
+            "timesheet.exe"
+        } else {
+            "timesheet"
+        };
         let installed = dest_path.join(exe_name);
         assert!(installed.exists());
     }

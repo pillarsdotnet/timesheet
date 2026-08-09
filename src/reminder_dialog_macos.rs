@@ -427,10 +427,8 @@ define_class!(
             let doc_height = scroll_height.max(overall_height);
             let grid_origin_x = (doc_width - overall_width) / 2.0;
 
-            let container_frame = NSRect::new(
-                NSPoint::new(0.0, 0.0),
-                NSSize::new(doc_width, doc_height),
-            );
+            let container_frame =
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(doc_width, doc_height));
             let container_alloc = NSView::alloc(mtm);
             let container: Retained<NSView> =
                 unsafe { msg_send![container_alloc, initWithFrame: container_frame] };

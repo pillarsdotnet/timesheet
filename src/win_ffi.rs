@@ -90,7 +90,10 @@ extern "system" {
 }
 
 fn wide_null(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// Strip the inheritable flag from this process's own stdin/stdout/stderr handles. Without this,
