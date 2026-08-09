@@ -6269,8 +6269,11 @@ mod tests {
 
     #[test]
     fn test_week_start() {
-        // 2023-11-14 12:00:00 UTC-ish Tuesday -> week start is Sunday 2023-11-12 00:00:00 local
-        let tuesday = Local.timestamp_opt(1700000000, 0).single().unwrap();
+        // Tuesday 2023-11-14 12:00 local -> week start is Sunday 2023-11-12 00:00 local.
+        let tuesday = local_datetime_at(
+            NaiveDate::from_ymd_opt(2023, 11, 14).unwrap(),
+            NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
+        );
         let week_start_dt = week_start_with(tuesday, RotationBoundary::default());
         assert_eq!(week_start_dt.weekday(), chrono::Weekday::Sun);
         assert_eq!(week_start_dt.hour(), 0);
@@ -6284,8 +6287,11 @@ mod tests {
             day: Weekday::Mon,
             time: NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
         };
-        // Tuesday 2023-11-14 -> Monday 2023-11-13 00:00 local.
-        let tuesday = Local.timestamp_opt(1700000000, 0).single().unwrap();
+        // Tuesday 2023-11-14 12:00 local -> Monday 2023-11-13 00:00 local.
+        let tuesday = local_datetime_at(
+            NaiveDate::from_ymd_opt(2023, 11, 14).unwrap(),
+            NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
+        );
         let start = week_start_with(tuesday, boundary);
         assert_eq!(start.weekday(), Weekday::Mon);
         assert_eq!((start.hour(), start.minute()), (0, 0));
