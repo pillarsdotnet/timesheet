@@ -2294,6 +2294,8 @@ fn install_linux_desktop_entry(dest_file: &Path) -> Result<PathBuf, String> {
     fs::create_dir_all(&apps).map_err(|e| format!("cannot create {}: {}", apps.display(), e))?;
 
     // Terminal=false: `timesheet start` prompts through kdialog/zenity, so it needs no console.
+    // Exactly one XDG *main* category (Office); listing a second one (e.g. Utility) makes the entry
+    // show up twice in the KDE menu. ProjectManagement is an additional category, valid with Office.
     let entry = format!(
         "[Desktop Entry]\n\
          Type=Application\n\
@@ -2303,7 +2305,7 @@ fn install_linux_desktop_entry(dest_file: &Path) -> Result<PathBuf, String> {
          Exec={exe} start\n\
          Icon=timesheet\n\
          Terminal=false\n\
-         Categories=Utility;Office;ProjectManagement;\n\
+         Categories=Office;ProjectManagement;\n\
          Keywords=time;timesheet;tracking;work;\n\
          StartupNotify=false\n",
         exe = dest_file.display()
