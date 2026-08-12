@@ -49,6 +49,11 @@ chmod +x ~/bin/timesheet
 
 Ensure `~/bin` (or your chosen directory) is on your `PATH`.
 
+The `install` subcommand (not the manual copy) also registers a point-and-click way to start work:
+on Linux a "Timesheet" application-menu entry (`~/.local/share/applications/timesheet.desktop`) that
+runs `timesheet start`, and on Windows a "Start Timesheet" Start Menu shortcut. Re-running `install`
+after moving the binary rewrites them to the new location.
+
 ## Autostart (optional, macOS/Linux only)
 
 Not available on Windows (`timesheet autostart` errors as unsupported there). To run **`timesheet start`** at login and **`timesheet stop`** at logout/shutdown on macOS or Linux:

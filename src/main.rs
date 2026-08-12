@@ -104,8 +104,9 @@ const DEFAULT_TIMESHEET: &str = "Documents/timesheet.log";
 /// Canonical source repository for this project.
 const CANONICAL_SOURCE_URL: &str = "https://github.com/pillarsdotnet/timesheet";
 
-/// Icon for macOS reminder dock; embedded so "timesheet install" can write it without the repo.
-#[cfg(target_os = "macos")]
+/// Icon for the macOS reminder dock and the Linux application-menu entry; embedded so
+/// "timesheet install" can write it without the repo.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const EMBEDDED_ICON_SVG: &[u8] = include_bytes!("../assets/icon.svg");
 
 /// Weekday names for the list report (Sunday first).
@@ -2248,9 +2249,73 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
             Err(e) => eprintln!("timesheet install: warning: {}", e),
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        match install_linux_desktop_entry(&dest_file) {
+            Ok(path) => println!("Installed application menu entry {}", path.display()),
+            Err(e) => eprintln!("timesheet install: warning: {}", e),
+        }
+    }
     println!("Installed {}", dest_file.display());
     println!("Done. timesheet is in {} and executable.", dest.display());
     Ok(())
+}
+
+/// Base directory for per-user data files (`$XDG_DATA_HOME`, else `$HOME/.local/share`, else the
+/// platform data dir), following the same resolution order as `reminder_pid_path` so tests can
+/// redirect it instead of writing into the developer's real menu.
+#[cfg(target_os = "linux")]
+fn user_data_dir() -> Option<PathBuf> {
+    env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
+        .or_else(dirs::data_dir)
+}
+
+/// Per-user application-menu entry ("Timesheet" in the Kubuntu/KDE launcher, GNOME Activities, etc.)
+/// that runs `timesheet start`, mirroring the Windows Start Menu shortcut. Writes the icon into the
+/// hicolor theme so `Icon=timesheet` resolves by name rather than by an absolute path that would
+/// break if the binary moves.
+#[cfg(target_os = "linux")]
+fn install_linux_desktop_entry(dest_file: &Path) -> Result<PathBuf, String> {
+    let data = user_data_dir().ok_or("cannot resolve XDG data dir")?;
+
+    // Icon: ~/.local/share/icons/hicolor/scalable/apps/timesheet.svg
+    let icon_dir = data
+        .join("icons")
+        .join("hicolor")
+        .join("scalable")
+        .join("apps");
+    if fs::create_dir_all(&icon_dir).is_ok() {
+        let _ = fs::write(icon_dir.join("timesheet.svg"), EMBEDDED_ICON_SVG);
+    }
+
+    let apps = data.join("applications");
+    fs::create_dir_all(&apps).map_err(|e| format!("cannot create {}: {}", apps.display(), e))?;
+
+    // Terminal=false: `timesheet start` prompts through kdialog/zenity, so it needs no console.
+    let entry = format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=Timesheet\n\
+         GenericName=Time Tracker\n\
+         Comment=Start tracking work time\n\
+         Exec={exe} start\n\
+         Icon=timesheet\n\
+         Terminal=false\n\
+         Categories=Utility;Office;ProjectManagement;\n\
+         Keywords=time;timesheet;tracking;work;\n\
+         StartupNotify=false\n",
+        exe = dest_file.display()
+    );
+    let desktop = apps.join("timesheet.desktop");
+    fs::write(&desktop, entry).map_err(|e| format!("cannot write {}: {}", desktop.display(), e))?;
+
+    // Best effort: refresh the menu caches so the entry shows up without a re-login.
+    let _ = Command::new("update-desktop-database").arg(&apps).output();
+    let _ = Command::new("kbuildsycoca6").output();
+
+    Ok(desktop)
 }
 
 /// Create (or overwrite) a Windows shortcut (.lnk) via PowerShell's WScript.Shell COM object, same
@@ -2410,6 +2475,27 @@ fn cmd_uninstall(args: &[String]) -> Result<(), String> {
             let _ = fs::remove_file(&shortcut);
             println!("Removed {}", shortcut.display());
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(data) = user_data_dir() {
+        for f in [
+            data.join("applications").join("timesheet.desktop"),
+            data.join("icons")
+                .join("hicolor")
+                .join("scalable")
+                .join("apps")
+                .join("timesheet.svg"),
+        ] {
+            if f.exists() {
+                let _ = fs::remove_file(&f);
+                println!("Removed {}", f.display());
+            }
+        }
+        let _ = Command::new("update-desktop-database")
+            .arg(data.join("applications"))
+            .output();
+        let _ = Command::new("kbuildsycoca6").output();
     }
 
     fs::remove_file(&exe)
@@ -2971,12 +3057,19 @@ ahead of this binary on
 would silently run the wrong program. On Windows, also creates (or overwrites) a per-user Start
 Menu shortcut, "Start Timesheet", that runs
 .B "timesheet.exe start"
-so starting work is a point-and-click action.
+so starting work is a point-and-click action. On Linux, likewise creates (or overwrites) a per-user
+application-menu entry,
+.BR ~/.local/share/applications/timesheet.desktop ,
+named "Timesheet", that runs
+.B "timesheet start"
+from the Kubuntu/KDE launcher (or GNOME Activities, or any XDG menu), with the icon installed as
+.B ~/.local/share/icons/hicolor/scalable/apps/timesheet.svg
+so it resolves by name if the binary later moves.
 .TP
 .B uninstall
 Stop the reminder daemon, remove startup/shutdown/login/logout hooks (LaunchAgents and LogoutHook on macOS, systemd user units and the system-level logout hook on Linux), prompt to remove timesheet log files (y/N), then remove
 .BR ts-icon.svg ,
-the Start Menu shortcut (Windows), and the
+the Start Menu shortcut (Windows), the application-menu entry and its icon (Linux), and the
 .B timesheet
 binary (
 .B timesheet.exe
@@ -4059,10 +4152,6 @@ fn linux_logout_hook_unit_name() -> String {
 fn install_linux_logout_hook(exe_path: &str) -> Result<(), String> {
     let unit_name = linux_logout_hook_unit_name();
     let dest = format!("/etc/systemd/system/{}", unit_name);
-    if Path::new(&dest).exists() {
-        // Already installed (readable without root).
-        return Ok(());
-    }
     let uid = unsafe { libc::getuid() };
     let unit = format!(
         r#"[Unit]
@@ -4084,6 +4173,16 @@ WantedBy=multi-user.target
         uid = uid,
         exe = exe_path
     );
+
+    // Rewrite whenever the installed copy differs -- the unit is world-readable, so we can diff it
+    // without root. Skipping merely because the file exists would pin a stale ExecStop path forever:
+    // renaming the binary from "ts" to "timesheet" left this hook pointing at a path that no longer
+    // existed, and no amount of reinstalling would have repaired it.
+    let installed = fs::read_to_string(&dest).ok();
+    if installed.as_deref() == Some(unit.as_str()) {
+        return Ok(());
+    }
+    let updating = installed.is_some();
 
     // Stage the unit in a user-writable timesheet dir; the sudo command installs it system-wide.
     let staged = linux_user_units_dir()?
@@ -4108,8 +4207,17 @@ WantedBy=multi-user.target
         dest = dest,
         name = unit_name
     );
-    println!("  To also record STOP on a full shutdown/reboot (a second guarantee, like the macOS");
-    println!("  logout hook), install a system service. This requires administrator access:");
+    if updating {
+        println!(
+            "  The system-level logout hook is out of date -- it does not match this binary's"
+        );
+        println!("  location. Updating it requires administrator access:");
+    } else {
+        println!(
+            "  To also record STOP on a full shutdown/reboot (a second guarantee, like the macOS"
+        );
+        println!("  logout hook), install a system service. This requires administrator access:");
+    }
     println!("  sudo sh -c \"{}\"", inner);
     print!("  Run this command now? [y/N] ");
     let _ = io::stdout().flush();
@@ -4118,7 +4226,10 @@ WantedBy=multi-user.target
         let answer = line.trim().to_lowercase();
         if answer == "y" || answer == "yes" {
             match Command::new("sudo").args(["sh", "-c", &inner]).status() {
-                Ok(s) if s.success() => println!("  Logout hook installed ({}).", dest),
+                Ok(s) if s.success() => {
+                    let verb = if updating { "updated" } else { "installed" };
+                    println!("  Logout hook {} ({}).", verb, dest);
+                }
                 _ => println!(
                     "  timesheet autostart: logout hook not installed (sudo cancelled or failed); \
                      run the command above to enable it."
@@ -7910,7 +8021,12 @@ other: value
     fn test_cmd_install_to_dir() {
         let dest_dir = tempfile::tempdir().unwrap();
         let dest_path = dest_dir.path().to_path_buf();
+        // Redirect the menu entry into a temp dir; otherwise installing to a tempdir would leave a
+        // "Timesheet" launcher on the developer's real desktop pointing at a deleted path.
+        let data_dir = tempfile::tempdir().unwrap();
+        env::set_var("XDG_DATA_HOME", data_dir.path());
         let result = cmd_install(&[dest_path.to_string_lossy().to_string()]);
+        env::remove_var("XDG_DATA_HOME");
         assert!(result.is_ok());
         let exe_name = if cfg!(windows) {
             "timesheet.exe"
@@ -7919,5 +8035,24 @@ other: value
         };
         let installed = dest_path.join(exe_name);
         assert!(installed.exists());
+
+        #[cfg(target_os = "linux")]
+        {
+            let desktop = data_dir
+                .path()
+                .join("applications")
+                .join("timesheet.desktop");
+            let entry = fs::read_to_string(&desktop).expect("desktop entry written");
+            assert!(
+                entry.contains(&format!("Exec={} start\n", installed.display())),
+                "menu entry should launch the installed binary with \"start\": {}",
+                entry
+            );
+            assert!(entry.contains("Icon=timesheet\n"));
+            assert!(data_dir
+                .path()
+                .join("icons/hicolor/scalable/apps/timesheet.svg")
+                .exists());
+        }
     }
 }
