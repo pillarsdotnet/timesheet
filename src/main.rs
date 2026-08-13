@@ -2997,6 +2997,11 @@ whose ExecStop runs "timesheet stop" before shutdown.target as a second guarante
 full shutdown/reboot. Installing the system unit needs administrator access, so the
 .B sudo
 command is printed and offered to run; if declined, run it yourself. Once present, later runs skip it.
+The login unit
+.RB ( ts-autostart-start.service )
+is wanted by and ordered after graphical-session.target, so the chooser waits for the desktop session
+instead of racing it: a unit wanted by default.target starts seconds before the compositor exists and
+has no display to open on.
 With
 .I uninstall
 removes the registration (the logout hook removal also needs
@@ -4064,15 +4069,24 @@ fn do_autostart_install_linux() -> Result<(), String> {
     // its control group -- otherwise the reminder daemon `timesheet start` spawns (which lives in this
     // unit's cgroup; setsid only changes the process group, not the cgroup) would be killed the
     // moment `timesheet start` returns.
+    // `timesheet start` puts a chooser on screen, so it must not run until there is a screen to put
+    // it on. default.target is reached as soon as the user manager starts -- seconds before the
+    // compositor exists and before the session exports WAYLAND_DISPLAY/DISPLAY into the manager
+    // environment -- so a unit wanted by it races the login and the chooser's Qt process aborts with
+    // "no Qt platform plugin could be initialized". Ordering after graphical-session.target only
+    // takes effect if both jobs are in the same transaction, which is why the unit is wanted by that
+    // target rather than by default.target. This is the same idiom systemd-xdg-autostart-generator
+    // uses for /etc/xdg/autostart entries.
     let start_unit = format!(
         r#"[Unit]
 Description=timesheet start on login
+After=graphical-session.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart={} start
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
 "#,
         exe_path
     );
@@ -4105,6 +4119,15 @@ WantedBy=default.target
     {
         return Err("timesheet autostart: systemctl daemon-reload failed".to_string());
     }
+    // Drop any symlink left by a previous install first. `enable` adds the link for the current
+    // [Install] section but never removes one written by an older version, so an install that moved
+    // the unit from default.target to graphical-session.target would otherwise leave it wanted by
+    // both -- and the default.target link alone is enough to bring the chooser up before the
+    // compositor exists. Deliberately no `--now`: that would stop the running unit and kill the
+    // reminder daemon in its cgroup.
+    let _ = Command::new("systemctl")
+        .args(["--user", "disable", "ts-autostart-start.service"])
+        .status();
     // Enable the start unit for next login but do NOT --now it: running `timesheet start` immediately would
     // close the caller's already-open session and pop another chooser. The reminder daemon for the
     // current session is started separately by `timesheet autostart` (start_reminder_daemon_if_needed).
@@ -5209,8 +5232,37 @@ fn prompt_enter_activity_linux(backend: LinuxDialog) -> Option<String> {
 /// getattr dance.
 #[cfg(target_os = "linux")]
 const REMINDER_CHOOSER_PY: &str = r#"
-import sys, os
+import sys, os, socket
 choices = sys.argv[1:]
+# QApplication() calls qFatal() when no platform plugin can be initialized, which aborts on SIGABRT
+# and leaves a core dump -- there is no exception to catch. So check for a reachable display first
+# and exit 3 (the same "chooser unavailable" status as a missing Qt) while that is still possible.
+def have_display():
+    wd = os.environ.get("WAYLAND_DISPLAY")
+    if wd:
+        rt = os.environ.get("XDG_RUNTIME_DIR", "")
+        if os.path.exists(wd if os.path.isabs(wd) else os.path.join(rt, wd)):
+            return True
+    disp = os.environ.get("DISPLAY")
+    if not disp:
+        return False
+    host, _, num = disp.rpartition(":")
+    if host and host != "unix":
+        return True  # remote X: too costly to probe, let Qt try
+    n = num.split(".")[0]
+    path = "/tmp/.X11-unix/X" + n
+    if os.path.exists(path):
+        return True
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)  # X may bind only an abstract socket
+    try:
+        s.connect("\0" + path)
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+if not have_display():
+    sys.exit(3)
 def load_qt():
     for mod in ("PyQt6", "PyQt5"):
         try:
@@ -5347,8 +5399,14 @@ fn show_reminder_prompt_pyqt(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                if status.code() == Some(3) {
-                    // No Qt toolkit available: let the caller fall back to kdialog/zenity.
+                // A clean exit 0 is the only path that carries a choice: the script prints the
+                // selection and returns, and prints nothing when dismissed. Exit 3 means no Qt
+                // toolkit, and any other status means the chooser died before it could ask --
+                // notably Qt's qFatal("no Qt platform plugin could be initialized"), which aborts on
+                // SIGABRT and so reports no exit code at all. Treating those as a dismissal would
+                // silently re-show the prompt forever; let the caller fall back to kdialog/zenity.
+                if status.code() != Some(0) {
+                    ts_debug(&format!("reminder: PyQt chooser unavailable ({})", status));
                     return None;
                 }
                 let mut out = Vec::new();
