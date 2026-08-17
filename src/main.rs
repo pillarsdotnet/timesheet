@@ -76,7 +76,7 @@ use regex::Regex;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(target_os = "windows")]
@@ -1590,14 +1590,24 @@ fn cmd_tail(tail_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
 }
 
 /// Prints report: % per activity and hours per weekday; optional arg selects file (e.g. `log`, `0220`, `-1`, path).
-/// Opens the timesheet log in the user's editor (`$EDITOR`, falling back to `$VISUAL`, then the
-/// OS default: the program associated with `.txt` files on Windows, `vi` elsewhere).
+/// Opens the timesheet log in the user's editor (`$EDITOR`, falling back to `$VISUAL`), but only
+/// when running interactively (stdin and stdout are both a real tty). A GUI launcher (e.g. an
+/// application-menu entry) typically won't have sourced the shell profile that sets those
+/// variables anyway, and even if it somehow did, exec'ing a terminal editor with no tty attached
+/// would just hang or fail -- so without a tty this always falls back to the OS default: the
+/// program associated with `.txt` files on Windows, `open` on macOS, `xdg-open` on Linux. `vi` is
+/// the last resort for an interactive terminal with neither variable set.
 fn cmd_edit(timesheet: &Path) -> Result<(), String> {
     if let Some(parent) = timesheet.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("timesheet edit: cannot create {}: {}", parent.display(), e))?;
     }
-    let editor = env::var_os("EDITOR").or_else(|| env::var_os("VISUAL"));
+    let tty = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let editor = if tty {
+        env::var_os("EDITOR").or_else(|| env::var_os("VISUAL"))
+    } else {
+        None
+    };
     let (mut cmd, label) = match editor {
         Some(editor) => {
             let mut c = Command::new(&editor);
@@ -1623,6 +1633,16 @@ fn cmd_edit(timesheet: &Path) -> Result<(), String> {
                 c.current_dir(parent);
             }
             (c, "the program associated with .txt files".to_string())
+        }
+        None if !tty && cfg!(target_os = "macos") => {
+            let mut c = Command::new("open");
+            c.arg(timesheet);
+            (c, "open".to_string())
+        }
+        None if !tty && cfg!(target_os = "linux") => {
+            let mut c = Command::new("xdg-open");
+            c.arg(timesheet);
+            (c, "xdg-open".to_string())
         }
         None => {
             let mut c = Command::new("vi");
@@ -3138,12 +3158,18 @@ Open the timesheet log
 in your editor, taken from
 .B $EDITOR
 (then
-.BR $VISUAL ,
-else
-.B vi
-on other platforms; on Windows, the program associated with
+.BR $VISUAL ),
+but only when run interactively, i.e. stdin and stdout are both a real terminal.
+Otherwise \(em e.g. launched from a GUI menu entry, where those variables usually
+aren't set anyway \(em it opens via the OS default instead:
+.B open
+on macOS,
+.B xdg-open
+on Linux, or on Windows the program associated with
 .B .txt
-files, same as double-clicking the log in Explorer).
+files, same as double-clicking the log in Explorer.
+.B vi
+is the last-resort fallback for an interactive terminal with neither variable set.
 .TP
 .BI "pdf " "[options] [week]"
 Fill a form-fillable PDF template with one week of the timesheet and write it out.
