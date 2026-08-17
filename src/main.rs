@@ -2232,8 +2232,27 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
         "timesheet"
     });
     if !paths_refer_to_same_file(src_to_use, &dest_file) {
+        // A running reminder daemon keeps its own executable image open (Windows blocks
+        // overwriting it outright; Unix's `fs::copy` truncates the destination in place rather
+        // than unlinking it first, which fails with ETXTBSY against a binary currently mapped for
+        // execution). Stop it the same intentional-kill way `timesheet stop` does --
+        // `kill_reminder_daemon_if_running` removes the PID file before terminating, so the
+        // daemon's shutdown handler sees this as a deliberate timesheet kill rather than a system
+        // shutdown/logout and skips writing a STOP entry, since a binary swap isn't a work
+        // stoppage -- then relaunch it from the newly installed binary so the already-open
+        // session's reminders resume without adding a new STOP or START log entry.
+        let restart_daemon = is_reminder_daemon_running();
+        if restart_daemon {
+            kill_reminder_daemon_if_running();
+        }
         fs::copy(src_to_use, &dest_file)
             .map_err(|e| format!("timesheet install: copy failed: {}", e))?;
+        if restart_daemon {
+            #[cfg(target_os = "windows")]
+            windows_spawn_reminder_daemon(&dest_file);
+            #[cfg(unix)]
+            unix_spawn_reminder_daemon(&dest_file);
+        }
     }
     #[cfg(unix)]
     {
@@ -3092,6 +3111,12 @@ named "Timesheet", that runs
 from the Kubuntu/KDE launcher (or GNOME Activities, or any XDG menu), with the icon installed as
 .B ~/.local/share/icons/hicolor/scalable/apps/timesheet.svg
 so it resolves by name if the binary later moves.
+If the reminder daemon is running from the target binary and thus has it locked open, stops it the
+same intentional-kill way
+.B timesheet stop
+does (so no STOP entry is added to the log), copies the new binary into place, then restarts the
+daemon from it \(em the open work session and reminder schedule carry through the reinstall
+untouched.
 .TP
 .B uninstall
 Stop the reminder daemon, remove startup/shutdown/login/logout hooks (LaunchAgents and LogoutHook on macOS, systemd user units and the system-level logout hook on Linux), prompt to remove timesheet log files (y/N), then remove
@@ -4585,6 +4610,68 @@ fn kill_reminder_daemon_if_running() {
     }
 }
 
+/// Spawns the reminder daemon (`--reminder-daemon`) from the given binary. Callers are
+/// responsible for first checking whether a daemon is already running -- this always spawns.
+/// Used both by `start_reminder_daemon_if_needed` (with `env::current_exe()`) and by
+/// `cmd_install` (with the freshly installed binary, after replacing the one the previous daemon
+/// was running from).
+#[cfg(target_os = "windows")]
+fn windows_spawn_reminder_daemon(exe: &Path) {
+    let use_debug = env::var_os("TS_DEBUG").is_some();
+    if use_debug {
+        ts_debug("windows_spawn_reminder_daemon: TS_DEBUG set, spawning daemon with inherited stdio");
+    } else {
+        ts_debug(&format!(
+            "windows_spawn_reminder_daemon: spawning {}",
+            exe.display()
+        ));
+        // Stop this process's own stdio handles from riding along into the daemon: Windows
+        // handle inheritance is all-or-nothing, so without this a caller capturing this
+        // process's output (a script, `$out = & timesheet.exe start`, ...) would block forever
+        // waiting for EOF, since the long-lived daemon keeps the pipe's write end open. Only
+        // safe to do here, not when TS_DEBUG wants the daemon to inherit these same handles.
+        win_ffi::make_own_std_handles_noninheritable();
+    }
+    // CREATE_NO_WINDOW keeps a hidden (not absent) console so the daemon's console ctrl
+    // handler can still receive logoff/shutdown events. Try to also break away from any
+    // enclosing job (e.g. Windows Terminal's per-tab job, which may kill-on-close) so the
+    // daemon survives after the spawning terminal closes -- the Windows analog of setsid()
+    // detaching from the controlling terminal on Unix. CreateProcess fails outright if the
+    // enclosing job forbids breakaway, so retry once without that flag on failure.
+    let base_flags = win_ffi::CREATE_NO_WINDOW | win_ffi::CREATE_NEW_PROCESS_GROUP;
+    let spawn = |flags: u32| {
+        Command::new(exe)
+            .arg("--reminder-daemon")
+            .stdin(Stdio::null())
+            .stdout(if use_debug {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
+            .stderr(if use_debug {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
+            .creation_flags(flags)
+            .spawn()
+    };
+    let result =
+        spawn(base_flags | win_ffi::CREATE_BREAKAWAY_FROM_JOB).or_else(|_| spawn(base_flags));
+    match result {
+        Ok(child) => {
+            ts_debug(&format!(
+                "windows_spawn_reminder_daemon: spawned pid {}",
+                child.id()
+            ));
+            drop(child);
+        }
+        Err(e) => {
+            ts_debug(&format!("windows_spawn_reminder_daemon: spawn failed: {}", e));
+        }
+    }
+}
+
 /// Start the reminder daemon in the background if not already running. No-op on non-Unix or if daemon already running.
 fn start_reminder_daemon_if_needed(_timesheet: &Path) {
     #[cfg(target_os = "windows")]
@@ -4606,56 +4693,7 @@ fn start_reminder_daemon_if_needed(_timesheet: &Path) {
                 return;
             }
         };
-        let use_debug = env::var_os("TS_DEBUG").is_some();
-        if use_debug {
-            ts_debug("start_reminder: TS_DEBUG set, spawning daemon with inherited stdio");
-        } else {
-            ts_debug(&format!("start_reminder: spawning {}", exe.display()));
-            // Stop this process's own stdio handles from riding along into the daemon: Windows
-            // handle inheritance is all-or-nothing, so without this a caller capturing this
-            // process's output (a script, `$out = & timesheet.exe start`, ...) would block forever
-            // waiting for EOF, since the long-lived daemon keeps the pipe's write end open. Only
-            // safe to do here, not when TS_DEBUG wants the daemon to inherit these same handles.
-            win_ffi::make_own_std_handles_noninheritable();
-        }
-        // CREATE_NO_WINDOW keeps a hidden (not absent) console so the daemon's console ctrl
-        // handler can still receive logoff/shutdown events. Try to also break away from any
-        // enclosing job (e.g. Windows Terminal's per-tab job, which may kill-on-close) so the
-        // daemon survives after the spawning terminal closes -- the Windows analog of setsid()
-        // detaching from the controlling terminal on Unix. CreateProcess fails outright if the
-        // enclosing job forbids breakaway, so retry once without that flag on failure.
-        let base_flags = win_ffi::CREATE_NO_WINDOW | win_ffi::CREATE_NEW_PROCESS_GROUP;
-        let spawn = |flags: u32| {
-            Command::new(&exe)
-                .arg("--reminder-daemon")
-                .stdin(Stdio::null())
-                .stdout(if use_debug {
-                    Stdio::inherit()
-                } else {
-                    Stdio::null()
-                })
-                .stderr(if use_debug {
-                    Stdio::inherit()
-                } else {
-                    Stdio::null()
-                })
-                .creation_flags(flags)
-                .spawn()
-        };
-        let result =
-            spawn(base_flags | win_ffi::CREATE_BREAKAWAY_FROM_JOB).or_else(|_| spawn(base_flags));
-        match result {
-            Ok(child) => {
-                ts_debug(&format!(
-                    "start_reminder: spawned daemon pid {}",
-                    child.id()
-                ));
-                drop(child);
-            }
-            Err(e) => {
-                ts_debug(&format!("start_reminder: spawn failed: {}", e));
-            }
-        }
+        windows_spawn_reminder_daemon(&exe);
         ts_debug("start_reminder: done");
         return;
     }
@@ -4682,45 +4720,58 @@ fn start_reminder_daemon_if_needed(_timesheet: &Path) {
                 return;
             }
         };
-        let use_debug = env::var_os("TS_DEBUG").is_some();
-        if use_debug {
-            ts_debug("start_reminder: TS_DEBUG set, spawning daemon with inherited stdio");
-        } else {
-            ts_debug(&format!("start_reminder: spawning {}", exe.display()));
-        }
-        let (stdout, stderr) = if use_debug {
-            (Stdio::inherit(), Stdio::inherit())
-        } else {
-            (Stdio::null(), Stdio::null())
-        };
-        // Use pre_exec to call setsid() in the child after fork but before exec.
-        // This places the reminder daemon in its own session before timesheet start exits,
-        // preventing launchd from killing it when the LaunchAgent's process group is cleaned up.
-        let result = unsafe {
-            Command::new(&exe)
-                .arg("--reminder-daemon")
-                .stdin(Stdio::null())
-                .stdout(stdout)
-                .stderr(stderr)
-                .pre_exec(|| {
-                    setsid();
-                    Ok(())
-                })
-                .spawn()
-        };
-        match result {
-            Ok(child) => {
-                ts_debug(&format!(
-                    "start_reminder: spawned daemon pid {}",
-                    child.id()
-                ));
-                drop(child);
-            }
-            Err(e) => {
-                ts_debug(&format!("start_reminder: spawn failed: {}", e));
-            }
-        }
+        unix_spawn_reminder_daemon(&exe);
         ts_debug("start_reminder: done");
+    }
+}
+
+/// Spawns the reminder daemon (`--reminder-daemon`) from the given binary. Callers are
+/// responsible for first checking whether a daemon is already running -- this always spawns.
+/// Used both by `start_reminder_daemon_if_needed` (with `env::current_exe()`) and by
+/// `cmd_install` (with the freshly installed binary, after replacing the one the previous daemon
+/// was running from).
+#[cfg(unix)]
+fn unix_spawn_reminder_daemon(exe: &Path) {
+    let use_debug = env::var_os("TS_DEBUG").is_some();
+    if use_debug {
+        ts_debug("unix_spawn_reminder_daemon: TS_DEBUG set, spawning daemon with inherited stdio");
+    } else {
+        ts_debug(&format!(
+            "unix_spawn_reminder_daemon: spawning {}",
+            exe.display()
+        ));
+    }
+    let (stdout, stderr) = if use_debug {
+        (Stdio::inherit(), Stdio::inherit())
+    } else {
+        (Stdio::null(), Stdio::null())
+    };
+    // Use pre_exec to call setsid() in the child after fork but before exec.
+    // This places the reminder daemon in its own session before timesheet start exits,
+    // preventing launchd from killing it when the LaunchAgent's process group is cleaned up.
+    let result = unsafe {
+        Command::new(exe)
+            .arg("--reminder-daemon")
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
+            .pre_exec(|| {
+                setsid();
+                Ok(())
+            })
+            .spawn()
+    };
+    match result {
+        Ok(child) => {
+            ts_debug(&format!(
+                "unix_spawn_reminder_daemon: spawned pid {}",
+                child.id()
+            ));
+            drop(child);
+        }
+        Err(e) => {
+            ts_debug(&format!("unix_spawn_reminder_daemon: spawn failed: {}", e));
+        }
     }
 }
 
