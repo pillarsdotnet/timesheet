@@ -249,29 +249,41 @@ The binary is produced at `target/release/timesheet` (or `target/debug/timesheet
 
 ### Building a Windows executable from WSL
 
-To build a Windows executable from within Windows Subsystem for Linux (WSL):
+To build a Windows executable from within Windows Subsystem for Linux (WSL), you need the MinGW compiler toolchain and the Rust Windows target:
 
-1. **Install the Windows target** (if not already installed):
+1. **Install MinGW and dependencies**:
+
+   On Ubuntu/Debian-based WSL:
+   ```sh
+   sudo apt install mingw-w64 pkg-config
+   ```
+
+   On other distributions, install the equivalent MinGW package (e.g., `mingw-w64` on Fedora/RHEL).
+
+2. **Install the Windows Rust target** (if not already installed):
 
    ```sh
    rustup target add x86_64-pc-windows-gnu
    ```
 
-2. **Build for Windows** from WSL:
+3. **Build for Windows**:
 
    ```sh
    cargo build --release --target x86_64-pc-windows-gnu
    ```
 
-   The Windows executable will be produced at `target/x86_64-pc-windows-gnu/release/timesheet.exe`.
+   The Windows executable will be produced at `target/x86_64-pc-windows-gnu/release/deps/timesheet-*.exe` (where `*` is a hash).
 
-3. **Access from Windows** — the executable is accessible from Windows at a path like:
+4. **Access from Windows** — the executable is accessible from Windows at a path like:
 
    ```
-   \\wsl$\Ubuntu\home\<username>\src\github\pillarsdotnet\timesheet\target\x86_64-pc-windows-gnu\release\timesheet.exe
+   \\wsl$\Ubuntu\home\<username>\src\github\pillarsdotnet\timesheet\target\x86_64-pc-windows-gnu\release\deps\timesheet-<hash>.exe
    ```
 
-   Or copy it to a more convenient location on your Windows file system.
+   Or copy it to a more convenient location:
+   ```cmd
+   copy \\wsl$\Ubuntu\home\<username>\...\timesheet-<hash>.exe timesheet.exe
+   ```
 
 This cross-compilation approach avoids the need to install a separate Rust/build environment on Windows itself — the toolchain remains in WSL while producing a native Windows binary.
 
