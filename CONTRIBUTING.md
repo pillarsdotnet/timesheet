@@ -1,5 +1,8 @@
 # Contributing
 
+Copyright (c) 2025 Robert August Vincent II <pillarsdotnet@gmail.com>
+Co-author: Claude-AI.
+
 Thanks for contributing to **ts** (the timesheet CLI). This document explains how to install the full toolchain so the build, the tests, and the pre-commit hooks all run, and how those checks map to CI.
 
 ## Source layout

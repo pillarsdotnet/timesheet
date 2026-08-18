@@ -3,6 +3,11 @@ description: Before committing, update docs if changes warrant it, then commit
 alwaysApply: true
 ---
 
+<!--
+Copyright (c) 2025 Robert August Vincent II <pillarsdotnet@gmail.com>
+Co-author: Cursor-AI.
+-->
+
 # Commit workflow
 
 When the user says "commit these changes" (or equivalent):

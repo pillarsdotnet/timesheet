@@ -1,5 +1,8 @@
 # Assets
 
+Copyright (c) 2025 Robert August Vincent II <pillarsdotnet@gmail.com>
+Co-author: Cursor-AI.
+
 ## Icon
 
 `icon.svg` is the application icon: a timesheet (document with ruled rows and a header). Use it for app bundles, installers, or documentation.
