@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Robert August Vincent II <pillarsdotnet@gmail.com>
+// Co-author: Claude-AI.
+
 //! Minimal hand-written FFI to kernel32.dll for the pieces of Windows process/daemon management
 //! `std` doesn't expose: querying/terminating a process by PID, a console control handler (the
 //! Windows analog of the Unix SIGTERM handler used for the logoff/shutdown STOP guarantee), and
