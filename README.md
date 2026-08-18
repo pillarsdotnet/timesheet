@@ -287,6 +287,21 @@ To build a Windows executable from within Windows Subsystem for Linux (WSL), you
 
 This cross-compilation approach avoids the need to install a separate Rust/build environment on Windows itself — the toolchain remains in WSL while producing a native Windows binary.
 
+5. **Install on Windows** — run the executable's `install` subcommand from PowerShell to self-install:
+
+   From **WSL**, using PowerShell Core:
+   ```sh
+   pwsh -Command "& './target/x86_64-pc-windows-gnu/release/deps/timesheet-<hash>.exe' install"
+   ```
+
+   Or from **Windows PowerShell** after copying the binary:
+   ```powershell
+   Copy-Item '\\wsl$\Ubuntu\home\<username>\...\timesheet-<hash>.exe' 'timesheet.exe'
+   .\timesheet.exe install
+   ```
+
+   This installs the binary to `%LOCALAPPDATA%\Programs\timesheet\timesheet.exe` and creates a "Start Timesheet" shortcut in the Windows Start Menu.
+
 To set up the full toolchain (Rust components, git hooks) and run the checks, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ### Commit messages
