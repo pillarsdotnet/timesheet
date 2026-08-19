@@ -76,7 +76,7 @@ use regex::Regex;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Seek, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(target_os = "windows")]
@@ -152,6 +152,7 @@ fn clamp_auto_stop_time(timesheet: &Path, requested_dt: DateTime<Local>) -> Date
 }
 
 fn append_log_entry(timesheet: &Path, entry: &str) -> Result<(), String> {
+    ensure_trailing_newline(timesheet)?;
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -159,6 +160,26 @@ fn append_log_entry(timesheet: &Path, entry: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     f.write_all(format!("{}\n", entry).as_bytes())
         .map_err(|e| e.to_string())
+}
+
+/// If `timesheet` exists, is non-empty, and does not already end in a newline (e.g. after a manual
+/// edit that left the file without a trailing line-end), appends one. Without this, the next
+/// appended entry would land on the same line as the last one, silently corrupting the log.
+fn ensure_trailing_newline(timesheet: &Path) -> Result<(), String> {
+    let Ok(mut f) = fs::OpenOptions::new().read(true).append(true).open(timesheet) else {
+        return Ok(());
+    };
+    let len = f.metadata().map_err(|e| e.to_string())?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    let mut last_byte = [0u8; 1];
+    f.seek(io::SeekFrom::End(-1)).map_err(|e| e.to_string())?;
+    f.read_exact(&mut last_byte).map_err(|e| e.to_string())?;
+    if last_byte[0] != b'\n' {
+        f.write_all(b"\n").map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Returns the default timesheet path: `$HOME/Documents/timesheet.log`, falling back to the
@@ -866,12 +887,7 @@ fn do_rotate(timesheet: &Path) -> Result<(), String> {
         .unwrap_or(false)
     {
         let stop_dt = clamp_auto_stop_time(timesheet, Local::now());
-        let mut f = fs::OpenOptions::new()
-            .append(true)
-            .open(timesheet)
-            .map_err(|e| e.to_string())?;
-        f.write_all(format!("{}\n", format_stop_log_entry(stop_dt)).as_bytes())
-            .map_err(|e| e.to_string())?;
+        append_log_entry(timesheet, &format_stop_log_entry(stop_dt))?;
     }
     let min_dt =
         min_dt_in_log(timesheet).ok_or("timesheet rotate: no valid entries in timesheet.")?;
@@ -886,6 +902,7 @@ fn do_rotate(timesheet: &Path) -> Result<(), String> {
     let dest = parent.join(format!("{}.{}", stem, stamp));
     let content = fs::read_to_string(timesheet).map_err(|e| e.to_string())?;
     if dest.exists() {
+        ensure_trailing_newline(&dest)?;
         let mut f = fs::OpenOptions::new()
             .append(true)
             .open(&dest)
@@ -1372,13 +1389,7 @@ fn cmd_stop(args: &[String], timesheet: &Path) -> Result<(), String> {
             .ok_or_else(|| format!("timesheet stop: could not parse stop time: {}", t))?,
         None => Local::now(),
     };
-    let line = format!("{}\n", format_stop_log_entry(stop_dt));
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(timesheet)
-        .map_err(|e| e.to_string())?;
-    f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    append_log_entry(timesheet, &format_stop_log_entry(stop_dt))?;
     if is_reminder_daemon_running() {
         show_reminders_stopped_notification();
     }
@@ -1897,13 +1908,7 @@ fn cmd_timeoff(timesheet: &Path) -> Result<(), String> {
             let _ = fs::create_dir_all(parent);
         }
         let now = Local::now();
-        let line = format!("{}\n", format_start_log_entry(now, "misc/unspecified"));
-        let mut f = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(timesheet)
-            .map_err(|e| e.to_string())?;
-        f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+        append_log_entry(timesheet, &format_start_log_entry(now, "misc/unspecified"))?;
     }
     let content = fs::read_to_string(timesheet).unwrap_or_default();
     let mut stack: Vec<(DateTime<Local>, String)> = Vec::new();
@@ -6768,6 +6773,40 @@ other: value
         // The auto STOP is capped to one reminder interval after the open START (default 5 min).
         let cap = chrono::Duration::seconds(get_reminder_interval_secs() as i64);
         assert_eq!(lines[1], format_stop_log_entry(start_dt + cap));
+    }
+
+    #[test]
+    fn test_append_log_entry_inserts_missing_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        // Simulate a manual edit (e.g. via `timesheet edit`) that left the file without a
+        // trailing newline.
+        fs::write(
+            &log_path,
+            format_start_log_entry(Local::now(), "manually-edited"),
+        )
+        .unwrap();
+
+        let dt = Local::now();
+        append_log_entry(&log_path, &format_stop_log_entry(dt)).unwrap();
+
+        let content = fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "entries must not be concatenated: {content:?}");
+        assert_eq!(lines[1], format_stop_log_entry(dt));
+    }
+
+    #[test]
+    fn test_append_log_entry_on_empty_file_has_no_leading_blank_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("timesheet.log");
+        fs::write(&log_path, "").unwrap();
+
+        let dt = Local::now();
+        append_log_entry(&log_path, &format_start_log_entry(dt, "task")).unwrap();
+
+        let content = fs::read_to_string(&log_path).unwrap();
+        assert_eq!(content, format!("{}\n", format_start_log_entry(dt, "task")));
     }
 
     #[test]
