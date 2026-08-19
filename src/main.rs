@@ -166,7 +166,11 @@ fn append_log_entry(timesheet: &Path, entry: &str) -> Result<(), String> {
 /// edit that left the file without a trailing line-end), appends one. Without this, the next
 /// appended entry would land on the same line as the last one, silently corrupting the log.
 fn ensure_trailing_newline(timesheet: &Path) -> Result<(), String> {
-    let Ok(mut f) = fs::OpenOptions::new().read(true).append(true).open(timesheet) else {
+    let Ok(mut f) = fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(timesheet)
+    else {
         return Ok(());
     };
     let len = f.metadata().map_err(|e| e.to_string())?.len();
@@ -4624,7 +4628,9 @@ fn kill_reminder_daemon_if_running() {
 fn windows_spawn_reminder_daemon(exe: &Path) {
     let use_debug = env::var_os("TS_DEBUG").is_some();
     if use_debug {
-        ts_debug("windows_spawn_reminder_daemon: TS_DEBUG set, spawning daemon with inherited stdio");
+        ts_debug(
+            "windows_spawn_reminder_daemon: TS_DEBUG set, spawning daemon with inherited stdio",
+        );
     } else {
         ts_debug(&format!(
             "windows_spawn_reminder_daemon: spawning {}",
@@ -4672,7 +4678,10 @@ fn windows_spawn_reminder_daemon(exe: &Path) {
             drop(child);
         }
         Err(e) => {
-            ts_debug(&format!("windows_spawn_reminder_daemon: spawn failed: {}", e));
+            ts_debug(&format!(
+                "windows_spawn_reminder_daemon: spawn failed: {}",
+                e
+            ));
         }
     }
 }
@@ -6792,7 +6801,11 @@ other: value
 
         let content = fs::read_to_string(&log_path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 2, "entries must not be concatenated: {content:?}");
+        assert_eq!(
+            lines.len(),
+            2,
+            "entries must not be concatenated: {content:?}"
+        );
         assert_eq!(lines[1], format_stop_log_entry(dt));
     }
 
