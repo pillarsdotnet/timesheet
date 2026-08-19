@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Robert August Vincent II <pillarsdotnet@gmail.com>
+// Co-author: Cursor-AI.
+
 //! Native macOS reminder dialog using a custom NSPanel with vertical NSStackView of buttons.
 //! Used when the daemon spawns `ts --reminder-dialog choice1 choice2 ...` via launchctl asuser.
 //! Custom panel guarantees vertical layout regardless of choice count (NSAlert switches to horizontal).
