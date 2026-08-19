@@ -1,5 +1,8 @@
 # Building and installing from source
 
+Copyright (c) 2025 Robert August Vincent II <pillarsdotnet@gmail.com>
+Co-author: Cursor-AI.
+
 This document describes how to build and install the **timesheet** CLI from the repository.
 
 ## Prerequisites

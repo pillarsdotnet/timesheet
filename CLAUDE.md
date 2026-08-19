@@ -1,5 +1,8 @@
 # Claude instructions for the `timesheet` project
 
+Copyright (c) 2025 Robert August Vincent II <pillarsdotnet@gmail.com>
+Co-author: Claude-AI.
+
 These mirror the project's Cursor rules (`.cursor/rules/*.mdc`) as native Claude
 instructions. Keep them in sync if either set changes.
 

@@ -4,6 +4,11 @@ globs: "**/*"
 alwaysApply: false
 ---
 
+<!--
+Copyright (c) 2025 Robert August Vincent II <pillarsdotnet@gmail.com>
+Co-author: Cursor-AI.
+-->
+
 # Rebuild and reinstall
 
 When the user says "rebuild and reinstall" (or equivalent) in this project:
