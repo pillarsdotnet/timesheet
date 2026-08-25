@@ -31,6 +31,16 @@ pub const DAYS: [&str; 7] = [
 /// must be named even when `ts pdf` would have written to stdout.
 pub const DEFAULT_OUTPUT: &str = "timesheet_{week_end}.pdf";
 
+/// Where a `sendmail`-compatible binary lives on a Unix system, whether the local MTA is
+/// Postfix, sendmail, ssmtp or msmtp.
+#[cfg(not(windows))]
+pub const DEFAULT_SENDMAIL: &str = "/usr/sbin/sendmail";
+
+/// Windows has no MTA and no conventional path for one, so the default is a bare name for
+/// `PATH` to resolve — msmtp copied to `sendmail.exe` being the usual way to supply it.
+#[cfg(windows)]
+pub const DEFAULT_SENDMAIL: &str = "sendmail.exe";
+
 /// Every slot the filled timesheet writes to. Each must resolve to a PDF field name.
 pub fn slots() -> Vec<String> {
     let mut out = vec![
@@ -112,11 +122,8 @@ pub struct Settings {
     pub reply: Option<String>,
     pub subject: String,
     pub body: String,
-    pub smtp_host: String,
-    pub smtp_port: u16,
-    pub smtp_starttls: bool,
-    pub smtp_user: Option<String>,
-    pub smtp_password_command: Option<String>,
+    /// The sendmail(8)-compatible binary the message is piped to.
+    pub sendmail: PathBuf,
 }
 
 /// Expands a leading `~` to `$HOME` (or the platform home directory, e.g. `%USERPROFILE%` on
@@ -190,16 +197,6 @@ fn scoped_number(doc: &Yaml, section: Option<&Yaml>, key: &str, fallback: f64) -
     scoped(doc, section, key)
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(fallback)
-}
-
-fn scoped_flag(doc: &Yaml, section: Option<&Yaml>, key: &str, fallback: bool) -> bool {
-    match scoped(doc, section, key) {
-        Some(s) => matches!(
-            s.trim().to_ascii_lowercase().as_str(),
-            "true" | "yes" | "on" | "1"
-        ),
-        None => fallback,
-    }
 }
 
 impl Settings {
@@ -279,16 +276,6 @@ impl Settings {
             ));
         }
 
-        let smtp_port = scoped(doc, section, "smtp_port")
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(25);
-        let smtp_host = scoped(doc, section, "smtp_host")
-            .unwrap_or("localhost")
-            .to_string();
-        // A relay on the submission port is always STARTTLS in practice, so default the
-        // flag from the port rather than making every config state it.
-        let smtp_starttls = scoped_flag(doc, section, "smtp_starttls", smtp_port == 587);
-
         Ok(Settings {
             name,
             prefix,
@@ -341,12 +328,10 @@ impl Settings {
             body: scoped(doc, section, "body")
                 .unwrap_or("Attached is my timesheet for {week_start} through {week_end}.")
                 .to_string(),
-            smtp_host,
-            smtp_port,
-            smtp_starttls,
-            smtp_user: scoped(doc, section, "smtp_user").map(str::to_string),
-            smtp_password_command: scoped(doc, section, "smtp_password_command")
-                .map(str::to_string),
+            sendmail: scoped(doc, section, "sendmail")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map_or_else(|| PathBuf::from(DEFAULT_SENDMAIL), expand_tilde),
         })
     }
 }
@@ -488,25 +473,39 @@ prefixes:
     }
 
     #[test]
-    fn starttls_defaults_from_the_port() {
-        let base = "name: N\ntemplate: /t.pdf\n";
-        let plain = yaml::parse(base);
-        assert!(
-            !Settings::resolve(&plain, &Overrides::default())
-                .unwrap()
-                .smtp_starttls
+    fn sendmail_is_per_prefix_and_tilde_expanded() {
+        let doc = yaml::parse(
+            "name: N\ntemplate: /t.pdf\nsendmail: /usr/local/bin/msmtp\nprefixes:\n  ST:\n    sendmail: \"~/.local/bin/sendmail-st\"\n  OT:\n",
         );
-        let submission = yaml::parse(&format!("{}smtp_port: 587\n", base));
-        assert!(
-            Settings::resolve(&submission, &Overrides::default())
-                .unwrap()
-                .smtp_starttls
+        let with_prefix = Settings::resolve(
+            &doc,
+            &Overrides {
+                prefix: Some("ST".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            with_prefix.sendmail,
+            expand_tilde("~/.local/bin/sendmail-st")
         );
-        let forced_off = yaml::parse(&format!("{}smtp_port: 587\nsmtp_starttls: false\n", base));
-        assert!(
-            !Settings::resolve(&forced_off, &Overrides::default())
+        // A prefix that names none falls back to the top level...
+        let inherited = Settings::resolve(
+            &doc,
+            &Overrides {
+                prefix: Some("OT".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(inherited.sendmail, PathBuf::from("/usr/local/bin/msmtp"));
+        // ...and with the key absent entirely, the system binary is used.
+        let none = yaml::parse("name: N\ntemplate: /t.pdf\n");
+        assert_eq!(
+            Settings::resolve(&none, &Overrides::default())
                 .unwrap()
-                .smtp_starttls
+                .sendmail,
+            PathBuf::from(DEFAULT_SENDMAIL)
         );
     }
 

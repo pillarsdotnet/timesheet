@@ -29,9 +29,9 @@ cargo build --release
 
 The binary is written to `target/release/timesheet` (or `target/debug/timesheet` if you use `cargo build` without `--release`).
 
-The first build fetches crates from crates.io, so it needs network access; later builds do not. `timesheet pdf` and `timesheet email` bring in PDF and SMTP support (`lopdf` and `lettre`, the latter with rustls and bundled roots), which is most of the binary's size and of the build time. TLS is pure Rust, so no system OpenSSL or certificate store is required, on Linux, macOS, or Windows.
+The first build fetches crates from crates.io, so it needs network access; later builds do not. `timesheet pdf` and `timesheet email` bring in PDF filling and message building (`lopdf` and `lettre`), which is most of the binary's size and of the build time. Nothing links against system OpenSSL or reads a certificate store, on Linux, macOS, or Windows: `timesheet email` pipes the finished message to a `sendmail(8)` binary and leaves the network to it.
 
-On Windows, `cargo build --release` produces `target\release\timesheet.exe`. Core commands (`start`, `stop`, `list`, `sprint`, `tail`, `alias`/`rename`/`prefix`, `rotate`, `migrate`, `timeoff`, `edit`, `pdf`, `email`) work the same as on Linux/macOS. The reminder daemon, reminder dialog, and `timesheet autostart` are not implemented on Windows yet, so `timesheet start` with no activity always defaults to misc/unspecified rather than prompting.
+On Windows, `cargo build --release` produces `target\release\timesheet.exe`. Core commands (`start`, `stop`, `list`, `sprint`, `tail`, `alias`/`rename`/`prefix`, `rotate`, `migrate`, `timeoff`, `edit`, `pdf`, `email`) work the same as on Linux/macOS. The reminder daemon, reminder dialog, and `timesheet autostart` are not implemented on Windows yet, so `timesheet start` with no activity always defaults to misc/unspecified rather than prompting. `timesheet email` pipes the message to `sendmail.exe` on `PATH`, which Windows does not supply; see [Supplying `sendmail.exe` on Windows](README.md#supplying-sendmailexe-on-windows) in the README for installing msmtp under that name.
 
 ### 2. Install the binary
 

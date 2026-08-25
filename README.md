@@ -38,7 +38,7 @@ figure out how it works. For now I'm just glad that it does.
 
 - **Windows:** no extra dependencies to build or run; PowerShell (built in) drives the reminder chooser and shortcuts. The log lives at `%USERPROFILE%\Documents\timesheet.log`. `timesheet start` with no activity shows a full-screen chooser (PowerShell/WinForms) to pick or enter an activity, same as macOS/Linux. The reminder daemon runs in the background and re-prompts at the configured interval; `timesheet stop`/`timesheet interval` stop it (and any open chooser window) the same way as elsewhere. `timesheet autostart` registers a Startup-folder shortcut to run `timesheet start` at login (the per-user, no-admin-required analog of a macOS LaunchAgent or Linux systemd user unit); STOP at logoff/shutdown is recorded by the daemon's console control handler. Unlike macOS (LogoutHook) and Linux (systemd `ExecStop` plus a system-level logout-hook unit), there is no second, more-guaranteed mechanism available without admin rights, so this one path is best-effort — Windows does not guarantee it waits for the handler to finish the way launchd/systemd do. `timesheet edit` falls back to `notepad` (instead of `vi`) when `$EDITOR`/`$VISUAL` are unset. `timesheet help` has no `groff`/`less` to page through, so it renders the man page as plain text through `more` instead. `timesheet install` installs the binary as `timesheet.exe` (see [Install](#install)) and creates a per-user Start Menu shortcut ("Start Timesheet") that runs `timesheet.exe start`, so starting work is also a point-and-click action.
 
-- **`timesheet pdf` and `timesheet email`:** no extra runtime dependencies. PDF filling and SMTP (including STARTTLS, via rustls with bundled roots) are built into the binary; nothing needs to be installed alongside it. `timesheet email` runs `smtp_password_command` through `sh` (`cmd` on Windows), so whatever that command needs — `pass`, `secret-tool`, `op` — must be on PATH.
+- **`timesheet pdf` and `timesheet email`:** PDF filling and message building are compiled in, so there is nothing to install for `timesheet pdf`. `timesheet email` hands the finished message to a `sendmail(8)`-compatible binary — `/usr/sbin/sendmail` on Linux and macOS, `sendmail.exe` found on `PATH` on Windows, unless `sendmail:` names another — so delivery needs a local MTA (Postfix, ssmtp, msmtp) or a wrapper script, configured there rather than here. See [Supplying `sendmail.exe` on Windows](#supplying-sendmailexe-on-windows).
 
 ## Data format
 
@@ -88,20 +88,19 @@ The rotation boundary is checked by `timesheet start`, `timesheet stop`, `timesh
 
 Each of these may be written at the top level, or under `prefixes:` → _PREFIX_ so that it applies only when that prefix is in use. A per-prefix value beats the top-level one, and a command-line option beats both — which is how one log can serve several jobs, each tagging its activities (`ST:Setup Jira`) and keeping its own name, template, addresses and field map.
 
-| Setting                                   | Meaning                                                                                                                                 |
-| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`                                    | Full name as it should appear on the timesheet. Required.                                                                               |
-| `prefix`                                  | Default for `--prefix`. When absent and exactly one prefix is listed under `prefixes:`, that one is used.                               |
-| `template`                                | Default for `--template`: path to the form-fillable PDF. No built-in default.                                                           |
-| `output`                                  | Default for `--output`. When absent, `timesheet pdf` writes to stdout.                                                                  |
-| `activity`, `separator`, `zero`           | Defaults for `--activity`, `--separator` and `--zero`.                                                                                  |
-| `to`, `cc`                                | Default recipients; each is either one address or a sequence of them.                                                                   |
-| `from`, `reply`                           | Default sender and Reply-To addresses.                                                                                                  |
-| `subject`, `body`                         | Message templates, taking the same placeholders as `output` plus `{total_hours}`.                                                       |
-| `min_font_size`, `max_font_size`          | Shrink-to-fit range in points (default 5 and 10).                                                                                       |
-| `fields`                                  | Maps each timesheet slot to a form-field name. Defaults suit the stock form; anything listed here replaces only the slots it names.     |
-| `smtp_host`, `smtp_port`, `smtp_starttls` | Relay to submit through (default `localhost:25`). `smtp_starttls` defaults to true on port 587 and false elsewhere.                     |
-| `smtp_user`, `smtp_password_command`      | Credentials, if the relay wants them. `smtp_password_command` is a shell command that prints the password, so no secret is stored here. |
+| Setting                          | Meaning                                                                                                                                                                              |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `name`                           | Full name as it should appear on the timesheet. Required.                                                                                                                            |
+| `prefix`                         | Default for `--prefix`. When absent and exactly one prefix is listed under `prefixes:`, that one is used.                                                                            |
+| `template`                       | Default for `--template`: path to the form-fillable PDF. No built-in default.                                                                                                        |
+| `output`                         | Default for `--output`. When absent, `timesheet pdf` writes to stdout.                                                                                                               |
+| `activity`, `separator`, `zero`  | Defaults for `--activity`, `--separator` and `--zero`.                                                                                                                               |
+| `to`, `cc`                       | Default recipients; each is either one address or a sequence of them.                                                                                                                |
+| `from`, `reply`                  | Default sender and Reply-To addresses.                                                                                                                                               |
+| `subject`, `body`                | Message templates, taking the same placeholders as `output` plus `{total_hours}`.                                                                                                    |
+| `min_font_size`, `max_font_size` | Shrink-to-fit range in points (default 5 and 10).                                                                                                                                    |
+| `fields`                         | Maps each timesheet slot to a form-field name. Defaults suit the stock form; anything listed here replaces only the slots it names.                                                  |
+| `sendmail`                       | Path to the `sendmail(8)`-compatible binary the message is piped to. Default `/usr/sbin/sendmail`, or `sendmail.exe` resolved against `PATH` on Windows. A leading `~/` is expanded. |
 
 The slots that `fields` maps are `contractor_name`, `week_start_month`/`_day`/`_year`, `week_end_month`/`_day`/`_year`, `<weekday>_hours` and `<weekday>_activities` for each of the seven weekdays, and `total_hours`. The field names of a different form can be listed with `mutool show form.pdf form | grep Name:`.
 
@@ -109,10 +108,6 @@ The slots that `fields` maps are `contractor_name`, `week_start_month`/`_day`/`_
 # ~/.config/timesheet.yml
 name: "Jane Contractor"
 from: "jane@example.com"
-smtp_host: "smtp.gmail.com"
-smtp_port: 587
-smtp_user: "jane@example.com"
-smtp_password_command: "pass show smtp/jane"
 prefixes:
   ST:
     template: "~/Documents/timesheet-fillable.pdf"
@@ -123,7 +118,36 @@ prefixes:
     to: "timesheets@employer.example"
 ```
 
-A Gmail or Google Workspace account needs `smtp.gmail.com` on port 587 with STARTTLS, the full address as `smtp_user`, and an **App Password** — an account password is rejected. Gmail also rewrites `From` to the authenticated account unless the address is a verified "Send mail as" alias, so set `reply` when the two differ; `timesheet email` warns if you have not.
+`timesheet email` does not speak SMTP itself. It runs `<binary> -i -f <from> <recipient>...`, writes the message to its standard input, and repeats whatever the binary prints to standard error — as a warning when it succeeds, as the error when it does not. Relay, credentials and queueing therefore live in the MTA's own configuration, not here.
+
+`sendmail` is scoped like every other setting, so one job can be sent by a wrapper that mails through a different account while the rest use the system binary:
+
+```yaml
+prefixes:
+  ST:
+    sendmail: "~/.local/bin/sendmail-employer"
+```
+
+Anything that reads a message on stdin and takes sendmail's arguments will do. A wrapper that sends through an account other than the one in `from` will usually rewrite the `From` header, so set `reply` to the address you actually read.
+
+#### Supplying `sendmail.exe` on Windows
+
+Windows ships no MTA and has no conventional path for one, so the default there is the bare name `sendmail.exe`, resolved against `PATH`. [msmtp](https://marlam.de/msmtp/) supplies a working one: it is an SMTP client with a sendmail-compatible interface, so it takes `-f` and the recipients as operands, accepts and ignores `-i`, and returns sendmail's exit codes — which is exactly what `timesheet email` drives. Its own TLS and its own account configuration (`msmtprc`) replace the relay settings this program used to carry. Two ways to get it:
+
+- **Portable build** — unzip `msmtp_windows_portable_<version>.zip` from [SourceForge](https://sourceforge.net/projects/msmtp-windows-portable/files/); it is a 64-bit build with no installer.
+- **MSYS2** — `pacman -S mingw-w64-x86_64-msmtp`, which puts `msmtp.exe` in the mingw64 `bin` directory.
+
+Then either copy `msmtp.exe` to `sendmail.exe` somewhere on `PATH`, or skip the renaming and point the setting at it:
+
+```yaml
+sendmail: "C:/msys64/mingw64/bin/msmtp.exe"
+```
+
+Configure the relay and credentials in msmtp's own `msmtprc` (`~/.msmtprc`; see [its manual](https://marlam.de/msmtp/msmtp.html) for where it looks on Windows), not here.
+
+XAMPP's bundled "fake sendmail" (`sendmail.exe` by Byron Jones, and the `sendmail-tls1-2` fork) is the other binary of that name in circulation. It is documented as emulating sendmail's `-t` option — recipients taken from the headers — whereas `timesheet email` passes the envelope as operands, so check that it actually delivers to everyone before relying on it.
+
+A `.cmd` wrapper also works if you would rather delegate: `sendmail:` can name a batch file that calls `wsl.exe -e /usr/sbin/sendmail "$@"` or a PowerShell script.
 
 ## Filling and sending the timesheet
 
