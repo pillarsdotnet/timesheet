@@ -5,9 +5,10 @@
 
 use crate::settings::Settings;
 use lettre::message::{header::ContentType, Attachment, Mailbox, MultiPart, SinglePart};
-use lettre::transport::smtp::authentication::Credentials;
-use lettre::{Message, SmtpTransport, Transport};
-use std::process::Command;
+use lettre::Message;
+use std::io::Write;
+use std::path::Path;
+use std::process::{Command, Stdio};
 
 /// Parses one address, naming the setting it came from so a typo is easy to place.
 fn mailbox(address: &str, setting: &str) -> Result<Mailbox, String> {
@@ -19,17 +20,38 @@ fn mailbox(address: &str, setting: &str) -> Result<Mailbox, String> {
     })
 }
 
-/// Runs `smtp_password_command` and returns what it printed.
+/// Pipes an already-formatted message to a sendmail(8)-compatible binary.
 ///
-/// This happens before connecting: a locked keyring is a configuration problem rather than a
-/// mail problem, and a pinentry prompt wants the terminal to itself.
-fn read_password(command: &str) -> Result<String, String> {
-    let output = if cfg!(windows) {
-        Command::new("cmd").arg("/C").arg(command).output()
-    } else {
-        Command::new("sh").arg("-c").arg(command).output()
-    }
-    .map_err(|e| format!("ts: smtp_password_command failed to run: {}", e))?;
+/// The envelope is spelled out on the command line — `-f` for the sender, the recipients as
+/// operands — rather than left to `-t`, so that what is delivered matches what the config
+/// says even if a binary parses headers loosely. `-i` keeps a line holding only a dot from
+/// ending the message early.
+fn send_via_sendmail(
+    program: &Path,
+    from: &str,
+    recipients: &[String],
+    message: &[u8],
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    let mut child = Command::new(program)
+        .arg("-i")
+        .arg("-f")
+        .arg(from)
+        .args(recipients)
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("ts: cannot run {}: {}", program.display(), e))?;
+    // Dropping the handle closes the pipe, which is what tells the binary the message ended.
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(message)
+        .map_err(|e| format!("ts: cannot write to {}: {}", program.display(), e))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("ts: {} did not finish: {}", program.display(), e))?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let detail = if detail.is_empty() {
@@ -37,16 +59,21 @@ fn read_password(command: &str) -> Result<String, String> {
         } else {
             detail
         };
-        return Err(format!("ts: smtp_password_command failed: {}", detail));
-    }
-    let password = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if password.is_empty() {
         return Err(format!(
-            "ts: smtp_password_command printed nothing: {}",
-            command
+            "ts: {} refused the message: {}",
+            program.display(),
+            detail
         ));
     }
-    Ok(password)
+    // A binary that accepted the message may still have had something to say — a dry-run
+    // notice, a rewritten sender, a queue warning. Losing that would make a send that did
+    // not do what the config asked look like a clean one.
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        if !line.trim().is_empty() {
+            warnings.push(line.trim_end().to_string());
+        }
+    }
+    Ok(())
 }
 
 /// Mails `data` as `filename` attached to a message built from `settings`.
@@ -101,56 +128,14 @@ pub fn send(
         )
         .map_err(|e| format!("ts: cannot build the message: {}", e))?;
 
-    let user = settings
-        .smtp_user
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    // Gmail silently rewrites From to the authenticated account unless `from` is a verified
-    // "Send mail as" alias there. Setting `reply` is the way to live with that, so a config
-    // that sets it has acknowledged the mismatch and gets no warning.
-    if let Some(user) = user {
-        if !user.eq_ignore_ascii_case(from) && settings.reply.is_none() {
-            warnings.push(format!(
-                "authenticating as {} but sending as {}; some relays rewrite the From header \
-                 unless the sender is a verified alias — set \"reply:\" so replies still reach \
-                 you",
-                user, from
-            ));
-        }
-    }
-
-    let mut transport = if settings.smtp_starttls {
-        SmtpTransport::starttls_relay(&settings.smtp_host).map_err(|e| {
-            format!(
-                "ts: cannot set up STARTTLS for {}: {}",
-                settings.smtp_host, e
-            )
-        })?
-    } else {
-        SmtpTransport::builder_dangerous(&settings.smtp_host)
-    }
-    .port(settings.smtp_port);
-
-    if let Some(user) = user {
-        let command = settings
-            .smtp_password_command
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or("ts: smtp_user is set without smtp_password_command")?;
-        transport =
-            transport.credentials(Credentials::new(user.to_string(), read_password(command)?));
-    }
-
-    transport.build().send(&message).map_err(|e| {
-        format!(
-            "ts: {}:{} refused the message: {}",
-            settings.smtp_host, settings.smtp_port, e
-        )
-    })?;
-
     let mut recipients = settings.to.clone();
     recipients.extend(settings.cc.iter().cloned());
+    send_via_sendmail(
+        &settings.sendmail,
+        from,
+        &recipients,
+        &message.formatted(),
+        warnings,
+    )?;
     Ok(recipients)
 }
