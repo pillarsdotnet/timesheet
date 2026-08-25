@@ -2881,25 +2881,35 @@ Values default to the field names of the stock form, and any listed here replace
 slots they name. The field names of another form can be listed with
 .BR "mutool show form.pdf form | grep Name:" .
 .TP
-.BR smtp_host ", " smtp_port ", " smtp_starttls
-Relay to submit through (default
-.BR localhost :25).
-.B smtp_starttls
-defaults to true on port 587 and false elsewhere.
-.TP
-.BR smtp_user ", " smtp_password_command
-Credentials for a relay that requires them. Leave
-.B smtp_user
-unset for an unauthenticated relay; otherwise set
-.B smtp_password_command
-to a shell command that prints the password, so that no secret is stored in the config
-file, e.g.\&
-.BR "pass show smtp/me@example.com" .
-A Gmail or Workspace account wants
-.BR smtp.gmail.com :587
-with STARTTLS, the full address as
-.BR smtp_user ,
-and an App Password \(em an account password is rejected.
+.B sendmail
+Path to the
+.BR sendmail (8)-compatible
+binary the message is piped to. The default is
+.B /usr/sbin/sendmail
+on Linux and macOS and
+.B sendmail.exe
+\(em resolved against
+.B PATH
+\(em on Windows; a leading \fB~/\fR is expanded. It is run as
+.RI "\fIbinary\fR \-i \-f " from " " recipient ...
+with the message on its standard input, and whatever it prints to standard error is
+repeated \(em as a warning when it succeeds, as the error when it does not. Delivery is
+therefore the local MTA's business: relay, credentials and queueing are configured there
+(Postfix, ssmtp, msmtp) rather than here. Because the key is scoped like the rest, one
+prefix can be sent by a wrapper that mails through a different account while another uses
+the system binary.
+.IP
+Windows ships no MTA, so \fBsendmail.exe\fR has to be supplied. msmtp \(em an SMTP client
+with a sendmail-compatible interface, which takes \fB\-f\fR and the recipients as operands,
+accepts and ignores \fB\-i\fR, and returns sendmail's exit codes \(em is the usual answer.
+Install the portable build (\fBmsmtp_windows_portable_*.zip\fR from
+sourceforge.net/projects/msmtp\-windows\-portable) or the MSYS2 package
+(\fBpacman \-S mingw\-w64\-x86_64\-msmtp\fR), then either copy \fBmsmtp.exe\fR to
+\fBsendmail.exe\fR somewhere on \fBPATH\fR, or point \fBsendmail\fR straight at it. Its
+relay and credentials go in msmtp's own \fBmsmtprc\fR, not here. The "fake sendmail" binary
+of the same name bundled with XAMPP emulates \fB\-t\fR, taking recipients from the headers
+rather than the command line, so check that it delivers to every recipient before relying
+on it.
 .PP
 A configuration for one job, tagged
 .B ST
@@ -2910,10 +2920,6 @@ in the activity descriptions:
 # ~/.config/timesheet.yml
 name: "Jane Contractor"
 from: "jane@example.com"
-smtp_host: "smtp.gmail.com"
-smtp_port: 587
-smtp_user: "jane@example.com"
-smtp_password_command: "pass show smtp/jane"
 prefixes:
   ST:
     template: "~/Documents/timesheet-fillable.pdf"
@@ -3302,13 +3308,15 @@ Carbon-copy recipient, likewise repeatable.
 Sender address.
 .TP
 .BR \-r ", " \-\-reply " " \fIADDRESS\fR
-Reply-To address. Worth setting when the relay rewrites
+Reply-To address. Worth setting when the sending account rewrites
 .B From
 \(em a Gmail account may only send as itself unless the address is a verified
 "Send mail as" alias \(em so that replies still reach the address you read.
 .RE
 .IP
-The relay, credentials, subject and body come from the configuration file (see
+The
+.BR sendmail (8)
+binary, subject and body come from the configuration file (see
 .BR CONFIGURATION ).
 If the send fails the finished PDF is kept on disk rather than discarded, so the message can
 be retried without rebuilding a week that may have moved on.

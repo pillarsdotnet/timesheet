@@ -75,9 +75,9 @@ Either command installs both the `pre-commit` and `commit-msg` hooks. The Pretti
 
 - `groff` and `less` to render `ts help`.
 - The Linux reminder chooser: `python3` with `python3-pyqt6` (or `python3-pyqt5`), falling back to `kdialog`/`zenity`, plus `notify-send`. See the [README](README.md) "Requirements" section for details.
-- Nothing for `ts pdf` and `ts email`: PDF filling and SMTP (STARTTLS included, via rustls with bundled roots) are compiled in, so there is no system OpenSSL or certificate store to install. They are, however, most of the crate's dependency tree, so the first `cargo build` needs network access and takes a while.
+- Nothing for `ts pdf` and `ts email`: PDF filling and message building are compiled in, and delivery is handed to `/usr/sbin/sendmail` (or whatever `sendmail:` names), so there is no TLS stack, OpenSSL or certificate store involved. `lopdf` and `lettre` are still most of the crate's dependency tree, so the first `cargo build` needs network access and takes a while.
 
-To exercise `ts email` without sending anything, point `$TS_CONFIG` at a throwaway config whose `smtp_host` is a local sink — the send path, the attachment, and the keep-the-PDF-on-failure behaviour can all be checked that way.
+To exercise `ts email` without sending anything, point `$TS_CONFIG` at a throwaway config whose `sendmail` is a script that saves its stdin (`cat > /tmp/message.eml`) — the send path, the attachment, and the keep-the-PDF-on-failure behaviour (make the script exit non-zero) can all be checked that way.
 
 ## Running the checks
 
