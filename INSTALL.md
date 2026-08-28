@@ -31,7 +31,7 @@ The binary is written to `target/release/timesheet` (or `target/debug/timesheet`
 
 The first build fetches crates from crates.io, so it needs network access; later builds do not. `timesheet pdf` and `timesheet email` bring in PDF filling and message building (`lopdf` and `lettre`), which is most of the binary's size and of the build time. Nothing links against system OpenSSL or reads a certificate store, on Linux, macOS, or Windows: `timesheet email` pipes the finished message to a `sendmail(8)` binary and leaves the network to it.
 
-On Windows, `cargo build --release` produces `target\release\timesheet.exe`. Core commands (`start`, `stop`, `list`, `sprint`, `tail`, `alias`/`rename`/`prefix`, `rotate`, `migrate`, `timeoff`, `edit`, `pdf`, `email`) work the same as on Linux/macOS. The reminder daemon, reminder dialog, and `timesheet autostart` are not implemented on Windows yet, so `timesheet start` with no activity always defaults to misc/unspecified rather than prompting. `timesheet email` pipes the message to `sendmail.exe` on `PATH`, which Windows does not supply; see [Supplying `sendmail.exe` on Windows](README.md#supplying-sendmailexe-on-windows) in the README for installing msmtp under that name.
+On Windows, `cargo build --release` produces `target\release\timesheet.exe`. Core commands (`start`, `stop`, `list`, `sprint`, `tail`, `alias`/`rename`/`prefix`, `rotate`, `migrate`, `timeoff`, `edit`, `pdf`, `email`) work the same as on Linux/macOS. The reminder daemon and reminder dialog are not implemented on Windows yet, so `timesheet start` with no activity always defaults to misc/unspecified rather than prompting. `timesheet autostart` is supported on Windows (see [Autostart](#autostart-optional) below). `timesheet email` pipes the message to `sendmail.exe` on `PATH`, which Windows does not supply; see [Supplying `sendmail.exe` on Windows](README.md#supplying-sendmailexe-on-windows) in the README for installing msmtp under that name.
 
 ### 2. Install the binary
 
@@ -57,15 +57,21 @@ on Linux a "Timesheet" application-menu entry (`~/.local/share/applications/time
 runs `timesheet start`, and on Windows a "Start Timesheet" Start Menu shortcut. Re-running `install`
 after moving the binary rewrites them to the new location.
 
-## Autostart (optional, macOS/Linux only)
+## Autostart (optional)
 
-Not available on Windows (`timesheet autostart` errors as unsupported there). To run **`timesheet start`** at login and **`timesheet stop`** at logout/shutdown on macOS or Linux:
+To run **`timesheet start`** at login, **again at session unlock**, and **`timesheet stop`** at logout/shutdown:
 
 ```sh
 timesheet autostart
 ```
 
-You can pass an interval (e.g. **`timesheet autostart 5s`**) to set the reminder interval and start the daemon in this session. Startup skips a new START if the last log entry is a STOP less than 60 seconds old, and if it finds a non-STOP event more than 5 minutes old it backfills a STOP 5 minutes after that event before recording the new START. On macOS this uses LaunchAgents and a logout hook. If the installer prints a `sudo defaults write com.apple.loginwindow LogoutHook ...` command, run it once (it requires your password) so that STOP is recorded when you log out or shut down. To remove: **`timesheet autostart uninstall`**.
+You can pass an interval (e.g. **`timesheet autostart 5s`**) to set the reminder interval and start the daemon in this session. Startup skips a new START if the last log entry is a STOP less than 60 seconds old, and if it finds a non-STOP event more than 5 minutes old it backfills a STOP 5 minutes after that event before recording the new START.
+
+- **macOS:** uses LaunchAgents and a logout hook; the session LaunchAgent also watches for macOS's `com.apple.screenIsUnlocked` distributed notification to trigger the unlock START. If the installer prints a `sudo defaults write com.apple.loginwindow LogoutHook ...` command, run it once (it requires your password) so that STOP is recorded when you log out or shut down.
+- **Linux:** uses systemd user units; the session unit watches logind's `LockedHint` session property over the system D-Bus to trigger the unlock START (works with desktop environments that integrate with logind, e.g. GNOME, KDE). If logind or the system bus is unavailable, the unlock trigger is simply skipped.
+- **Windows:** registers a single per-user Scheduled Task ("Timesheet Autostart") with two triggers — at login, and at workstation unlock — no admin rights needed.
+
+To remove: **`timesheet autostart uninstall`**.
 
 ## Configuration
 

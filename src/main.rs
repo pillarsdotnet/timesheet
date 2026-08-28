@@ -41,7 +41,7 @@
 //! | Command    | Description |
 //! |------------|-------------|
 //! | `alias`    | Interactively replace activity text in this week's START entries (regex). |
-//! | `autostart` | Register `timesheet start` on login and `timesheet stop` on logout/shutdown (macOS/Linux: LaunchAgents/systemd units plus an admin-installed logout hook; Windows: a Startup-folder shortcut plus the daemon's best-effort console control handler, no admin required or available). |
+//! | `autostart` | Register `timesheet start` on login and on session unlock, and `timesheet stop` on logout/shutdown (macOS/Linux: LaunchAgents/systemd units plus an admin-installed logout hook, with the unlock trigger via a distributed notification on macOS and a logind D-Bus watch on Linux; Windows: a per-user Scheduled Task with login and workstation-unlock triggers, plus the daemon's best-effort console control handler for STOP, no admin required or available). |
 //! | `edit`     | Open the timesheet log in `$EDITOR` (then `$VISUAL`, else `vi`; the `.txt`-associated program on Windows). |
 //! | `email`    | Fill the timesheet PDF as `pdf` does and mail it as an attachment. |
 //! | `help`     | Show the man page in a pager (groff -man -Tascii \| less; plain text via `more` on Windows). |
@@ -3018,7 +3018,9 @@ applies the current replacement and all remaining matches without prompting agai
 [\fIinterval\fR]
 Register
 .B "timesheet start"
-to run at login and
+to run at login
+.I and
+at session unlock, and
 .B "timesheet stop"
 to run at logout or system shutdown. Optional
 .I interval
@@ -3036,7 +3038,11 @@ If the last recorded event is not STOP and is more than 5 minutes old, startup b
 \fBcom.ts.autostart.session\fR
 Runs
 .B "timesheet \-\-session\-daemon"
-as a persistent launchd job; on logout/shutdown launchd sends it SIGTERM and waits up to 30 s (ExitTimeOut) for it to write the STOP entry and exit.
+as a persistent launchd job. It watches for macOS's
+.B com.apple.screenIsUnlocked
+distributed notification and runs
+.B "timesheet start"
+each time it fires. On logout/shutdown launchd sends it SIGTERM and waits up to 30 s (ExitTimeOut) for it to write the STOP entry and exit.
 .TP
 \fBLogoutHook\fR
 Runs as root before logout/shutdown and macOS blocks the shutdown sequence until it returns, providing a second guarantee that STOP is recorded. Uses
@@ -3056,6 +3062,19 @@ The login unit
 is wanted by and ordered after graphical-session.target, so the chooser waits for the desktop session
 instead of racing it: a unit wanted by default.target starts seconds before the compositor exists and
 has no display to open on.
+The session unit
+.RB ( ts-autostart-session.service )
+runs
+.B "timesheet \-\-session\-daemon"
+as its
+.BR ExecStart ,
+which watches logind's
+.B LockedHint
+session property over the system D\-Bus and runs
+.B "timesheet start"
+on the transition to unlocked; desktop environments that integrate with logind (GNOME, KDE, etc.) update this property on lock/unlock. If logind or the system bus is unavailable, the daemon falls back to idling so the unit (and the STOP\-at\-logout guarantee via its
+.B ExecStop
+, run by systemd independently of this process) is unaffected.
 With
 .I uninstall
 removes the registration (the logout hook removal also needs
@@ -3063,14 +3082,22 @@ removes the registration (the logout hook removal also needs
 Without
 .I interval
 : starts the daemon if not running and prints the current reminder interval.
-On Windows, registers a per-user Startup-folder shortcut ("Timesheet Autostart") that runs
-.B "timesheet start"
-at login; no admin rights are needed for this, but unlike macOS/Linux there is no
+On Windows, registers a per-user Scheduled Task ("Timesheet Autostart") with two triggers: at login, and at workstation unlock (Task Scheduler's native
+.B SessionStateChangeTrigger
+/
+.BR SessionUnlock ,
+only reachable via a Task Scheduler XML definition, not a
+.B schtasks
+flag). Both triggers run
+.BR "timesheet start" .
+No admin rights are needed to register it (runs as the creating user, no stored password). Unlike macOS/Linux there is no
 no-admin-required second guarantee for logoff/shutdown available on Windows, so STOP there relies
 solely on the reminder daemon's console control handler (best-effort: Windows does not guarantee
 it waits for the handler to finish). With
 .I uninstall
-removes the Startup-folder shortcut.
+removes the Scheduled Task (and any Startup-folder shortcut left by a version of
+.B timesheet
+older than the one that introduced the Scheduled Task).
 .TP
 .B help
 Run the equivalent of
@@ -3792,8 +3819,11 @@ fn cmd_autostart(args: &[String]) -> Result<(), String> {
     }
 }
 
-/// Per-user Startup-folder shortcut path used for Windows autostart (run at login, no admin
-/// needed): the direct analog of a macOS LaunchAgent or Linux systemd user unit.
+/// Per-user Startup-folder shortcut path used by older versions of `timesheet autostart` (run at
+/// login only, no admin needed). Superseded by the "Timesheet Autostart" Scheduled Task below,
+/// which adds an unlock trigger a Startup-folder shortcut cannot express; kept only so install/
+/// uninstall can clean up a leftover shortcut from a prior install and not leave two autostart
+/// entries active side by side.
 #[cfg(target_os = "windows")]
 fn windows_startup_shortcut_path() -> Result<PathBuf, String> {
     Ok(dirs::config_dir()
@@ -3806,26 +3836,98 @@ fn windows_startup_shortcut_path() -> Result<PathBuf, String> {
         .join("Timesheet Autostart.lnk"))
 }
 
-/// Register `timesheet.exe start` to run at login via a Startup-folder shortcut. STOP at
-/// logoff/shutdown is handled by the reminder daemon's console control handler
-/// (`windows_console_ctrl_handler`) rather than a separate hook: unlike macOS's LogoutHook or
-/// Linux's system-level logout-hook unit, there is no per-user, no-admin-required Windows
+/// Name of the per-user Scheduled Task used for Windows autostart.
+#[cfg(target_os = "windows")]
+const WINDOWS_AUTOSTART_TASK_NAME: &str = "Timesheet Autostart";
+
+/// Register `timesheet.exe start` to run at login *and* at workstation unlock, via a per-user
+/// Scheduled Task with two triggers. A Startup-folder shortcut (the previous mechanism) can only
+/// express "at login" -- Task Scheduler's `SessionStateChangeTrigger` with `StateChange` set to
+/// `SessionUnlock` is the native unlock trigger, and it is only reachable via a Task Scheduler XML
+/// definition, not a `schtasks` flag. `Principal/LogonType=InteractiveToken` with no explicit
+/// `UserId` and `RunLevel=LeastPrivilege` is the standard "runs as whoever creates it, no stored
+/// password, no admin rights" per-user task shape -- the same no-admin guarantee the Startup
+/// shortcut had. STOP at logoff/shutdown is still handled by the reminder daemon's console control
+/// handler (`windows_console_ctrl_handler`) rather than a separate hook: unlike macOS's LogoutHook
+/// or Linux's system-level logout-hook unit, there is no per-user, no-admin-required Windows
 /// mechanism to add a second guarantee, so this one path is best-effort (see the daemon's doc
 /// comment for the same caveat other platforms already carry).
 #[cfg(target_os = "windows")]
 fn do_autostart_install_windows() -> Result<(), String> {
     let exe = env::current_exe().map_err(|e| e.to_string())?;
-    let shortcut = windows_startup_shortcut_path()?;
-    create_windows_shortcut(
-        &shortcut,
-        &exe,
-        "start",
-        exe.parent().unwrap_or(Path::new(".")),
-        "Record work start at login (same as running \"timesheet start\")",
-    )?;
-    println!("Autostart installed: {}", shortcut.display());
+    let xml_escape = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
+    let exe_escaped = xml_escape(&exe.to_string_lossy());
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Record work start at login and workstation unlock (same as running "timesheet start")</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+    </LogonTrigger>
+    <SessionStateChangeTrigger>
+      <Enabled>true</Enabled>
+      <StateChange>SessionUnlock</StateChange>
+    </SessionStateChangeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{exe}</Command>
+      <Arguments>start</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#,
+        exe = exe_escaped
+    );
+    let xml_path = env::temp_dir().join("timesheet-autostart-task.xml");
+    fs::write(&xml_path, xml).map_err(|e| {
+        format!(
+            "timesheet autostart: cannot write {}: {}",
+            xml_path.display(),
+            e
+        )
+    })?;
+    let status = Command::new("schtasks")
+        .args(["/Create", "/TN", WINDOWS_AUTOSTART_TASK_NAME, "/XML"])
+        .arg(&xml_path)
+        .arg("/F")
+        .status()
+        .map_err(|e| format!("failed to run schtasks: {}", e))?;
+    let _ = fs::remove_file(&xml_path);
+    if !status.success() {
+        return Err(format!("schtasks /Create exited with {}", status));
+    }
+    // Clean up a Startup-folder shortcut from a prior install so only one autostart entry runs.
+    if let Ok(shortcut) = windows_startup_shortcut_path() {
+        let _ = fs::remove_file(&shortcut);
+    }
     println!(
-        "\"timesheet start\" runs at login; STOP at logoff/shutdown is best-effort (no admin rights available for a second guarantee)."
+        "Autostart installed: Scheduled Task \"{}\"",
+        WINDOWS_AUTOSTART_TASK_NAME
+    );
+    println!(
+        "\"timesheet start\" runs at login and at workstation unlock; STOP at logoff/shutdown is best-effort (no admin rights available for a second guarantee)."
     );
     println!("  To remove: timesheet autostart uninstall");
     Ok(())
@@ -3833,16 +3935,16 @@ fn do_autostart_install_windows() -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn do_autostart_uninstall_windows() -> Result<(), String> {
-    let shortcut = windows_startup_shortcut_path()?;
-    if shortcut.exists() {
-        fs::remove_file(&shortcut).map_err(|e| {
-            format!(
-                "timesheet autostart: cannot remove {}: {}",
-                shortcut.display(),
-                e
-            )
-        })?;
-        println!("Removed {}", shortcut.display());
+    // Best-effort cleanup of the legacy Startup-folder shortcut, if one is still present.
+    if let Ok(shortcut) = windows_startup_shortcut_path() {
+        let _ = fs::remove_file(&shortcut);
+    }
+    let status = Command::new("schtasks")
+        .args(["/Delete", "/TN", WINDOWS_AUTOSTART_TASK_NAME, "/F"])
+        .status()
+        .map_err(|e| format!("failed to run schtasks: {}", e))?;
+    if status.success() {
+        println!("Removed Scheduled Task \"{}\"", WINDOWS_AUTOSTART_TASK_NAME);
     } else {
         println!("Autostart was not installed.");
     }
@@ -4158,14 +4260,17 @@ WantedBy=graphical-session.target
 "#,
         exe_path
     );
+    // ExecStart runs the session daemon (STOP-on-shutdown here is systemd's own ExecStop, not the
+    // daemon catching a signal -- see the doc comment on run_session_daemon), which also watches
+    // logind for session unlock and spawns "timesheet start" (see watch_for_unlock_linux).
     let session_unit = format!(
         r#"[Unit]
-Description=timesheet stop on logout
+Description=timesheet session daemon (STOP on logout, START on unlock)
 [Service]
 Type=simple
 Environment=TS_LOGOUT=1
-ExecStart=/bin/sleep infinity
-ExecStop={} stop
+ExecStart={0} --session-daemon
+ExecStop={0} stop
 [Install]
 WantedBy=default.target
 "#,
@@ -4838,14 +4943,93 @@ fn cmd_interval(args: &[String], timesheet: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Spawn `timesheet start` in response to a session-unlock event. Shared by the macOS and Linux
+/// unlock watchers below.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn spawn_start_on_unlock() {
+    if let Ok(exe) = env::current_exe() {
+        ts_debug("spawn_start_on_unlock: session unlocked, spawning \"timesheet start\"");
+        let _ = Command::new(exe).arg("start").spawn();
+    }
+}
+
+/// Block the current thread forever, watching for macOS's `com.apple.screenIsUnlocked`
+/// distributed notification and spawning `timesheet start` each time it fires. Registering the
+/// observer sets up the underlying Mach port as an input source on this thread's run loop, so
+/// `NSRunLoop::run` (which would otherwise return immediately with no sources registered) blocks
+/// indefinitely servicing it -- the standard idiom for a CLI/daemon unlock watcher on macOS.
+#[cfg(target_os = "macos")]
+fn watch_for_unlock_macos() {
+    use objc2_foundation::{ns_string, NSDistributedNotificationCenter, NSNotification, NSRunLoop};
+
+    let center = NSDistributedNotificationCenter::defaultCenter();
+    let block = block2::RcBlock::new(move |_note: std::ptr::NonNull<NSNotification>| {
+        spawn_start_on_unlock();
+    });
+    unsafe {
+        center.addObserverForName_object_queue_usingBlock(
+            Some(ns_string!("com.apple.screenIsUnlocked")),
+            None,
+            None,
+            &block,
+        );
+    }
+    NSRunLoop::currentRunLoop().run();
+}
+
+/// Block the current thread forever, watching logind's `LockedHint` session property over the
+/// system D-Bus for the transition to `false` (unlocked), spawning `timesheet start` each time.
+/// Desktop environments that integrate with logind (GNOME via gnome-session, KDE via ksmserver,
+/// etc.) call `SetLockedHint` on lock/unlock, which is what flips this property. Returns (rather
+/// than looping forever) if the system bus or this process's logind session cannot be resolved,
+/// so the caller can fall back to a plain sleep loop -- e.g. no logind at all, as on a bare WSL1
+/// install.
+#[cfg(target_os = "linux")]
+fn watch_for_unlock_linux() -> Result<(), String> {
+    let conn = zbus::blocking::Connection::system().map_err(|e| e.to_string())?;
+    let msg = conn
+        .call_method(
+            Some("org.freedesktop.login1"),
+            "/org/freedesktop/login1",
+            Some("org.freedesktop.login1.Manager"),
+            "GetSessionByPID",
+            &(process::id(),),
+        )
+        .map_err(|e| e.to_string())?;
+    let session_path: zbus::zvariant::OwnedObjectPath =
+        msg.body().deserialize().map_err(|e| e.to_string())?;
+    let proxy = zbus::blocking::Proxy::new(
+        &conn,
+        "org.freedesktop.login1",
+        session_path,
+        "org.freedesktop.login1.Session",
+    )
+    .map_err(|e| e.to_string())?;
+    for changed in proxy.receive_property_changed::<bool>("LockedHint") {
+        if matches!(changed.get(), Ok(false)) {
+            spawn_start_on_unlock();
+        }
+    }
+    // The iterator only ends if the bus connection drops; let the caller fall back to sleeping.
+    Err("logind PropertiesChanged stream ended".to_string())
+}
+
 /// Run the reminder daemon loop: sleep for configured interval, show "What are you working on?" prompt, handle response or timeout.
 /// Long-running session daemon that records a STOP entry when launchd sends SIGTERM
-/// (i.e. at logout or system shutdown). Installed as the `com.ts.autostart.session`
-/// LaunchAgent by `timesheet autostart`. Because this is a launchd job, launchd delivers a
-/// clean SIGTERM and waits for the process to exit (see ExitTimeOut in the plist) before
-/// proceeding with the shutdown sequence, making STOP recording reliable.
+/// (i.e. at logout or system shutdown), and (macOS/Linux) watches for session unlock to spawn
+/// "timesheet start". Installed as the `com.ts.autostart.session` LaunchAgent (macOS) or as the
+/// `ts-autostart-session.service` unit's `ExecStart` (Linux) by `timesheet autostart`.
+///
+/// The SIGTERM-catching STOP guarantee below is macOS-only: launchd LaunchAgents have no
+/// systemd-style `ExecStop`, so this process must catch its own SIGTERM (launchd delivers a clean
+/// one and waits for exit, per ExitTimeOut in the plist) and write the STOP entry itself. Linux
+/// already gets STOP-at-stop for free from the unit's own `ExecStop=timesheet stop`, run by
+/// systemd independently of this process -- catching SIGTERM here too would race it and risk a
+/// duplicate STOP.
 fn run_session_daemon(timesheet: &Path) {
-    #[cfg(unix)]
+    #[cfg(not(target_os = "macos"))]
+    let _ = timesheet;
+    #[cfg(target_os = "macos")]
     {
         // Block SIGTERM in the main thread; a dedicated sigwait thread handles it
         // synchronously, so the STOP entry is written before process::exit is called.
@@ -4873,8 +5057,22 @@ fn run_session_daemon(timesheet: &Path) {
                 process::exit(0);
             }
         });
+        watch_for_unlock_macos();
     }
-    // Main thread: sleep indefinitely. The sigwait thread calls process::exit on SIGTERM.
+    #[cfg(target_os = "linux")]
+    {
+        loop {
+            if let Err(e) = watch_for_unlock_linux() {
+                ts_debug(&format!(
+                    "run_session_daemon: unlock watcher unavailable ({}); sleeping",
+                    e
+                ));
+            }
+            thread::sleep(Duration::from_secs(3600));
+        }
+    }
+    // Main thread: sleep indefinitely.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     loop {
         thread::sleep(Duration::from_secs(3600));
     }
