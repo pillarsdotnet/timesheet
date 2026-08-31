@@ -3090,14 +3090,16 @@ only reachable via a Task Scheduler XML definition, not a
 .B schtasks
 flag). Both triggers run
 .BR "timesheet start" .
-No admin rights are needed to register it (runs as the creating user, no stored password). Unlike macOS/Linux there is no
+No admin rights are needed to register it (runs as the creating user, no stored password), but some
+managed/locked-down machines block per-user Scheduled Task creation via Group Policy anyway; if
+.B schtasks
+reports it cannot create the task, autostart falls back to a per-user Startup-folder shortcut
+(login only, no workstation-unlock trigger). Unlike macOS/Linux there is no
 no-admin-required second guarantee for logoff/shutdown available on Windows, so STOP there relies
 solely on the reminder daemon's console control handler (best-effort: Windows does not guarantee
 it waits for the handler to finish). With
 .I uninstall
-removes the Scheduled Task (and any Startup-folder shortcut left by a version of
-.B timesheet
-older than the one that introduced the Scheduled Task).
+removes whichever of the Scheduled Task or Startup-folder shortcut is present.
 .TP
 .B help
 Run the equivalent of
@@ -3819,11 +3821,13 @@ fn cmd_autostart(args: &[String]) -> Result<(), String> {
     }
 }
 
-/// Per-user Startup-folder shortcut path used by older versions of `timesheet autostart` (run at
-/// login only, no admin needed). Superseded by the "Timesheet Autostart" Scheduled Task below,
-/// which adds an unlock trigger a Startup-folder shortcut cannot express; kept only so install/
-/// uninstall can clean up a leftover shortcut from a prior install and not leave two autostart
-/// entries active side by side.
+/// Per-user Startup-folder shortcut path (run at login only, no admin needed). The Scheduled Task
+/// below is preferred when it can be created, since it adds an unlock trigger a Startup-folder
+/// shortcut cannot express, but this path also serves two other purposes: it's the fallback
+/// `do_autostart_install_windows` uses when `schtasks /Create` is blocked (e.g. by Group Policy on
+/// a managed machine), and install/uninstall clean it up so a prior install (fallback or older
+/// pre-Scheduled-Task version of `timesheet autostart`) never leaves two autostart entries active
+/// side by side.
 #[cfg(target_os = "windows")]
 fn windows_startup_shortcut_path() -> Result<PathBuf, String> {
     Ok(dirs::config_dir()
@@ -3851,7 +3855,11 @@ const WINDOWS_AUTOSTART_TASK_NAME: &str = "Timesheet Autostart";
 /// handler (`windows_console_ctrl_handler`) rather than a separate hook: unlike macOS's LogoutHook
 /// or Linux's system-level logout-hook unit, there is no per-user, no-admin-required Windows
 /// mechanism to add a second guarantee, so this one path is best-effort (see the daemon's doc
-/// comment for the same caveat other platforms already carry).
+/// comment for the same caveat other platforms already carry). Some managed/locked-down machines
+/// block per-user Scheduled Task creation via Group Policy even though no admin rights are
+/// technically required (`schtasks /Create` fails with "Access is denied" for *any* task, not just
+/// this one); on those, fall back to the Startup-folder shortcut for a login-only trigger instead
+/// of failing outright.
 #[cfg(target_os = "windows")]
 fn do_autostart_install_windows() -> Result<(), String> {
     let exe = env::current_exe().map_err(|e| e.to_string())?;
@@ -3863,7 +3871,7 @@ fn do_autostart_install_windows() -> Result<(), String> {
     };
     let exe_escaped = xml_escape(&exe.to_string_lossy());
     let xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
+        r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Description>Record work start at login and workstation unlock (same as running "timesheet start")</Description>
@@ -3901,7 +3909,13 @@ fn do_autostart_install_windows() -> Result<(), String> {
         exe = exe_escaped
     );
     let xml_path = env::temp_dir().join("timesheet-autostart-task.xml");
-    fs::write(&xml_path, xml).map_err(|e| {
+    // schtasks requires the XML file's actual bytes to match its declared encoding, BOM included
+    // -- plain UTF-8 with no BOM (what `fs::write` on a `String` produces) makes it fail with
+    // "The task XML is malformed ... unable to switch the encoding". UTF-16LE with a BOM is what
+    // `schtasks /Query /XML` itself exports, so write that instead.
+    let mut xml_bytes: Vec<u8> = vec![0xFF, 0xFE];
+    xml_bytes.extend(xml.encode_utf16().flat_map(|u| u.to_le_bytes()));
+    fs::write(&xml_path, &xml_bytes).map_err(|e| {
         format!(
             "timesheet autostart: cannot write {}: {}",
             xml_path.display(),
@@ -3915,19 +3929,43 @@ fn do_autostart_install_windows() -> Result<(), String> {
         .status()
         .map_err(|e| format!("failed to run schtasks: {}", e))?;
     let _ = fs::remove_file(&xml_path);
-    if !status.success() {
-        return Err(format!("schtasks /Create exited with {}", status));
+    if status.success() {
+        // Scheduled Task is the primary mechanism; drop any leftover fallback shortcut so only
+        // one autostart entry runs.
+        if let Ok(shortcut) = windows_startup_shortcut_path() {
+            let _ = fs::remove_file(&shortcut);
+        }
+        println!(
+            "Autostart installed: Scheduled Task \"{}\"",
+            WINDOWS_AUTOSTART_TASK_NAME
+        );
+        println!(
+            "\"timesheet start\" runs at login and at workstation unlock; STOP at logoff/shutdown is best-effort (no admin rights available for a second guarantee)."
+        );
+        println!("  To remove: timesheet autostart uninstall");
+        return Ok(());
     }
-    // Clean up a Startup-folder shortcut from a prior install so only one autostart entry runs.
-    if let Ok(shortcut) = windows_startup_shortcut_path() {
-        let _ = fs::remove_file(&shortcut);
-    }
+    // schtasks printed its own error above (inherited stderr). Managed machines sometimes block
+    // per-user Scheduled Task creation via Group Policy regardless of admin rights, so fall back
+    // to a Startup-folder shortcut: login-only (no workstation-unlock trigger), but not gated by
+    // the same policy.
+    eprintln!(
+        "schtasks /Create failed (see error above); falling back to a Startup-folder shortcut (login only, no workstation-unlock trigger)."
+    );
+    let shortcut = windows_startup_shortcut_path()?;
+    create_windows_shortcut(
+        &shortcut,
+        &exe,
+        "start",
+        exe.parent().unwrap_or(Path::new(".")),
+        "Record work start at login (same as running \"timesheet start\")",
+    )?;
     println!(
-        "Autostart installed: Scheduled Task \"{}\"",
-        WINDOWS_AUTOSTART_TASK_NAME
+        "Autostart installed: Startup-folder shortcut \"{}\"",
+        shortcut.display()
     );
     println!(
-        "\"timesheet start\" runs at login and at workstation unlock; STOP at logoff/shutdown is best-effort (no admin rights available for a second guarantee)."
+        "\"timesheet start\" runs at login only; STOP at logoff/shutdown is best-effort (no admin rights available for a second guarantee)."
     );
     println!("  To remove: timesheet autostart uninstall");
     Ok(())
@@ -3935,17 +3973,23 @@ fn do_autostart_install_windows() -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn do_autostart_uninstall_windows() -> Result<(), String> {
-    // Best-effort cleanup of the legacy Startup-folder shortcut, if one is still present.
-    if let Ok(shortcut) = windows_startup_shortcut_path() {
-        let _ = fs::remove_file(&shortcut);
-    }
+    // Best-effort cleanup of the Startup-folder shortcut, whether it's the fallback from a
+    // blocked schtasks or a leftover from a pre-Scheduled-Task install.
+    let shortcut_removed = windows_startup_shortcut_path()
+        .map(|shortcut| fs::remove_file(&shortcut).is_ok())
+        .unwrap_or(false);
     let status = Command::new("schtasks")
         .args(["/Delete", "/TN", WINDOWS_AUTOSTART_TASK_NAME, "/F"])
         .status()
         .map_err(|e| format!("failed to run schtasks: {}", e))?;
-    if status.success() {
+    let task_removed = status.success();
+    if task_removed {
         println!("Removed Scheduled Task \"{}\"", WINDOWS_AUTOSTART_TASK_NAME);
-    } else {
+    }
+    if shortcut_removed {
+        println!("Removed Startup-folder shortcut");
+    }
+    if !task_removed && !shortcut_removed {
         println!("Autostart was not installed.");
     }
     Ok(())

@@ -69,7 +69,7 @@ You can pass an interval (e.g. **`timesheet autostart 5s`**) to set the reminder
 
 - **macOS:** uses LaunchAgents and a logout hook; the session LaunchAgent also watches for macOS's `com.apple.screenIsUnlocked` distributed notification to trigger the unlock START. If the installer prints a `sudo defaults write com.apple.loginwindow LogoutHook ...` command, run it once (it requires your password) so that STOP is recorded when you log out or shut down.
 - **Linux:** uses systemd user units; the session unit watches logind's `LockedHint` session property over the system D-Bus to trigger the unlock START (works with desktop environments that integrate with logind, e.g. GNOME, KDE). If logind or the system bus is unavailable, the unlock trigger is simply skipped.
-- **Windows:** registers a single per-user Scheduled Task ("Timesheet Autostart") with two triggers — at login, and at workstation unlock — no admin rights needed.
+- **Windows:** registers a single per-user Scheduled Task ("Timesheet Autostart") with two triggers — at login, and at workstation unlock — no admin rights needed. On managed machines where Group Policy blocks per-user Scheduled Task creation, falls back to a Startup-folder shortcut (login only, no unlock trigger).
 
 To remove: **`timesheet autostart uninstall`**.
 
