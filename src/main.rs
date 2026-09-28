@@ -5230,13 +5230,25 @@ fn run_reminder_daemon(timesheet: &Path) {
         }
     });
 
+    // Set when the last prompt was dismissed without a choice: the next one follows at once rather
+    // than a whole reminder interval later.
+    let mut reshow_now = false;
     loop {
         // If ownership changed underneath us (e.g. another daemon took over), exit quietly.
         if !owns_reminder_daemon(&pid_path) {
             ts_debug("reminder daemon: lost pid ownership, exiting");
             return;
         }
-        let interval_secs = get_reminder_interval_secs();
+        let interval_secs = if reshow_now {
+            // Debounce: a dialog that exits the moment it opens (say, the display is not reachable
+            // yet) would otherwise spin the CPU re-showing it.
+            ts_debug("reminder daemon: prompt dismissed without a choice; re-showing it");
+            thread::sleep(Duration::from_millis(500));
+            0
+        } else {
+            get_reminder_interval_secs()
+        };
+        reshow_now = false;
         ts_debug(&format!("reminder daemon: sleeping {}s", interval_secs));
         // Sleep in slices rather than one long nap, re-checking ownership as we go: `timesheet stop`
         // silences a daemon by removing the PID file, and a daemon it could not signal (a stray
@@ -5275,7 +5287,7 @@ fn run_reminder_daemon(timesheet: &Path) {
             ReminderResult::EnterNew => {
                 unreachable!("show_reminder_prompt converts EnterNew to Activity")
             }
-            ReminderResult::ShowAgainImmediate => {} // dismissed without choice; re-show immediately
+            ReminderResult::ShowAgainImmediate => reshow_now = true, // dismissed without a choice
             ReminderResult::TimeoutAddStop(dt) => {
                 // Reached only when no chooser could be shown at all (no PyQt/kdialog/zenity) or the
                 // dialog failed to run. A chooser that did appear keeps itself on screen past the
