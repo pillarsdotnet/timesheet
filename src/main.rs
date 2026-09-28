@@ -3185,7 +3185,7 @@ and
 .B reminder
 are aliases for
 .BR interval .
-Reminder daemon behavior: if a prompt goes unanswered for one reminder interval, records a STOP timestamped at the moment the prompt appeared, not when the interval expired. That timestamp is used exactly, without the one-interval cap, because the prompt appears one reminder interval after the previous entry and so already marks the last time you were known to be working. The prompt is then left on screen rather than dismissed (macOS also brings it back to the front of the window stack): choosing an activity when you return records a START at the return time, so the stretch away from the desk falls between the two entries and goes unbilled while your return is logged accurately. No second STOP is added while work is already stopped, so an unattended screen records one STOP rather than one per interval. The reminder window covers the full screen and stays on top on both macOS and Linux, so it cannot be hidden by accident by a mouse action in progress when it appears. Dismissed without choice (close, Escape) re-shows immediately. The "Enter new activity" dialog has no timeout; blank/cancelled re-shows the reminder. At logout/shutdown the open session is stopped: on macOS the daemon itself records STOP when launchd sends it SIGTERM (capped to one reminder interval after the latest entry); on Linux the systemd session unit's ExecStop runs "timesheet stop" instead, and the daemon stays silent on SIGTERM (systemd may signal it during ordinary teardown, so writing a STOP there would be spurious). Every other automatic STOP is capped to one reminder interval (default 5 minutes) after the latest entry, so forgetting to stop never records work all night.
+Reminder daemon behavior: if a prompt goes unanswered for one reminder interval, records a STOP timestamped at the moment the prompt appeared, not when the interval expired. That timestamp is used exactly, without the one-interval cap, because the prompt appears one reminder interval after the previous entry and so already marks the last time you were known to be working. The prompt is then left on screen rather than dismissed (macOS also brings it back to the front of the window stack): choosing an activity when you return records a START at the return time, so the stretch away from the desk falls between the two entries and goes unbilled while your return is logged accurately. No second STOP is added while work is already stopped, so an unattended screen records one STOP rather than one per interval. The reminder window covers the full screen and stays on top on macOS, Linux, and Windows, so it cannot be hidden by accident by a mouse action in progress when it appears. With several monitors it opens on every screen at once, so it is seen whichever screen you are working on, even beside a full-screen remote desktop that raises itself above everything on the next click; choosing on any screen dismisses it on all of them. (The kdialog/zenity fallback on Linux is a single ordinary dialog.) Dismissed without choice (close, Escape) re-shows immediately. The "Enter new activity" dialog has no timeout; blank/cancelled re-shows the reminder. At logout/shutdown the open session is stopped: on macOS the daemon itself records STOP when launchd sends it SIGTERM (capped to one reminder interval after the latest entry); on Linux the systemd session unit's ExecStop runs "timesheet stop" instead, and the daemon stays silent on SIGTERM (systemd may signal it during ordinary teardown, so writing a STOP there would be spurious). Every other automatic STOP is capped to one reminder interval (default 5 minutes) after the latest entry, so forgetting to stop never records work all night.
 .TP
 .B list
 Plaintext report: percentage of time per activity (high to low), and hours per day of week (Sun\-Sat).
@@ -5230,13 +5230,25 @@ fn run_reminder_daemon(timesheet: &Path) {
         }
     });
 
+    // Set when the last prompt was dismissed without a choice: the next one follows at once rather
+    // than a whole reminder interval later.
+    let mut reshow_now = false;
     loop {
         // If ownership changed underneath us (e.g. another daemon took over), exit quietly.
         if !owns_reminder_daemon(&pid_path) {
             ts_debug("reminder daemon: lost pid ownership, exiting");
             return;
         }
-        let interval_secs = get_reminder_interval_secs();
+        let interval_secs = if reshow_now {
+            // Debounce: a dialog that exits the moment it opens (say, the display is not reachable
+            // yet) would otherwise spin the CPU re-showing it.
+            ts_debug("reminder daemon: prompt dismissed without a choice; re-showing it");
+            thread::sleep(Duration::from_millis(500));
+            0
+        } else {
+            get_reminder_interval_secs()
+        };
+        reshow_now = false;
         ts_debug(&format!("reminder daemon: sleeping {}s", interval_secs));
         // Sleep in slices rather than one long nap, re-checking ownership as we go: `timesheet stop`
         // silences a daemon by removing the PID file, and a daemon it could not signal (a stray
@@ -5275,7 +5287,7 @@ fn run_reminder_daemon(timesheet: &Path) {
             ReminderResult::EnterNew => {
                 unreachable!("show_reminder_prompt converts EnterNew to Activity")
             }
-            ReminderResult::ShowAgainImmediate => {} // dismissed without choice; re-show immediately
+            ReminderResult::ShowAgainImmediate => reshow_now = true, // dismissed without a choice
             ReminderResult::TimeoutAddStop(dt) => {
                 // Reached only when no chooser could be shown at all (no PyQt/kdialog/zenity) or the
                 // dialog failed to run. A chooser that did appear keeps itself on screen past the
@@ -5569,6 +5581,7 @@ fn prompt_enter_activity_linux(backend: LinuxDialog) -> Option<String> {
 ///
 /// The window covers the whole screen and stays on top, matching the macOS chooser: a small window
 /// is easy to dismiss by accident when it appears mid-click. The choices sit in a centered panel.
+/// One such window opens on every connected screen, and a choice made on any of them closes all.
 /// Qt enum access differs between PyQt5 (unscoped) and PyQt6 (scoped), hence the `WindowType`
 /// getattr dance.
 #[cfg(target_os = "linux")]
@@ -5622,79 +5635,121 @@ wintype = getattr(Qt, "WindowType", Qt)
 align = getattr(Qt, "AlignmentFlag", Qt)
 result = {"v": None}
 app = QApplication([])
-w = QWidget()
-w.setWindowTitle("timesheet")
-try:
-    w.setWindowFlags(w.windowFlags() | wintype.WindowStaysOnTopHint)
-except Exception:
-    pass
-prompt = QLabel("What are you working on?")
-try:
-    prompt.setAlignment(align.AlignCenter)
-except Exception:
-    pass
-# Lay the choices out in columns instead of one tall scrolling list: with the
-# window full-screen, a grid uses the available space instead of forcing a
-# scrollbar. Column count is derived from screen height so the grid fits
-# without scrolling for any realistic number of choices; filled column-major
-# so the first choice ("Stop Work") lands top-of-first-column and the last
-# ("Enter new activity...") lands bottom-of-last-column.
-item_h = 28
-screen = app.primaryScreen()
-avail_h = (screen.availableGeometry().height() if screen else 800) - 220
-max_rows = max(1, avail_h // item_h)
-n = len(choices)
-columns = max(1, -(-n // max_rows))  # ceil division
-rows_per_col = -(-n // columns)  # ceil division
-grid = QHBoxLayout()
-lists = []
-idx = 0
-for col in range(columns):
-    count = min(rows_per_col, n - idx)
-    lst = QListWidget()
-    lst.addItems(choices[idx:idx + count])
-    lst.setFixedWidth(420)
-    lst.setFixedHeight(count * item_h + 20)
-    lists.append((lst, idx))
-    grid.addWidget(lst)
-    idx += count
-# Centered panel: the window is full-screen, but the choices stay a comfortable size.
-panel = QWidget()
-panel_lay = QVBoxLayout(panel)
-panel_lay.addWidget(prompt)
-panel_lay.addLayout(grid)
-row = QHBoxLayout()
-row.addStretch(1)
-row.addWidget(panel)
-row.addStretch(1)
-lay = QVBoxLayout(w)
-lay.addStretch(1)
-lay.addLayout(row)
-lay.addStretch(1)
+# One full-screen window per connected screen, so the prompt is seen whichever screen you are
+# looking at -- including when another screen is taken over by a full-screen remote desktop that
+# raises itself above everything on the next click. Choosing on any one of them closes them all.
+windows = {}
+retiring = set()
+quitting = {"v": False}
+def dismiss():
+    # Qt 6 sends every window a close event from inside quit(); without this guard each of those
+    # would call quit() again.
+    if not quitting["v"]:
+        quitting["v"] = True
+        app.quit()
 def finish(val):
     result["v"] = val
-    app.quit()
+    dismiss()
 def on_click(item):
     text = item.text()
     if text == "Enter new activity...":
-        activity, ok = QInputDialog.getText(w, "timesheet", "Enter activity:")
+        activity, ok = QInputDialog.getText(item.listWidget().window(), "timesheet", "Enter activity:")
         if ok and activity.strip():
             finish(activity.strip())
         else:
             item.listWidget().clearSelection()
         return
     finish(text)
-for lst, _ in lists:
-    lst.itemClicked.connect(on_click)
-w.showFullScreen()
-try:
-    w.raise_()
-    w.activateWindow()
-except Exception:
-    pass
+class ChooserWindow(QWidget):
+    # Closing any one window (window manager close, Alt+F4) dismisses the whole prompt, the same as
+    # closing the single window used to; only a window retired with its screen closes on its own.
+    def closeEvent(self, event):
+        event.accept()
+        if self not in retiring:
+            dismiss()
+def build_window(screen):
+    w = ChooserWindow()
+    w.setWindowTitle("timesheet")
+    try:
+        w.setWindowFlags(w.windowFlags() | wintype.WindowStaysOnTopHint)
+    except Exception:
+        pass
+    prompt = QLabel("What are you working on?")
+    try:
+        prompt.setAlignment(align.AlignCenter)
+    except Exception:
+        pass
+    # Lay the choices out in columns instead of one tall scrolling list: with the
+    # window full-screen, a grid uses the available space instead of forcing a
+    # scrollbar. Column count is derived from this screen's height so the grid fits
+    # without scrolling for any realistic number of choices; filled column-major
+    # so the first choice ("Stop Work") lands top-of-first-column and the last
+    # ("Enter new activity...") lands bottom-of-last-column.
+    item_h = 28
+    avail_h = (screen.availableGeometry().height() if screen else 800) - 220
+    max_rows = max(1, avail_h // item_h)
+    n = len(choices)
+    columns = max(1, -(-n // max_rows))  # ceil division
+    rows_per_col = -(-n // columns)  # ceil division
+    grid = QHBoxLayout()
+    lists = []
+    idx = 0
+    for col in range(columns):
+        count = min(rows_per_col, n - idx)
+        lst = QListWidget()
+        lst.addItems(choices[idx:idx + count])
+        lst.setFixedWidth(420)
+        lst.setFixedHeight(count * item_h + 20)
+        lst.itemClicked.connect(on_click)
+        lists.append((lst, idx))
+        grid.addWidget(lst)
+        idx += count
+    # Centered panel: the window is full-screen, but the choices stay a comfortable size.
+    panel = QWidget()
+    panel_lay = QVBoxLayout(panel)
+    panel_lay.addWidget(prompt)
+    panel_lay.addLayout(grid)
+    row = QHBoxLayout()
+    row.addStretch(1)
+    row.addWidget(panel)
+    row.addStretch(1)
+    lay = QVBoxLayout(w)
+    lay.addStretch(1)
+    lay.addLayout(row)
+    lay.addStretch(1)
+    # Pin the window to its screen before showing it. Wayland ignores client-chosen positions, but
+    # it honors the output a full-screen request names, which Qt takes from the window's screen.
+    if screen is not None:
+        w.winId()
+        handle = w.windowHandle()
+        if handle is not None:
+            handle.setScreen(screen)
+        w.setGeometry(screen.geometry())
+    w.showFullScreen()
+    try:
+        w.raise_()
+        w.activateWindow()
+    except Exception:
+        pass
+    windows[screen] = (w, lists)
+def on_screen_added(screen):
+    if screen not in windows:
+        build_window(screen)
+def on_screen_removed(screen):
+    entry = windows.pop(screen, None)
+    if entry is not None:
+        retiring.add(entry[0])
+        entry[0].close()
+primary = app.primaryScreen()
+# The primary screen's window is built last so it is the one left active.
+for screen in sorted(app.screens() or [primary], key=lambda s: s == primary):
+    build_window(screen)
+app.screenAdded.connect(on_screen_added)
+app.screenRemoved.connect(on_screen_removed)
 autopick = os.environ.get("TS_CHOOSER_AUTOPICK")
 if autopick is not None:
     ai = int(autopick)
+    lists = windows.get(primary, next(iter(windows.values())))[1]
     for lst, base in lists:
         if base <= ai < base + lst.count():
             QTimer.singleShot(200, lambda lst=lst, i=ai - base: on_click(lst.item(i)))
@@ -5921,8 +5976,9 @@ fn base64_encode(data: &[u8]) -> String {
 /// Full-screen, topmost, single-click chooser implemented with PowerShell/WinForms (mirrors the
 /// Linux PyQt chooser's feel more than kdialog/zenity's list+OK). Picking "Enter new activity..."
 /// opens a small inline input dialog in the same script (like the PyQt chooser does), so the whole
-/// interaction is one process and one round trip. Writes the chosen string to stdout, or nothing
-/// if the window is dismissed without a choice.
+/// interaction is one process and one round trip. One such form covers each connected screen, and a
+/// choice on any of them closes all. Writes the chosen string to stdout, or nothing if the window
+/// is dismissed without a choice.
 /// `{CHOICES}` is replaced with a PowerShell array literal before encoding. Choices are embedded
 /// directly in the script rather than passed as trailing argv, because -EncodedCommand does not
 /// support trailing positional arguments the way -Command does (passing them anyway makes
@@ -5970,67 +6026,21 @@ function Prompt-NewActivity {
     return $null
 }
 
-$form = New-Object System.Windows.Forms.Form
-$form.Text = "timesheet"
-$form.FormBorderStyle = "None"
-$form.WindowState = "Maximized"
-$form.TopMost = $true
-$form.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
-$form.KeyPreview = $true
-$form.Add_KeyDown({ if ($_.KeyCode -eq "Escape") { $form.Close() } })
+$script:forms = @()
+$script:closing = $false
 
-$label = New-Object System.Windows.Forms.Label
-$label.Text = "What are you working on?"
-$label.ForeColor = [System.Drawing.Color]::White
-$label.Font = New-Object System.Drawing.Font("Segoe UI", 16)
-$label.AutoSize = $true
-$label.Location = New-Object System.Drawing.Point(10, 10)
-
-# Lay the choices out in columns instead of one tall scrolling list: with the
-# window full-screen (borderless + maximized above), a grid uses the
-# available space instead of forcing a scrollbar. Column count is derived
-# from screen height so the grid fits without scrolling for any realistic
-# number of choices; filled column-major so the first choice ("Stop Work")
-# lands top-of-first-column and the last ("Enter new activity...") lands
-# bottom-of-last-column.
-$itemHeight = 28
-$screenHeight = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Height
-$maxRows = [Math]::Max(1, [Math]::Floor(($screenHeight - 220) / $itemHeight))
-$n = $choices.Count
-$columns = [Math]::Max(1, [Math]::Ceiling($n / $maxRows))
-$rowsPerCol = [Math]::Ceiling($n / $columns)
-$colWidth = 420
-$colSpacing = 20
-
-$listBoxes = @()
-$idx = 0
-for ($col = 0; $col -lt $columns; $col++) {
-    $count = [Math]::Min($rowsPerCol, $n - $idx)
-    $lb = New-Object System.Windows.Forms.ListBox
-    $lb.Font = New-Object System.Drawing.Font("Segoe UI", 12)
-    $lb.Width = $colWidth
-    $lb.Height = ($count * $itemHeight) + 20
-    $lb.Location = New-Object System.Drawing.Point((10 + $col * ($colWidth + $colSpacing)), ($label.Bottom + 10))
-    for ($j = 0; $j -lt $count; $j++) { [void]$lb.Items.Add($choices[$idx + $j]) }
-    $listBoxes += $lb
-    $idx += $count
+# A choice (or a close) on any screen's form dismisses the prompt on every screen.
+# $except is the form already closing, which must not be closed a second time.
+function Close-All($except) {
+    if ($script:closing) { return }
+    $script:closing = $true
+    foreach ($f in $script:forms) {
+        if ($f -ne $except -and -not $f.IsDisposed) { $f.Close() }
+    }
 }
-$maxListHeight = ($listBoxes | ForEach-Object { $_.Height } | Measure-Object -Maximum).Maximum
-
-$panel = New-Object System.Windows.Forms.Panel
-$panel.Width = 20 + ($columns * $colWidth) + (($columns - 1) * $colSpacing)
-$panel.Height = $label.Bottom + 10 + $maxListHeight + 10
-$panel.Controls.Add($label)
-foreach ($lb in $listBoxes) { $panel.Controls.Add($lb) }
-$form.Controls.Add($panel)
-$form.Add_Shown({
-    $panel.Left = [int](($form.ClientSize.Width - $panel.Width) / 2)
-    $panel.Top = [int](($form.ClientSize.Height - $panel.Height) / 2)
-    $form.Activate()
-})
 
 # $this is bound to whichever ListBox raised the event, so one handler
-# shared across all columns is enough.
+# shared across all columns and all screens is enough.
 $onListClick = {
     if ($this.SelectedItem -eq $null) { return }
     $item = $this.SelectedItem.ToString()
@@ -6038,18 +6048,91 @@ $onListClick = {
         $activity = Prompt-NewActivity
         if ($activity) {
             $script:result = $activity
-            $form.Close()
+            Close-All
         } else {
             $this.ClearSelected()
         }
         return
     }
     $script:result = $item
-    $form.Close()
+    Close-All
 }
-foreach ($lb in $listBoxes) { $lb.Add_Click($onListClick) }
 
-[void]$form.ShowDialog()
+function New-ChooserForm($screen) {
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "timesheet"
+    $form.FormBorderStyle = "None"
+    # Cover exactly this screen: a manual position plus its bounds, rather than Maximized, which
+    # would put every form on the screen the first one opened on.
+    $form.StartPosition = "Manual"
+    $form.Bounds = $screen.Bounds
+    $form.TopMost = $true
+    $form.ShowInTaskbar = $screen.Primary
+    $form.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
+    $form.KeyPreview = $true
+    $form.Add_KeyDown({ if ($_.KeyCode -eq "Escape") { Close-All } })
+    $form.Add_FormClosed({ Close-All $this })
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = "What are you working on?"
+    $label.ForeColor = [System.Drawing.Color]::White
+    $label.Font = New-Object System.Drawing.Font("Segoe UI", 16)
+    $label.AutoSize = $true
+    $label.Location = New-Object System.Drawing.Point(10, 10)
+
+    # Lay the choices out in columns instead of one tall scrolling list: with the
+    # form covering the whole screen, a grid uses the available space instead of
+    # forcing a scrollbar. Column count is derived from this screen's height so
+    # the grid fits without scrolling for any realistic number of choices; filled
+    # column-major so the first choice ("Stop Work") lands top-of-first-column and
+    # the last ("Enter new activity...") lands bottom-of-last-column.
+    $itemHeight = 28
+    $screenHeight = $screen.WorkingArea.Height
+    $maxRows = [Math]::Max(1, [Math]::Floor(($screenHeight - 220) / $itemHeight))
+    $n = $choices.Count
+    $columns = [Math]::Max(1, [Math]::Ceiling($n / $maxRows))
+    $rowsPerCol = [Math]::Ceiling($n / $columns)
+    $colWidth = 420
+    $colSpacing = 20
+
+    $listBoxes = @()
+    $idx = 0
+    for ($col = 0; $col -lt $columns; $col++) {
+        $count = [Math]::Min($rowsPerCol, $n - $idx)
+        $lb = New-Object System.Windows.Forms.ListBox
+        $lb.Font = New-Object System.Drawing.Font("Segoe UI", 12)
+        $lb.Width = $colWidth
+        $lb.Height = ($count * $itemHeight) + 20
+        $lb.Location = New-Object System.Drawing.Point((10 + $col * ($colWidth + $colSpacing)), ($label.Bottom + 10))
+        for ($j = 0; $j -lt $count; $j++) { [void]$lb.Items.Add($choices[$idx + $j]) }
+        $lb.Add_Click($onListClick)
+        $listBoxes += $lb
+        $idx += $count
+    }
+    $maxListHeight = ($listBoxes | ForEach-Object { $_.Height } | Measure-Object -Maximum).Maximum
+
+    $panel = New-Object System.Windows.Forms.Panel
+    $panel.Width = 20 + ($columns * $colWidth) + (($columns - 1) * $colSpacing)
+    $panel.Height = $label.Bottom + 10 + $maxListHeight + 10
+    $panel.Controls.Add($label)
+    foreach ($lb in $listBoxes) { $panel.Controls.Add($lb) }
+    $form.Controls.Add($panel)
+    $form.Add_Shown({
+        $p = $this.Controls[0]
+        $p.Left = [int](($this.ClientSize.Width - $p.Width) / 2)
+        $p.Top = [int](($this.ClientSize.Height - $p.Height) / 2)
+    })
+    return $form
+}
+
+# One form per connected screen, primary last so it is the one left active; the primary's form
+# owns the message loop, and closing it (which Close-All always does) ends the loop.
+$screens = @([System.Windows.Forms.Screen]::AllScreens | Sort-Object { $_.Primary })
+foreach ($screen in $screens) { $script:forms += New-ChooserForm $screen }
+$main = $script:forms[$script:forms.Count - 1]
+foreach ($f in $script:forms) { if ($f -ne $main) { $f.Show() } }
+$main.Add_Shown({ $this.Activate() })
+[System.Windows.Forms.Application]::Run($main)
 if ($script:result) {
     Write-Output $script:result
 }

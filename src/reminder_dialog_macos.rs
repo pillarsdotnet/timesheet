@@ -4,6 +4,7 @@
 //! Native macOS reminder dialog using a custom NSPanel with vertical NSStackView of buttons.
 //! Used when the daemon spawns `ts --reminder-dialog choice1 choice2 ...` via launchctl asuser.
 //! Custom panel guarantees vertical layout regardless of choice count (NSAlert switches to horizontal).
+//! One panel opens on every connected display; a choice on any of them dismisses them all.
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, ProtocolObject};
@@ -12,7 +13,8 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
     NSBackingStoreType, NSButton, NSEvent, NSEventModifierFlags, NSImage, NSPanel, NSScreen,
     NSScrollView, NSStackView, NSStackViewDistribution, NSTextField,
-    NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowCollectionBehavior,
+    NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -322,6 +324,149 @@ fn run_native_enter_activity_dialog(mtm: MainThreadMarker, app: &NSApplication) 
     }
 }
 
+/// Build one full-screen chooser panel covering `screen_frame`. Every panel shares the same button
+/// handler and window delegate, so a choice made on any screen ends the one modal session.
+fn build_chooser_panel(
+    mtm: MainThreadMarker,
+    screen_frame: NSRect,
+    choices: &[String],
+    handler: &TSReminderButtonHandler,
+    panel_delegate: &TSReminderPanelDelegate,
+) -> Retained<NSPanel> {
+    let sel_choice_clicked = objc2::sel!(choiceClicked:);
+    let style = NSWindowStyleMask::Titled; // No Closable: only button-clicks dismiss
+    let panel_alloc = NSPanel::alloc(mtm);
+    let panel: Retained<NSPanel> = NSPanel::initWithContentRect_styleMask_backing_defer(
+        panel_alloc,
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, 400.0)),
+        style,
+        NSBackingStoreType::Buffered,
+        false,
+    );
+    panel.setFrame_display(screen_frame, true);
+    panel.setTitle(&NSString::from_str("What are you working on?"));
+    unsafe { panel.setReleasedWhenClosed(false) };
+    panel.setDelegate(Some(ProtocolObject::from_ref(panel_delegate)));
+
+    // Content view: fill panel content area (resize with window).
+    // TSReminderContentView swallows keystrokes; only mouse and scroll work.
+    let content_rect = panel.contentRectForFrameRect(screen_frame);
+    let content_alloc = TSReminderContentView::alloc(mtm);
+    let content: Retained<TSReminderContentView> =
+        unsafe { msg_send![content_alloc, initWithFrame: content_rect] };
+    content.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable
+            | NSAutoresizingMaskOptions::ViewHeightSizable
+            | NSAutoresizingMaskOptions::ViewMinXMargin
+            | NSAutoresizingMaskOptions::ViewMaxXMargin
+            | NSAutoresizingMaskOptions::ViewMinYMargin
+            | NSAutoresizingMaskOptions::ViewMaxYMargin,
+    );
+    panel.setContentView(Some(&content));
+    panel.setInitialFirstResponder(Some(content.as_ref() as &NSView));
+
+    // Grid of per-column vertical stacks instead of one column with vertical
+    // scroll: with the panel full-screen, splitting into as many columns as fit
+    // the available height uses the space instead of forcing a scrollbar. Filled
+    // column-major (top-to-bottom, then next column) so the first choice
+    // ("Stop Work") lands top of the leftmost column and the last ("Enter new
+    // activity...") lands bottom of the rightmost column.
+    let button_width: f64 = 280.0;
+    let button_height: f64 = 32.0;
+    let col_spacing: f64 = 24.0;
+
+    let scroll_width = content_rect.size.width - 40.0;
+    let scroll_height = content_rect.size.height - 40.0;
+
+    let n = choices.len();
+    let max_rows = ((scroll_height / button_height).floor() as usize).max(1);
+    let columns = ((n + max_rows - 1) / max_rows).max(1);
+    let rows_per_col = (n + columns - 1) / columns;
+
+    let overall_width =
+        columns as f64 * button_width + (columns.saturating_sub(1)) as f64 * col_spacing;
+    let overall_height = (rows_per_col as f64 * button_height).max(160.0);
+    let doc_width = scroll_width.max(overall_width);
+    let doc_height = scroll_height.max(overall_height);
+    let grid_origin_x = (doc_width - overall_width) / 2.0;
+
+    let container_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(doc_width, doc_height));
+    let container_alloc = NSView::alloc(mtm);
+    let container: Retained<NSView> =
+        unsafe { msg_send![container_alloc, initWithFrame: container_frame] };
+
+    let mut idx = 0usize;
+    for col in 0..columns {
+        let count_in_col = rows_per_col.min(n - idx);
+        let col_height = (count_in_col as f64 * button_height).max(160.0);
+        let col_frame = NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(button_width, col_height),
+        );
+        let col_stack_alloc = NSStackView::alloc(mtm);
+        let col_stack: Retained<NSStackView> =
+            unsafe { msg_send![col_stack_alloc, initWithFrame: col_frame] };
+        col_stack.setOrientation(NS_USER_INTERFACE_LAYOUT_ORIENTATION_VERTICAL);
+        col_stack.setSpacing(8.0);
+        col_stack.setDistribution(NSStackViewDistribution::FillEqually);
+
+        for choice in &choices[idx..idx + count_in_col] {
+            let btn = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str(choice),
+                    Some(handler.as_ref() as &AnyObject),
+                    Some(sel_choice_clicked),
+                    mtm,
+                )
+            };
+            col_stack.addArrangedSubview(&btn);
+        }
+
+        col_stack.setFrame(NSRect::new(
+            NSPoint::new(
+                grid_origin_x + col as f64 * (button_width + col_spacing),
+                doc_height - col_height,
+            ),
+            NSSize::new(button_width, col_height),
+        ));
+        container.addSubview(&col_stack);
+        idx += count_in_col;
+    }
+
+    // Scroll view: fill content (with insets for padding). Both scrollers stay
+    // available as a fallback for pathological choice counts, though the column
+    // math above normally makes the grid fit without scrolling.
+    let scroll_frame = NSRect::new(
+        NSPoint::new(20.0, 20.0),
+        NSSize::new(scroll_width, scroll_height),
+    );
+    let scroll_alloc = NSScrollView::alloc(mtm);
+    let scroll: Retained<NSScrollView> =
+        unsafe { msg_send![scroll_alloc, initWithFrame: scroll_frame] };
+    scroll.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable
+            | NSAutoresizingMaskOptions::ViewHeightSizable
+            | NSAutoresizingMaskOptions::ViewMinXMargin
+            | NSAutoresizingMaskOptions::ViewMaxXMargin
+            | NSAutoresizingMaskOptions::ViewMinYMargin
+            | NSAutoresizingMaskOptions::ViewMaxYMargin,
+    );
+    scroll.setDocumentView(Some(&container));
+    scroll.setHasVerticalScroller(true);
+    scroll.setHasHorizontalScroller(true);
+    scroll.setAutohidesScrollers(true);
+    content.addSubview(&scroll);
+    // Buttons on every panel must take clicks while the modal session runs on the first one, and
+    // each panel must also show over a full-screen app (a remote desktop in its own Space, say) on
+    // its display rather than staying behind on the desktop Space.
+    panel.setWorksWhenModal(true);
+    panel.setCollectionBehavior(
+        NSWindowCollectionBehavior::CanJoinAllSpaces
+            | NSWindowCollectionBehavior::FullScreenAuxiliary,
+    );
+    panel
+}
+
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
@@ -365,157 +510,61 @@ define_class!(
             let handler_alloc = TSReminderButtonHandler::alloc(mtm);
             let handler: Retained<TSReminderButtonHandler> =
                 unsafe { msg_send![handler_alloc, init] };
-            let sel_choice_clicked = objc2::sel!(choiceClicked:);
-
-            // Panel: full screen.
-            let screen_frame = NSScreen::mainScreen(mtm)
-                .map(|s| s.frame())
-                .unwrap_or_else(|| NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 600.0)));
-            let style = NSWindowStyleMask::Titled; // No Closable: only button-clicks dismiss
-            let panel_alloc = NSPanel::alloc(mtm);
-            let panel: Retained<NSPanel> = NSPanel::initWithContentRect_styleMask_backing_defer(
-                panel_alloc,
-                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, 400.0)),
-                style,
-                NSBackingStoreType::Buffered,
-                false,
-            );
-            panel.setFrame_display(screen_frame, true);
-            panel.setTitle(&NSString::from_str("What are you working on?"));
-            unsafe { panel.setReleasedWhenClosed(false) };
             let panel_delegate_alloc = TSReminderPanelDelegate::alloc(mtm);
             let panel_delegate: Retained<TSReminderPanelDelegate> =
                 unsafe { msg_send![panel_delegate_alloc, init] };
-            panel.setDelegate(Some(ProtocolObject::from_ref(&*panel_delegate)));
 
-            // Content view: fill panel content area (resize with window).
-            // TSReminderContentView swallows keystrokes; only mouse and scroll work.
-            let content_rect = panel.contentRectForFrameRect(screen_frame);
-            let content_alloc = TSReminderContentView::alloc(mtm);
-            let content: Retained<TSReminderContentView> =
-                unsafe { msg_send![content_alloc, initWithFrame: content_rect] };
-            content.setAutoresizingMask(
-                NSAutoresizingMaskOptions::ViewWidthSizable
-                    | NSAutoresizingMaskOptions::ViewHeightSizable
-                    | NSAutoresizingMaskOptions::ViewMinXMargin
-                    | NSAutoresizingMaskOptions::ViewMaxXMargin
-                    | NSAutoresizingMaskOptions::ViewMinYMargin
-                    | NSAutoresizingMaskOptions::ViewMaxYMargin,
-            );
-            panel.setContentView(Some(&content));
-            panel.setInitialFirstResponder(Some(content.as_ref() as &NSView));
-
-            // Grid of per-column vertical stacks instead of one column with vertical
-            // scroll: with the panel full-screen, splitting into as many columns as fit
-            // the available height uses the space instead of forcing a scrollbar. Filled
-            // column-major (top-to-bottom, then next column) so the first choice
-            // ("Stop Work") lands top of the leftmost column and the last ("Enter new
-            // activity...") lands bottom of the rightmost column.
-            let button_width: f64 = 280.0;
-            let button_height: f64 = 32.0;
-            let col_spacing: f64 = 24.0;
-
-            let scroll_width = content_rect.size.width - 40.0;
-            let scroll_height = content_rect.size.height - 40.0;
-
-            let n = choices.len();
-            let max_rows = ((scroll_height / button_height).floor() as usize).max(1);
-            let columns = ((n + max_rows - 1) / max_rows).max(1);
-            let rows_per_col = (n + columns - 1) / columns;
-
-            let overall_width =
-                columns as f64 * button_width + (columns.saturating_sub(1)) as f64 * col_spacing;
-            let overall_height = (rows_per_col as f64 * button_height).max(160.0);
-            let doc_width = scroll_width.max(overall_width);
-            let doc_height = scroll_height.max(overall_height);
-            let grid_origin_x = (doc_width - overall_width) / 2.0;
-
-            let container_frame =
-                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(doc_width, doc_height));
-            let container_alloc = NSView::alloc(mtm);
-            let container: Retained<NSView> =
-                unsafe { msg_send![container_alloc, initWithFrame: container_frame] };
-
-            let mut idx = 0usize;
-            for col in 0..columns {
-                let count_in_col = rows_per_col.min(n - idx);
-                let col_height = (count_in_col as f64 * button_height).max(160.0);
-                let col_frame = NSRect::new(
-                    NSPoint::new(0.0, 0.0),
-                    NSSize::new(button_width, col_height),
-                );
-                let col_stack_alloc = NSStackView::alloc(mtm);
-                let col_stack: Retained<NSStackView> =
-                    unsafe { msg_send![col_stack_alloc, initWithFrame: col_frame] };
-                col_stack.setOrientation(NS_USER_INTERFACE_LAYOUT_ORIENTATION_VERTICAL);
-                col_stack.setSpacing(8.0);
-                col_stack.setDistribution(NSStackViewDistribution::FillEqually);
-
-                for choice in &choices[idx..idx + count_in_col] {
-                    let btn = unsafe {
-                        NSButton::buttonWithTitle_target_action(
-                            &NSString::from_str(choice),
-                            Some(handler.as_ref() as &AnyObject),
-                            Some(sel_choice_clicked),
-                            mtm,
-                        )
-                    };
-                    col_stack.addArrangedSubview(&btn);
+            // One full-screen panel per connected display, so the prompt is seen whichever
+            // display you are looking at. The main screen's panel comes first and hosts the modal
+            // session; the others take clicks through worksWhenModal.
+            let main_frame = NSScreen::mainScreen(mtm).map(|s| s.frame());
+            let mut frames: Vec<NSRect> =
+                NSScreen::screens(mtm).iter().map(|s| s.frame()).collect();
+            if let Some(main) = main_frame {
+                if let Some(pos) = frames.iter().position(|f| *f == main) {
+                    frames.swap(0, pos);
                 }
-
-                col_stack.setFrame(NSRect::new(
-                    NSPoint::new(
-                        grid_origin_x + col as f64 * (button_width + col_spacing),
-                        doc_height - col_height,
-                    ),
-                    NSSize::new(button_width, col_height),
-                ));
-                container.addSubview(&col_stack);
-                idx += count_in_col;
             }
-
-            // Scroll view: fill content (with insets for padding). Both scrollers stay
-            // available as a fallback for pathological choice counts, though the column
-            // math above normally makes the grid fit without scrolling.
-            let scroll_frame = NSRect::new(
-                NSPoint::new(20.0, 20.0),
-                NSSize::new(scroll_width, scroll_height),
-            );
-            let scroll_alloc = NSScrollView::alloc(mtm);
-            let scroll: Retained<NSScrollView> =
-                unsafe { msg_send![scroll_alloc, initWithFrame: scroll_frame] };
-            scroll.setAutoresizingMask(
-                NSAutoresizingMaskOptions::ViewWidthSizable
-                    | NSAutoresizingMaskOptions::ViewHeightSizable
-                    | NSAutoresizingMaskOptions::ViewMinXMargin
-                    | NSAutoresizingMaskOptions::ViewMaxXMargin
-                    | NSAutoresizingMaskOptions::ViewMinYMargin
-                    | NSAutoresizingMaskOptions::ViewMaxYMargin,
-            );
-            scroll.setDocumentView(Some(&container));
-            scroll.setHasVerticalScroller(true);
-            scroll.setHasHorizontalScroller(true);
-            scroll.setAutohidesScrollers(true);
-            content.addSubview(&scroll);
-            panel.orderFrontRegardless();
+            if frames.is_empty() {
+                frames.push(main_frame.unwrap_or_else(|| {
+                    NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 600.0))
+                }));
+            }
+            let panels: Vec<Retained<NSPanel>> = frames
+                .iter()
+                .map(|&frame| build_chooser_panel(mtm, frame, choices, &handler, &panel_delegate))
+                .collect();
+            let show_all = || {
+                for panel in &panels {
+                    panel.orderFrontRegardless();
+                }
+            };
+            let hide_all = || {
+                for panel in &panels {
+                    let _: () = unsafe { msg_send![&**panel, orderOut: None::<&AnyObject>] };
+                }
+            };
+            show_all();
 
             // Re-show if dismissed without a button choice (e.g. process killed).
             loop {
                 DIALOG_RESULT.with(|r| *r.borrow_mut() = None);
-                let _ = app.runModalForWindow(&panel);
+                let _ = app.runModalForWindow(&panels[0]);
                 match DIALOG_RESULT.with(|r| r.borrow().clone()) {
                     Some(selected) if selected == "Enter new activity..." => {
-                        let _: () = unsafe { msg_send![&panel, orderOut: None::<&AnyObject>] };
+                        hide_all();
                         if let Some(activity) = run_native_enter_activity_dialog(mtm, &app) {
                             DIALOG_RESULT.with(|r| *r.borrow_mut() = Some(activity));
                             break;
                         }
-                        panel.orderFrontRegardless();
+                        show_all();
                     }
                     Some(_) => break,
-                    None => panel.orderFrontRegardless(),
+                    None => show_all(),
                 }
             }
+            // A choice on any display dismisses the prompt on all of them.
+            hide_all();
 
             app.setActivationPolicy(NSApplicationActivationPolicy::Prohibited);
             let _: () = unsafe { msg_send![&app, stop: None::<&AnyObject>] };
