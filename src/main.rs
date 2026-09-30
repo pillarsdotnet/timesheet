@@ -3185,7 +3185,7 @@ and
 .B reminder
 are aliases for
 .BR interval .
-Reminder daemon behavior: if a prompt goes unanswered for one reminder interval, records a STOP timestamped at the moment the prompt appeared, not when the interval expired. That timestamp is used exactly, without the one-interval cap, because the prompt appears one reminder interval after the previous entry and so already marks the last time you were known to be working. The prompt is then left on screen rather than dismissed (macOS also brings it back to the front of the window stack): choosing an activity when you return records a START at the return time, so the stretch away from the desk falls between the two entries and goes unbilled while your return is logged accurately. No second STOP is added while work is already stopped, so an unattended screen records one STOP rather than one per interval. The reminder window covers the full screen and stays on top on macOS, Linux, and Windows, so it cannot be hidden by accident by a mouse action in progress when it appears. With several monitors it opens on every screen at once, so it is seen whichever screen you are working on, even beside a full-screen remote desktop that raises itself above everything on the next click; choosing on any screen dismisses it on all of them. (The kdialog/zenity fallback on Linux is a single ordinary dialog.) Dismissed without choice (close, Escape) re-shows immediately. The "Enter new activity" dialog has no timeout; blank/cancelled re-shows the reminder. At logout/shutdown the open session is stopped: on macOS the daemon itself records STOP when launchd sends it SIGTERM (capped to one reminder interval after the latest entry); on Linux the systemd session unit's ExecStop runs "timesheet stop" instead, and the daemon stays silent on SIGTERM (systemd may signal it during ordinary teardown, so writing a STOP there would be spurious). Every other automatic STOP is capped to one reminder interval (default 5 minutes) after the latest entry, so forgetting to stop never records work all night.
+Reminder daemon behavior: if a prompt goes unanswered for one reminder interval, records a STOP timestamped at the moment the prompt appeared, not when the interval expired. That timestamp is used exactly, without the one-interval cap, because the prompt appears one reminder interval after the previous entry and so already marks the last time you were known to be working. The prompt is then left on screen rather than dismissed, and every reminder interval after it first appears it is brought back to the front of the window stack, covering any window raised over it since, so an unanswered prompt cannot stay hidden while you carry on working (on Linux under Wayland each window is briefly hidden and re-shown to achieve this; an open "Enter new activity" box is brought forward instead of being covered): choosing an activity when you return records a START at the return time, so the stretch away from the desk falls between the two entries and goes unbilled while your return is logged accurately. No second STOP is added while work is already stopped, so an unattended screen records one STOP rather than one per interval. The reminder window covers the full screen and stays on top on macOS, Linux, and Windows, so it cannot be hidden by accident by a mouse action in progress when it appears. With several monitors it opens on every screen at once, so it is seen whichever screen you are working on, even beside a full-screen remote desktop that raises itself above everything on the next click; choosing on any screen dismisses it on all of them. (The kdialog/zenity fallback on Linux is a single ordinary dialog and is not brought back to the front.) Dismissed without choice (close, Escape) re-shows immediately. The "Enter new activity" dialog has no timeout; blank/cancelled re-shows the reminder. At logout/shutdown the open session is stopped: on macOS the daemon itself records STOP when launchd sends it SIGTERM (capped to one reminder interval after the latest entry); on Linux the systemd session unit's ExecStop runs "timesheet stop" instead, and the daemon stays silent on SIGTERM (systemd may signal it during ordinary teardown, so writing a STOP there would be spurious). Every other automatic STOP is capped to one reminder interval (default 5 minutes) after the latest entry, so forgetting to stop never records work all night.
 .TP
 .B list
 Plaintext report: percentage of time per activity (high to low), and hours per day of week (Sun\-Sat).
@@ -5717,6 +5717,9 @@ def build_window(screen):
     lay.addStretch(1)
     lay.addLayout(row)
     lay.addStretch(1)
+    present(w, screen)
+    windows[screen] = (w, lists)
+def present(w, screen):
     # Pin the window to its screen before showing it. Wayland ignores client-chosen positions, but
     # it honors the output a full-screen request names, which Qt takes from the window's screen.
     if screen is not None:
@@ -5731,7 +5734,21 @@ def build_window(screen):
         w.activateWindow()
     except Exception:
         pass
-    windows[screen] = (w, lists)
+def resurface():
+    # Another window brought forward hides the prompt without answering it, and it is easy to go
+    # back to work without noticing. Put every window back on top. Wayland gives a client no way to
+    # raise a window that is already mapped, so each one is hidden and shown again, which the
+    # compositor stacks like a newly opened window.
+    modal = app.activeModalWidget()
+    if modal is not None:
+        # The "Enter activity" box is open: bring that forward rather than covering it.
+        modal.raise_()
+        modal.activateWindow()
+        return
+    for screen in sorted(windows, key=lambda s: s == primary):
+        w = windows[screen][0]
+        w.hide()
+        present(w, screen)
 def on_screen_added(screen):
     if screen not in windows:
         build_window(screen)
@@ -5746,6 +5763,13 @@ for screen in sorted(app.screens() or [primary], key=lambda s: s == primary):
     build_window(screen)
 app.screenAdded.connect(on_screen_added)
 app.screenRemoved.connect(on_screen_removed)
+# Hiding the only window for a moment must not end the prompt; closeEvent dismisses it instead.
+app.setQuitOnLastWindowClosed(False)
+resurface_ms = int(os.environ.get("TS_CHOOSER_RESURFACE_MS") or 0)
+if resurface_ms > 0:
+    resurface_timer = QTimer()
+    resurface_timer.timeout.connect(resurface)
+    resurface_timer.start(resurface_ms)
 autopick = os.environ.get("TS_CHOOSER_AUTOPICK")
 if autopick is not None:
     ai = int(autopick)
@@ -5772,11 +5796,14 @@ fn show_reminder_prompt_pyqt(
     if !command_on_path("python3") {
         return None;
     }
+    let interval = Duration::from_secs(get_reminder_interval_secs());
     let mut cmd = Command::new("python3");
     cmd.arg("-c").arg(REMINDER_CHOOSER_PY);
     for c in choices {
         cmd.arg(c);
     }
+    // Every reminder interval the chooser puts itself back in front of whatever has covered it.
+    cmd.env("TS_CHOOSER_RESURFACE_MS", interval.as_millis().to_string());
     linux_with_display(&mut cmd);
     let mut child = cmd
         .stdin(Stdio::null())
@@ -5789,7 +5816,6 @@ fn show_reminder_prompt_pyqt(
     // interval passes unanswered, record the STOP at `reminder_appeared` but leave the window up:
     // whenever you get back and pick an activity, that START lands at your return time and the
     // interval you were away is left unbilled.
-    let interval = Duration::from_secs(get_reminder_interval_secs());
     let start = std::time::Instant::now();
     let mut appended_stop = false;
     loop {
@@ -6019,7 +6045,9 @@ function Prompt-NewActivity {
     $dlg.Controls.AddRange(@($lbl, $txt, $ok, $cancel))
     $dlg.AcceptButton = $ok
     $dlg.CancelButton = $cancel
+    $script:entryDialog = $dlg
     $r = $dlg.ShowDialog()
+    $script:entryDialog = $null
     if ($r -eq [System.Windows.Forms.DialogResult]::OK -and $txt.Text.Trim().Length -gt 0) {
         return $txt.Text.Trim()
     }
@@ -6132,7 +6160,34 @@ foreach ($screen in $screens) { $script:forms += New-ChooserForm $screen }
 $main = $script:forms[$script:forms.Count - 1]
 foreach ($f in $script:forms) { if ($f -ne $main) { $f.Show() } }
 $main.Add_Shown({ $this.Activate() })
+
+# Another window brought forward hides the prompt without answering it, and it is easy to go back
+# to work without noticing. Every {RESURFACE_MS} ms, put every form back on top: dropping and
+# restoring TopMost re-inserts a form at the head of the topmost band, above any other topmost
+# window that has since covered it.
+$script:entryDialog = $null
+$resurface = New-Object System.Windows.Forms.Timer
+$resurface.Interval = {RESURFACE_MS}
+$resurface.Add_Tick({
+    if ($script:closing) { return }
+    if ($script:entryDialog -ne $null) {
+        # The "Enter activity" box is open: bring that forward rather than covering it.
+        $script:entryDialog.TopMost = $false
+        $script:entryDialog.TopMost = $true
+        $script:entryDialog.Activate()
+        return
+    }
+    foreach ($f in $script:forms) {
+        if ($f.IsDisposed) { continue }
+        $f.TopMost = $false
+        $f.TopMost = $true
+        $f.BringToFront()
+    }
+    $main.Activate()
+})
+$resurface.Start()
 [System.Windows.Forms.Application]::Run($main)
+$resurface.Stop()
 if ($script:result) {
     Write-Output $script:result
 }
@@ -6148,7 +6203,13 @@ fn show_reminder_prompt_windows(activities: &[String], timesheet: Option<&Path>)
         .map(|c| format!("'{}'", ps_quote(c)))
         .collect::<Vec<_>>()
         .join(", ");
-    let script = REMINDER_CHOOSER_PS1.replace("{CHOICES}", &choices_literal);
+    let interval = Duration::from_secs(get_reminder_interval_secs());
+    // Every reminder interval the chooser puts itself back in front of whatever has covered it.
+    // WinForms timers take a positive Int32 of milliseconds.
+    let resurface_ms = interval.as_millis().clamp(1, i32::MAX as u128);
+    let script = REMINDER_CHOOSER_PS1
+        .replace("{CHOICES}", &choices_literal)
+        .replace("{RESURFACE_MS}", &resurface_ms.to_string());
     let encoded = encode_powershell_command(&script);
 
     let mut cmd = Command::new("powershell");
@@ -6174,7 +6235,6 @@ fn show_reminder_prompt_windows(activities: &[String], timesheet: Option<&Path>)
 
     // Same leave-it-on-screen-and-record-STOP-once behavior as the Linux dialog: wait indefinitely,
     // recording the STOP once one reminder interval passes unanswered.
-    let interval = Duration::from_secs(get_reminder_interval_secs());
     let mut child = child;
     let mut appended_stop = false;
     let stdout = loop {
