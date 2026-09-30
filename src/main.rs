@@ -199,14 +199,24 @@ fn timesheet_path() -> PathBuf {
 
 /// Path for the reminder daemon PID file (under $HOME/.cache, $XDG_CACHE_HOME, or the
 /// platform cache directory, e.g. `%LOCALAPPDATA%` on Windows).
+///
+/// Under `cargo test` this resolves to a per-process directory instead -- see
+/// [`test_cache_dir`].
 fn reminder_pid_path() -> PathBuf {
-    let cache = env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .or_else(dirs::cache_dir);
-    cache
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("ts-reminder.pid")
+    #[cfg(test)]
+    {
+        test_cache_dir().join("ts-reminder.pid")
+    }
+    #[cfg(not(test))]
+    {
+        let cache = env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+            .or_else(dirs::cache_dir);
+        cache
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("ts-reminder.pid")
+    }
 }
 
 /// Atomically claim sole ownership of the reminder daemon by creating the PID file with O_EXCL.
@@ -485,6 +495,27 @@ fn test_config_path() -> PathBuf {
             path
         })
         .clone()
+}
+
+/// The cache directory -- reminder PID file and interval -- the test suite runs against, under
+/// `target/tmp/` and never the developer's own.
+///
+/// Tests drive `cmd_start` and `cmd_stop` against a temporary log, and both stop and restart the
+/// reminder daemon. Against the real PID file that killed the developer's live daemon on every
+/// `cargo test`, the pre-commit hook included, silently ending their reminders mid-session.
+#[cfg(test)]
+fn test_cache_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        // Per-process so concurrent `cargo test` runs cannot signal each other's daemons.
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("tmp")
+            .join(format!("test-cache-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create test cache dir");
+        dir
+    })
+    .clone()
 }
 
 /// Parses the supported YAML subset: `key: value` pairs, `#` comments, optional quotes, and one
