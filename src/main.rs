@@ -58,7 +58,7 @@
 //! | `rename`   | Same as `alias`. |
 //! | `restart`, `reminder` | Aliases for `interval`. |
 //! | `rotate`   | Rename log to `timesheet.YYMMDD`; add STOP first if last entry is START; append if same-day exists. |
-//! | `start`    | Record work start now; with no activity, shows reminder chooser to pick/enter (macOS via AppKit; Linux via PyQt single-click chooser, falling back to kdialog/zenity; Windows via PowerShell/WinForms); otherwise optional activity (default: misc/unspecified); adds a STOP first only when the open session is over one reminder interval old (otherwise the START closes it by itself); starts/restarts reminder daemon. |
+//! | `start`    | Record work start now; with no activity, shows reminder chooser to pick/enter (macOS via AppKit; Linux via PyQt single-click chooser, falling back to kdialog/zenity; Windows via PowerShell/WinForms); otherwise optional activity (default: misc/unspecified); adds a STOP first only when the open session is over one reminder interval old (otherwise the START closes it by itself); starts/restarts reminder daemon; on Linux, rewrites stale `autostart` systemd units first. |
 //! | `started`  | Record a past start time; inserts at the correct chronological position without discarding entries. |
 //! | `stop`     | Record work stop (optional time); amends previous STOP if work already stopped; always stops the reminder daemon and closes any prompt it has on screen, and shows the "stopped" dialog (skipped during logout/shutdown). |
 //! | `timeoff`  | Show stop time for 8 h/day average; only requires a START entry (adds one if log empty or last is STOP). |
@@ -1296,6 +1296,9 @@ fn cmd_start(args: &[String], timesheet: &Path) -> Result<(), String> {
         // hide the stale open session.
         reconcile_stale_open_session(timesheet, startup_now);
     }
+    // After the shutdown guard, so a re-fire during shutdown never touches the units.
+    #[cfg(all(target_os = "linux", not(test)))]
+    refresh_stale_autostart_units_linux();
     maybe_rotate_if_previous_week(timesheet)?;
     // Will we block on an interactive chooser below (no activity given and a GUI chooser is available)?
     #[cfg(not(test))]
@@ -3453,6 +3456,16 @@ start/stop pairs match in LIFO order, so a STOP at the same instant as the START
 A STOP is added only when the open START is more than one reminder interval old, in which case it
 is capped to one interval after that entry, leaving the time you were away unbilled.
 Starts or restarts the reminder daemon (resets the timer).
+On Linux, if
+.B autostart
+has been installed and its systemd user units differ from what the current
+.B autostart
+would write (e.g. a session unit left by an older version that runs no session daemon and so
+never notices an unlock), rewrites them, reloads systemd and re-enables them. This happens only
+when the running binary is the one the units launch, so a development build never repoints them
+at itself. A session unit that is running is not restarted, since stopping it runs
+.BR "timesheet stop" ;
+its new definition takes effect at the next login.
 .TP
 .B started
 Record a work start at a
@@ -4266,19 +4279,10 @@ fn linux_user_units_dir() -> Result<PathBuf, String> {
     Ok(config.join("systemd/user"))
 }
 
+/// The start and session units `timesheet autostart` installs, launching the binary at `exe_path`.
+/// `timesheet start` also compares the installed units against these to find stale ones.
 #[cfg(target_os = "linux")]
-fn do_autostart_install_linux() -> Result<(), String> {
-    let exe = env::current_exe().map_err(|e| e.to_string())?;
-    let exe_path = exe.to_string_lossy();
-    let user_units = linux_user_units_dir()?;
-    fs::create_dir_all(&user_units).map_err(|e| {
-        format!(
-            "timesheet autostart: cannot create {}: {}",
-            user_units.display(),
-            e
-        )
-    })?;
-
+fn linux_autostart_units(exe_path: &str) -> (String, String) {
     // RemainAfterExit keeps the unit active after `timesheet start` exits so systemd does not tear down
     // its control group -- otherwise the reminder daemon `timesheet start` spawns (which lives in this
     // unit's cgroup; setsid only changes the process group, not the cgroup) would be killed the
@@ -4320,7 +4324,23 @@ WantedBy=default.target
 "#,
         exe_path
     );
+    (start_unit, session_unit)
+}
 
+#[cfg(target_os = "linux")]
+fn do_autostart_install_linux() -> Result<(), String> {
+    let exe = env::current_exe().map_err(|e| e.to_string())?;
+    let exe_path = exe.to_string_lossy();
+    let user_units = linux_user_units_dir()?;
+    fs::create_dir_all(&user_units).map_err(|e| {
+        format!(
+            "timesheet autostart: cannot create {}: {}",
+            user_units.display(),
+            e
+        )
+    })?;
+
+    let (start_unit, session_unit) = linux_autostart_units(&exe_path);
     let start_path = user_units.join("ts-autostart-start.service");
     let session_path = user_units.join("ts-autostart-session.service");
     fs::write(&start_path, &start_unit)
@@ -4376,6 +4396,96 @@ WantedBy=default.target
     install_linux_logout_hook(&exe_path)?;
     println!("  To remove: timesheet autostart uninstall");
     Ok(())
+}
+
+/// The binary an installed start unit launches: its `ExecStart=` line, minus the `start` argument.
+#[cfg(target_os = "linux")]
+fn linux_unit_start_binary(start_unit: &str) -> Option<&str> {
+    start_unit
+        .lines()
+        .find_map(|l| l.strip_prefix("ExecStart="))
+        .and_then(|cmd| cmd.strip_suffix(" start"))
+}
+
+/// Rewrite the autostart units when an older `timesheet autostart` left them different from what the
+/// current one writes -- e.g. a session unit that still runs `sleep infinity` instead of the
+/// session daemon, and so never notices a session unlock. Called by `timesheet start`.
+///
+/// Does nothing unless autostart was installed (the start unit exists), and nothing unless this
+/// process is the binary those units launch: a development build run from a source tree must not
+/// repoint the login units at itself. The units keep the path spelling they already use, so an
+/// install reached through a symlink is not rewritten just to change how its path is spelled.
+///
+/// A session unit that is running is left running. Restarting it would run its `ExecStop`, which is
+/// `timesheet stop`, and close the very session this `timesheet start` is opening; systemd starts it
+/// from the new definition at the next login instead. A session unit that is not running is
+/// started at once.
+#[cfg(all(target_os = "linux", not(test)))]
+fn refresh_stale_autostart_units_linux() {
+    let Ok(user_units) = linux_user_units_dir() else {
+        return;
+    };
+    let start_path = user_units.join("ts-autostart-start.service");
+    let session_path = user_units.join("ts-autostart-session.service");
+    let Ok(installed_start) = fs::read_to_string(&start_path) else {
+        return; // autostart was never installed
+    };
+    let installed_session = fs::read_to_string(&session_path).unwrap_or_default();
+    let Some(exe_path) = linux_unit_start_binary(&installed_start) else {
+        return;
+    };
+    let same_binary = match (
+        fs::canonicalize(exe_path),
+        env::current_exe().and_then(fs::canonicalize),
+    ) {
+        (Ok(theirs), Ok(ours)) => theirs == ours,
+        _ => false,
+    };
+    if !same_binary {
+        return;
+    }
+    let (start_unit, session_unit) = linux_autostart_units(exe_path);
+    if installed_start == start_unit && installed_session == session_unit {
+        return;
+    }
+    ts_debug("start: autostart units are stale; rewriting them");
+    if fs::write(&start_path, &start_unit).is_err()
+        || fs::write(&session_path, &session_unit).is_err()
+    {
+        eprintln!(
+            "timesheet: could not update the stale autostart units; run \"timesheet autostart\""
+        );
+        return;
+    }
+    let systemctl = |args: &[&str]| {
+        Command::new("systemctl")
+            .arg("--user")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    let session_running = systemctl(&["is-active", "--quiet", "ts-autostart-session.service"]);
+    let _ = systemctl(&["daemon-reload"]);
+    // Same disable-then-enable as `timesheet autostart`, to drop a link an older [Install] left.
+    let _ = systemctl(&["disable", "ts-autostart-start.service"]);
+    let _ = systemctl(&["enable", "ts-autostart-start.service"]);
+    if session_running {
+        let _ = systemctl(&["enable", "ts-autostart-session.service"]);
+        eprintln!(
+            "timesheet: updated the autostart units in {}; the session daemon starts at next login",
+            user_units.display()
+        );
+    } else {
+        let _ = systemctl(&["enable", "--now", "ts-autostart-session.service"]);
+        eprintln!(
+            "timesheet: updated the autostart units in {}",
+            user_units.display()
+        );
+    }
 }
 
 /// Name of the system-level logout-hook unit (keyed by uid so multiple users don't collide).
@@ -6782,6 +6892,39 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_linux_unit_start_binary_round_trips_generated_unit() {
+        let (start, _) = linux_autostart_units("/home/u/.local/bin/timesheet");
+        assert_eq!(
+            linux_unit_start_binary(&start),
+            Some("/home/u/.local/bin/timesheet")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_linux_autostart_units_detect_sleep_infinity_session_as_stale() {
+        // The session unit an older `timesheet autostart` wrote: no session daemon, so no unlock watch.
+        let old_session = "[Unit]\nDescription=timesheet stop on logout\n[Service]\nType=simple\n\
+            Environment=TS_LOGOUT=1\nExecStart=/bin/sleep infinity\n\
+            ExecStop=/x/timesheet stop\n[Install]\nWantedBy=default.target\n";
+        let (_, session) = linux_autostart_units("/x/timesheet");
+        assert_ne!(session, old_session);
+        assert!(session.contains("ExecStart=/x/timesheet --session-daemon\n"));
+        assert!(session.contains("ExecStop=/x/timesheet stop\n"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_linux_unit_start_binary_rejects_unit_without_start_command() {
+        assert_eq!(
+            linux_unit_start_binary("[Service]\nExecStart=/x/timesheet --session-daemon\n"),
+            None
+        );
+        assert_eq!(linux_unit_start_binary("[Service]\n"), None);
+    }
     use chrono::{TimeZone, Timelike};
 
     /// Helper: format epoch as RFC3339 for log file content (replaces format_epoch_iso8601 in tests).
