@@ -280,12 +280,56 @@ fn reminder_daemon_disowned() -> bool {
         && !owns_reminder_daemon(&reminder_pid_path())
 }
 
-/// Path for the reminder interval config file (seconds as decimal string; same dir as PID file).
+/// Path for the reminder interval file (seconds as a decimal string): `ts-reminder-interval` in the
+/// same directory as `timesheet.yml` (see [`user_config_dir`]).
+///
+/// It is a setting, so it lives with the settings. Older versions kept it beside the reminder PID
+/// file in the cache directory, which is meant to be disposable: clearing `~/.cache` silently reset
+/// the interval to the default. A file left there is moved here the first time the path is needed
+/// (see [`migrate_legacy_interval_file`]).
+///
+/// Under `cargo test` this resolves to the per-process test directory instead -- see
+/// [`test_cache_dir`].
 fn reminder_interval_path() -> PathBuf {
-    reminder_pid_path()
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("ts-reminder-interval")
+    #[cfg(test)]
+    {
+        test_cache_dir().join("ts-reminder-interval")
+    }
+    #[cfg(not(test))]
+    {
+        let path = user_config_dir().join("ts-reminder-interval");
+        let legacy = reminder_pid_path()
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("ts-reminder-interval");
+        migrate_legacy_interval_file(&legacy, &path);
+        path
+    }
+}
+
+/// Move an interval file an older version left at `legacy` (the cache directory) to `path`, unless
+/// `path` already holds one: an interval set since the move wins over the stale copy, which is then
+/// left alone. Falls back to copy-then-remove when the two directories are on different
+/// filesystems, removing the original only once the copy is in place.
+fn migrate_legacy_interval_file(legacy: &Path, path: &Path) {
+    if path.exists() || !legacy.exists() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if fs::rename(legacy, path).is_err() && fs::copy(legacy, path).is_ok() {
+        let _ = fs::remove_file(legacy);
+    }
+}
+
+/// Save the reminder interval, creating its directory if this is the first setting written there.
+fn write_reminder_interval(secs: u64) -> io::Result<()> {
+    let path = reminder_interval_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, secs.to_string())
 }
 
 /// Parse a duration string into seconds. E.g. "3", "3m" -> 180; "100s" -> 100; "1h30m" -> 5400.
@@ -447,11 +491,7 @@ fn config_path() -> PathBuf {
         if let Some(p) = env::var_os("TS_CONFIG") {
             return PathBuf::from(p);
         }
-        let dir = env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-            .or_else(dirs::config_dir)
-            .unwrap_or_else(|| PathBuf::from("."));
+        let dir = user_config_dir();
         let yml = dir.join("timesheet.yml");
         if !yml.exists() {
             let yaml = dir.join("timesheet.yaml");
@@ -461,6 +501,17 @@ fn config_path() -> PathBuf {
         }
         yml
     }
+}
+
+/// The user's configuration directory: `$XDG_CONFIG_HOME`, else `$HOME/.config`, else the platform
+/// config directory (e.g. `%APPDATA%` on Windows). Holds `timesheet.yml` and `ts-reminder-interval`.
+#[cfg_attr(test, allow(dead_code))]
+fn user_config_dir() -> PathBuf {
+    env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .or_else(dirs::config_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// The `timesheet.yml` the test suite runs against, generated once per test process under
@@ -3588,11 +3639,15 @@ sibling is used if no
 exists. Overridden by
 .BR $TS_CONFIG .
 .TP
-.B $XDG_CACHE_HOME/ts-reminder-interval
+.B $XDG_CONFIG_HOME/ts-reminder-interval
 or
-.B $HOME/.cache/ts-reminder-interval
+.B $HOME/.config/ts-reminder-interval
 Reminder interval in seconds (decimal). Used by the reminder daemon; set via
 .BR "timesheet interval" .
+Kept with the settings rather than in the cache directory, so clearing the cache does not reset
+it. Older versions kept it in
+.BR $XDG_CACHE_HOME " or " $HOME/.cache ;
+a file found there is moved here the first time it is needed.
 .TP
 .B "$HOME/Library/Application Support/ts/" (macOS)
 Autostart scripts: session script (stop on TERM), logout hook script (stop on logout/shutdown). The logout hook is registered with
@@ -3804,8 +3859,7 @@ fn cmd_autostart(args: &[String]) -> Result<(), String> {
         reconcile_stale_open_session(&timesheet_path(), Local::now());
         let interval_set = if let Some(interval_arg) = args.first() {
             if let Ok(secs) = parse_interval_duration(interval_arg) {
-                let path = reminder_interval_path();
-                if let Err(e) = fs::write(&path, secs.to_string()) {
+                if let Err(e) = write_reminder_interval(secs) {
                     eprintln!("timesheet autostart: could not set interval: {}", e);
                     false
                 } else {
@@ -4448,7 +4502,7 @@ fn linux_unit_start_binary(start_unit: &str) -> Option<&str> {
 /// install reached through a symlink is not rewritten just to change how its path is spelled.
 ///
 /// Writes the two unit files and nothing else. The reminder interval in particular is not part of
-/// either unit -- it lives in its own file beside the reminder PID file (see
+/// either unit -- it lives in its own file beside `timesheet.yml` (see
 /// [`reminder_interval_path`]) -- so an update that rewrites the units keeps whatever interval was
 /// configured instead of resetting it to the default.
 #[cfg(target_os = "linux")]
@@ -5123,11 +5177,7 @@ fn cmd_interval(args: &[String], timesheet: &Path) -> Result<(), String> {
     }
     let duration_str = args[0].as_str();
     let secs = parse_interval_duration(duration_str)?;
-    let path = reminder_interval_path();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    fs::write(&path, secs.to_string())
+    write_reminder_interval(secs)
         .map_err(|e| format!("timesheet interval: cannot write config: {}", e))?;
     kill_reminder_daemon_if_running();
     thread::sleep(Duration::from_millis(100));
@@ -7014,6 +7064,39 @@ mod tests {
         let exe = env::current_exe().unwrap();
         assert_eq!(rewrite_stale_autostart_units(units.path(), &exe), Ok(false));
         assert_eq!(fs::read_dir(units.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn test_migrate_legacy_interval_file_moves_cache_copy_to_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("cache").join("ts-reminder-interval");
+        let path = dir.path().join("config").join("ts-reminder-interval");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "600").unwrap();
+        migrate_legacy_interval_file(&legacy, &path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "600");
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn test_migrate_legacy_interval_file_keeps_interval_already_in_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy");
+        let path = dir.path().join("current");
+        fs::write(&legacy, "600").unwrap();
+        fs::write(&path, "120").unwrap();
+        migrate_legacy_interval_file(&legacy, &path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "120");
+        assert_eq!(fs::read_to_string(&legacy).unwrap(), "600");
+    }
+
+    #[test]
+    fn test_migrate_legacy_interval_file_without_legacy_file_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config").join("ts-reminder-interval");
+        migrate_legacy_interval_file(&dir.path().join("absent"), &path);
+        assert!(!path.exists());
+        assert!(!dir.path().join("config").exists());
     }
 
     #[cfg(target_os = "linux")]
