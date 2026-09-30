@@ -56,7 +56,7 @@
 //! | `manpage`  | Output Unix manual page in groff format to stdout. |
 //! | `rebuild`  | Build from local dir or clone; then install to current binary's directory. |
 //! | `rename`   | Same as `alias`. |
-//! | `restart`, `reminder` | Aliases for `interval`. |
+//! | `restart`, `reminder` | Aliases for `interval`; with no argument, `restart` also restarts a running daemon, where `interval` leaves it alone. |
 //! | `rotate`   | Rename log to `timesheet.YYMMDD`; add STOP first if last entry is START; append if same-day exists. |
 //! | `start`    | Record work start now; with no activity, shows reminder chooser to pick/enter (macOS via AppKit; Linux via PyQt single-click chooser, falling back to kdialog/zenity; Windows via PowerShell/WinForms); otherwise optional activity (default: misc/unspecified); adds a STOP first only when the open session is over one reminder interval old (otherwise the START closes it by itself); starts/restarts reminder daemon; on Linux, rewrites stale `autostart` systemd units first. |
 //! | `started`  | Record a past start time; inserts at the correct chronological position without discarding entries. |
@@ -3257,7 +3257,7 @@ binary (
 on Windows) from the directory containing the running executable.
 .TP
 .B interval
-Set or show the time between reminder daemon prompts. With no argument, print the current interval. With one argument, set the interval and restart the daemon.
+Set or show the time between reminder daemon prompts. With no argument, print the current interval and start the daemon if it is not running; a daemon already running is left alone, so its next prompt comes when it would have. With one argument, set the interval and restart the daemon.
 .I duration
 accepts: a bare number (treated as minutes, e.g.
 .BR 3 " or " 3m ),
@@ -3265,11 +3265,13 @@ seconds (e.g.
 .BR 100s ),
 or combined (e.g.
 .BR 1h30m ).
-.B restart
-and
 .B reminder
-are aliases for
-.BR interval .
+is an alias for
+.BR interval ,
+and so is
+.BR restart ,
+except that with no argument it also restarts a daemon that is already running, which resets
+its timer.
 Reminder daemon behavior: if a prompt goes unanswered for one reminder interval, records a STOP timestamped at the moment the prompt appeared, not when the interval expired. That timestamp is used exactly, without the one-interval cap, because the prompt appears one reminder interval after the previous entry and so already marks the last time you were known to be working. The prompt is then left on screen rather than dismissed, and every reminder interval after it first appears it is brought back to the front of the window stack, covering any window raised over it since, so an unanswered prompt cannot stay hidden while you carry on working (on Linux under Wayland each window is briefly hidden and re-shown to achieve this; an open "Enter new activity" box is brought forward instead of being covered): choosing an activity when you return records a START at the return time, so the stretch away from the desk falls between the two entries and goes unbilled while your return is logged accurately. No second STOP is added while work is already stopped, so an unattended screen records one STOP rather than one per interval. The reminder window covers the full screen and stays on top on macOS, Linux, and Windows, so it cannot be hidden by accident by a mouse action in progress when it appears. With several monitors it opens on every screen at once, so it is seen whichever screen you are working on, even beside a full-screen remote desktop that raises itself above everything on the next click; choosing on any screen dismisses it on all of them. (The kdialog/zenity fallback on Linux is a single ordinary dialog and is not brought back to the front.) Dismissed without choice (close, Escape) re-shows immediately. The "Enter new activity" dialog has no timeout; blank/cancelled re-shows the reminder. At logout/shutdown the open session is stopped: on macOS the daemon itself records STOP when launchd sends it SIGTERM (capped to one reminder interval after the latest entry); on Linux the systemd session unit's ExecStop runs "timesheet stop" instead, and the daemon stays silent on SIGTERM (systemd may signal it during ordinary teardown, so writing a STOP there would be spurious). Every other automatic STOP is capped to one reminder interval (default 5 minutes) after the latest entry, so forgetting to stop never records work all night.
 .TP
 .B list
@@ -3511,7 +3513,9 @@ Alias for
 .TP
 .B restart
 Alias for
-.BR interval .
+.BR interval ,
+except that with no argument it restarts a running daemon (resetting its timer) instead of
+leaving it alone.
 .TP
 .B rotate
 If the last entry is START (work in progress), appends a STOP no later than one reminder interval after that entry first.
@@ -5158,9 +5162,13 @@ fn unix_spawn_reminder_daemon(exe: &Path) {
     }
 }
 
-/// Set or show the reminder interval. With no arg: print current interval. With one arg: parse duration, save, restart daemon.
+/// Set or show the reminder interval. With one arg: parse duration, save, restart daemon.
 /// Duration examples: 3, 3m (minutes), 100s (seconds), 1h30m.
-fn cmd_interval(args: &[String], timesheet: &Path) -> Result<(), String> {
+///
+/// With no arg: print the current interval and make sure the daemon is running. A daemon already
+/// running is left alone -- restarting it would push its next prompt a whole interval later --
+/// unless `restart_running` is set, as it is for `timesheet restart`, whose name promises exactly that.
+fn cmd_interval(args: &[String], timesheet: &Path, restart_running: bool) -> Result<(), String> {
     if args.is_empty() {
         let secs = get_reminder_interval_secs();
         if secs >= 3600 && secs.is_multiple_of(3600) {
@@ -5170,8 +5178,10 @@ fn cmd_interval(args: &[String], timesheet: &Path) -> Result<(), String> {
         } else {
             println!("{}s", secs);
         }
-        kill_reminder_daemon_if_running();
-        thread::sleep(Duration::from_millis(100));
+        if restart_running {
+            kill_reminder_daemon_if_running();
+            thread::sleep(Duration::from_millis(100));
+        }
         start_reminder_daemon_if_needed(timesheet);
         return Ok(());
     }
@@ -6974,8 +6984,8 @@ fn main() {
         Some("migrate") => cmd_migrate(&timesheet),
         Some("pdf") => report::cmd_pdf(&rest, &timesheet),
         Some("email") => report::cmd_email(&rest, &timesheet),
-        Some("interval") => cmd_interval(&rest, &timesheet),
-        Some("restart") | Some("reminder") => cmd_interval(&rest, &timesheet),
+        Some("interval") | Some("reminder") => cmd_interval(&rest, &timesheet, false),
+        Some("restart") => cmd_interval(&rest, &timesheet, true),
         Some("autostart") => cmd_autostart(&rest),
         Some("manpage") => cmd_manpage(),
         Some("help") => cmd_help(),
