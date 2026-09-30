@@ -3492,7 +3492,8 @@ On Linux, if
 has been installed and its systemd user units differ from what the current
 .B autostart
 would write (e.g. a session unit left by an older version that runs no session daemon and so
-never notices an unlock), rewrites them, reloads systemd and re-enables them. This happens only
+never notices an unlock), rewrites them, reloads systemd and re-enables them. The reminder interval
+is not stored in the units, so rewriting them keeps a configured interval. This happens only
 when the running binary is the one the units launch, so a development build never repoints them
 at itself. A session unit that is running is not restarted, since stopping it runs
 .BR "timesheet stop" ;
@@ -4438,14 +4439,48 @@ fn linux_unit_start_binary(start_unit: &str) -> Option<&str> {
         .and_then(|cmd| cmd.strip_suffix(" start"))
 }
 
-/// Rewrite the autostart units when an older `timesheet autostart` left them different from what the
-/// current one writes -- e.g. a session unit that still runs `sleep infinity` instead of the
-/// session daemon, and so never notices a session unlock. Called by `timesheet start`.
+/// Rewrite the autostart units in `user_units` when an older `timesheet autostart` left them
+/// different from what the current one writes. Returns whether it rewrote them.
 ///
-/// Does nothing unless autostart was installed (the start unit exists), and nothing unless this
-/// process is the binary those units launch: a development build run from a source tree must not
-/// repoint the login units at itself. The units keep the path spelling they already use, so an
+/// Does nothing unless autostart was installed (the start unit exists), and nothing unless
+/// `current_exe` is the binary those units launch: a development build run from a source tree must
+/// not repoint the login units at itself. The units keep the path spelling they already use, so an
 /// install reached through a symlink is not rewritten just to change how its path is spelled.
+///
+/// Writes the two unit files and nothing else. The reminder interval in particular is not part of
+/// either unit -- it lives in its own file beside the reminder PID file (see
+/// [`reminder_interval_path`]) -- so an update that rewrites the units keeps whatever interval was
+/// configured instead of resetting it to the default.
+#[cfg(target_os = "linux")]
+fn rewrite_stale_autostart_units(user_units: &Path, current_exe: &Path) -> Result<bool, String> {
+    let start_path = user_units.join("ts-autostart-start.service");
+    let session_path = user_units.join("ts-autostart-session.service");
+    let Ok(installed_start) = fs::read_to_string(&start_path) else {
+        return Ok(false); // autostart was never installed
+    };
+    let installed_session = fs::read_to_string(&session_path).unwrap_or_default();
+    let Some(exe_path) = linux_unit_start_binary(&installed_start) else {
+        return Ok(false);
+    };
+    let same_binary = match (fs::canonicalize(exe_path), fs::canonicalize(current_exe)) {
+        (Ok(theirs), Ok(ours)) => theirs == ours,
+        _ => false,
+    };
+    if !same_binary {
+        return Ok(false);
+    }
+    let (start_unit, session_unit) = linux_autostart_units(exe_path);
+    if installed_start == start_unit && installed_session == session_unit {
+        return Ok(false);
+    }
+    fs::write(&start_path, &start_unit).map_err(|e| e.to_string())?;
+    fs::write(&session_path, &session_unit).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Bring stale autostart units up to date (see [`rewrite_stale_autostart_units`]) and have systemd
+/// pick them up. Called by `timesheet start`, e.g. a session unit that still runs `sleep infinity`
+/// instead of the session daemon, and so never notices a session unlock.
 ///
 /// A session unit that is running is left running. Restarting it would run its `ExecStop`, which is
 /// `timesheet stop`, and close the very session this `timesheet start` is opening; systemd starts it
@@ -4456,37 +4491,19 @@ fn refresh_stale_autostart_units_linux() {
     let Ok(user_units) = linux_user_units_dir() else {
         return;
     };
-    let start_path = user_units.join("ts-autostart-start.service");
-    let session_path = user_units.join("ts-autostart-session.service");
-    let Ok(installed_start) = fs::read_to_string(&start_path) else {
-        return; // autostart was never installed
-    };
-    let installed_session = fs::read_to_string(&session_path).unwrap_or_default();
-    let Some(exe_path) = linux_unit_start_binary(&installed_start) else {
+    let Ok(current_exe) = env::current_exe() else {
         return;
     };
-    let same_binary = match (
-        fs::canonicalize(exe_path),
-        env::current_exe().and_then(fs::canonicalize),
-    ) {
-        (Ok(theirs), Ok(ours)) => theirs == ours,
-        _ => false,
-    };
-    if !same_binary {
-        return;
-    }
-    let (start_unit, session_unit) = linux_autostart_units(exe_path);
-    if installed_start == start_unit && installed_session == session_unit {
-        return;
-    }
-    ts_debug("start: autostart units are stale; rewriting them");
-    if fs::write(&start_path, &start_unit).is_err()
-        || fs::write(&session_path, &session_unit).is_err()
-    {
-        eprintln!(
-            "timesheet: could not update the stale autostart units; run \"timesheet autostart\""
-        );
-        return;
+    match rewrite_stale_autostart_units(&user_units, &current_exe) {
+        Ok(true) => ts_debug("start: autostart units were stale; rewrote them"),
+        Ok(false) => return,
+        Err(e) => {
+            eprintln!(
+                "timesheet: could not update the stale autostart units ({}); run \"timesheet autostart\"",
+                e
+            );
+            return;
+        }
     }
     let systemctl = |args: &[&str]| {
         Command::new("systemctl")
@@ -6945,6 +6962,58 @@ mod tests {
         assert_ne!(session, old_session);
         assert!(session.contains("ExecStart=/x/timesheet --session-daemon\n"));
         assert!(session.contains("ExecStop=/x/timesheet stop\n"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_rewrite_stale_autostart_units_keeps_configured_interval() {
+        let units = tempfile::tempdir().unwrap();
+        let exe = env::current_exe().unwrap();
+        let exe_path = exe.to_string_lossy();
+        let start_path = units.path().join("ts-autostart-start.service");
+        let session_path = units.path().join("ts-autostart-session.service");
+        fs::write(
+            &start_path,
+            format!("[Service]\nExecStart={} start\n", exe_path),
+        )
+        .unwrap();
+        fs::write(&session_path, "[Service]\nExecStart=/bin/sleep infinity\n").unwrap();
+        // A configured interval, spelled so the suite's other tests still read the default 300 s
+        // from it while its exact bytes show whether anything rewrote the file.
+        let interval_path = reminder_interval_path();
+        fs::write(&interval_path, "0300").unwrap();
+
+        assert_eq!(rewrite_stale_autostart_units(units.path(), &exe), Ok(true));
+        let (start_unit, session_unit) = linux_autostart_units(&exe_path);
+        assert_eq!(fs::read_to_string(&start_path).unwrap(), start_unit);
+        assert_eq!(fs::read_to_string(&session_path).unwrap(), session_unit);
+        assert_eq!(fs::read_to_string(&interval_path).unwrap(), "0300");
+        assert_eq!(get_reminder_interval_secs(), 300);
+
+        // Current units are left alone.
+        assert_eq!(rewrite_stale_autostart_units(units.path(), &exe), Ok(false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_rewrite_stale_autostart_units_ignores_units_for_another_binary() {
+        let units = tempfile::tempdir().unwrap();
+        let start_path = units.path().join("ts-autostart-start.service");
+        let stale = "[Service]\nExecStart=/bin/true start\n";
+        fs::write(&start_path, stale).unwrap();
+        let exe = env::current_exe().unwrap();
+        assert_eq!(rewrite_stale_autostart_units(units.path(), &exe), Ok(false));
+        assert_eq!(fs::read_to_string(&start_path).unwrap(), stale);
+        assert!(!units.path().join("ts-autostart-session.service").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_rewrite_stale_autostart_units_ignores_missing_install() {
+        let units = tempfile::tempdir().unwrap();
+        let exe = env::current_exe().unwrap();
+        assert_eq!(rewrite_stale_autostart_units(units.path(), &exe), Ok(false));
+        assert_eq!(fs::read_dir(units.path()).unwrap().count(), 0);
     }
 
     #[cfg(target_os = "linux")]
