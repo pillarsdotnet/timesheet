@@ -1,4 +1,4 @@
-timesheet (0.1.0+git20260930.2c08782-1~ppa1) UNRELEASED; urgency=medium
+timesheet (0.1.0+git20261002.3ef90d1-1~ppa1) UNRELEASED; urgency=medium
 
   * Initial Debian packaging, for ppa:pillarsdotnet/ppa.
 
