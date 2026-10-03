@@ -347,3 +347,8 @@ cargo doc --no-deps --open
 Output is under `target/doc/timesheet/`.
 
 For command-line usage, run **`timesheet help`** or **`timesheet manpage`**.
+
+## License
+
+GNU General Public License, version 3 or (at your option) any later
+version; see [`LICENSE`](LICENSE).
