@@ -236,6 +236,24 @@ without a year means the current year.
 
 ## Install
 
+### From the Ubuntu PPA
+
+On Ubuntu 24.04 (`noble`), 26.04 (`resolute`) or 26.10 (`stonking`), install
+the Debian package from
+[`ppa:pillarsdotnet/ppa`](https://launchpad.net/~pillarsdotnet/+archive/ubuntu/ppa):
+
+```sh
+sudo add-apt-repository ppa:pillarsdotnet/ppa
+sudo apt install timesheet
+```
+
+It installs `/usr/bin/timesheet`, the man page, and the menu entry and icon
+for every user, so `timesheet install` is not needed. `timesheet autostart`
+still sets up the per-user login hooks. Remove it with `apt`, not
+`timesheet uninstall`, which would delete a file that belongs to `dpkg`.
+
+### From source
+
 From the repository directory:
 
 ```sh
