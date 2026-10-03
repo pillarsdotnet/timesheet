@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Timesheet
+GenericName=Time Tracker
+Comment=Start tracking work time
+Exec=timesheet start
+Icon=timesheet
+Terminal=false
+Categories=Office;ProjectManagement;
+Keywords=time;timesheet;tracking;work;
+StartupNotify=false

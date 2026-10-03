@@ -1,0 +1,21 @@
+timesheet source package
+========================
+
+Two upstream tarballs, both built by debian/make-orig-tarballs.sh:
+
+ * timesheet_<ver>.orig.tar.xz: the repository, without debian/.
+ * timesheet_<ver>.orig-vendor.tar.xz: every crate in Cargo.lock, unpacked to
+   vendor/. Launchpad's builders have no network. Crates that only build for
+   Windows, macOS or WebAssembly are reduced to their Cargo.toml and an
+   empty lib.rs.
+
+The script also regenerates the vendor/ paragraphs of debian/copyright, and
+prints the upstream version, <Cargo.toml version>+git<date>.<sha>.
+
+One debian/ serves noble, resolute and stonking. debian/changelog is kept at
+the plain version with distribution UNRELEASED; each upload sets the top
+entry to <ver>-1~ppa1~ubuntu<YY.MM>.1 and the series name, for example:
+
+  dch -b -v <ver>-1~ppa1~ubuntu24.04.1 -D noble "Build for noble."
+
+ -- Robert August Vincent II (Bob) <pillarsdotnet@gmail.com>  Fri, 02 Oct 2026 22:30:00 -0400

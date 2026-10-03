@@ -1,0 +1,67 @@
+#!/usr/bin/make -f
+# Copyright (c) 2026 Robert August Vincent II <pillarsdotnet@gmail.com>
+# Co-author: Claude Code.
+
+include /usr/share/dpkg/buildopts.mk
+
+# Every crate comes from vendor/ (the orig-vendor tarball); the builders have
+# no network. A private CARGO_HOME keeps the builder's own cargo configuration,
+# such as an sccache rustc-wrapper, out of the build.
+export CARGO_HOME = $(CURDIR)/debian/cargo-home
+unexport RUSTC_WRAPPER
+
+# Keep the build directory out of the binary's panic locations.
+export RUSTFLAGS += --remap-path-prefix=$(CURDIR)=.
+
+# Leave stripping to dh_strip, so the -dbgsym package gets the line tables.
+export CARGO_PROFILE_RELEASE_STRIP = false
+export CARGO_PROFILE_RELEASE_DEBUG = line-tables-only
+
+ifneq (,$(DEB_BUILD_OPTION_PARALLEL))
+export CARGO_BUILD_JOBS = $(DEB_BUILD_OPTION_PARALLEL)
+endif
+
+# The crates need Rust 1.88. noble's default cargo is 1.75, so there the
+# versioned toolchain from noble-updates (cargo-1.91, rustc-1.91) goes first
+# on PATH; resolute and stonking use their default one.
+RUST_OK := $(shell cargo --version 2>/dev/null \
+	| awk '{ split($$2, v, "."); print (v[1] > 1 || v[2] >= 88) ? "yes" : "no" }')
+ifneq ($(RUST_OK),yes)
+export PATH := /usr/lib/rust-1.91/bin:$(PATH)
+endif
+
+# The CLI reads and writes under $HOME; keep builds and tests off the real one.
+TEST_ENV = env -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u XDG_CACHE_HOME \
+	-u XDG_STATE_HOME -u XDG_RUNTIME_DIR HOME=$(CURDIR)/debian/home
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	mkdir -p $(CARGO_HOME) debian/home
+	printf '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "%s/vendor"\n' \
+		'$(CURDIR)' > $(CARGO_HOME)/config.toml
+	cargo --version
+	rustc --version
+
+override_dh_auto_build:
+	cargo build --release --frozen
+	$(TEST_ENV) target/release/timesheet manpage > debian/timesheet.1
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	$(TEST_ENV) cargo test --release --frozen
+endif
+
+override_dh_auto_install:
+	install -D -m 0755 target/release/timesheet debian/timesheet/usr/bin/timesheet
+	install -D -m 0644 assets/icon.svg \
+		debian/timesheet/usr/share/icons/hicolor/scalable/apps/timesheet.svg
+
+# dh_clean deletes *.orig files, but every vendored crate ships a
+# Cargo.toml.orig that its .cargo-checksum.json lists.
+override_dh_clean:
+	dh_clean -XCargo.toml.orig
+
+override_dh_auto_clean:
+	rm -rf target debian/cargo-home debian/home debian/timesheet.1

@@ -1,0 +1,13 @@
+timesheet for Debian
+====================
+
+The package installs the binary to /usr/bin/timesheet, the man page, and the
+"Timesheet" menu entry and icon system-wide, so `timesheet install` is not
+needed.
+
+Do not run `timesheet uninstall` against this copy: it deletes the binary it
+runs from, which here belongs to dpkg. `timesheet autostart` and
+`timesheet autostart uninstall` still manage the per-user login hooks; remove
+the package itself with apt.
+
+ -- Robert August Vincent II (Bob) <pillarsdotnet@gmail.com>  Fri, 02 Oct 2026 22:30:00 -0400

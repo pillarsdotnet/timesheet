@@ -1,0 +1,5 @@
+timesheet (0.1.0+git20260930.2c08782-1~ppa1) UNRELEASED; urgency=medium
+
+  * Initial Debian packaging, for ppa:pillarsdotnet/ppa.
+
+ -- Robert August Vincent II (Bob) <pillarsdotnet@gmail.com>  Fri, 02 Oct 2026 22:30:00 -0400
