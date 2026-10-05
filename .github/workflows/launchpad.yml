@@ -1,0 +1,88 @@
+# Copyright (c) 2026 Robert August Vincent II <pillarsdotnet@gmail.com>
+# Co-author: Claude Code.
+# Upload a source package of every push to main to ppa:pillarsdotnet/ppa,
+# for each supported Ubuntu series; Launchpad then builds it. A push that
+# changes only debian/ is uploaded as a new ~ppaN revision of the upstream
+# version already there; see .github/ppa-upload.
+#
+# Needs these, all registered on the Launchpad account:
+# - secret LAUNCHPAD_SIGNING_KEY: an armoured OpenPGP secret key without a
+#   passphrase, which Launchpad checks each upload's signature against;
+# - variable LAUNCHPAD_SIGNING_KEY_ID: its fingerprint;
+# - secret LAUNCHPAD_SSH_KEY: an SSH private key without a passphrase, to
+#   upload by SFTP rather than FTP.
+name: Launchpad
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One upload at a time; a push made while one runs waits, and only the newest
+# waiting push is uploaded, since it carries the commits of the ones before.
+concurrency:
+  group: launchpad
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  upload:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The changelog lists every commit since the last upload.
+          fetch-depth: 0
+
+      # debian/make-orig-tarballs.sh runs cargo vendor, and the crates need
+      # Rust 1.88.
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install the Debian tools
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            dpkg-dev devscripts dput python3-paramiko
+
+      - name: Import the signing key
+        env:
+          KEY: ${{ secrets.LAUNCHPAD_SIGNING_KEY }}
+          KEY_ID: ${{ vars.LAUNCHPAD_SIGNING_KEY_ID }}
+        run: |
+          printf '%s\n' "$KEY" | gpg --batch --import
+          # dput checks the signature before uploading, and calls a key of
+          # unknown trust an error.
+          echo "$KEY_ID:6:" | gpg --batch --import-ownertrust
+
+      - name: Set up SFTP to Launchpad
+        env:
+          SSH_KEY: ${{ secrets.LAUNCHPAD_SSH_KEY }}
+          # From ssh-keyscan on 2026-10-05.
+          HOST_KEY: "ppa.launchpad.net ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEA0aKz5UTUndYgIGG7dQBV+HaeuEZJ2xPHo2DS2iSKvUL4xNMSAY4UguNW+pX56nAQmZKIZZ8MaEvSj6zMEDiq6HFfn5JcTlM80UwlnyKe8B8p7Nk06PPQLrnmQt5fh0HmEcZx+JU9TZsfCHPnX7MNz4ELfZE6cFsclClrKim3BHUIGq//t93DllB+h4O9LHjEUsQ1Sr63irDLSutkLJD6RXchjROXkNirlcNVHH/jwLWR5RcYilNX7S5bIkK8NlWPjsn/8Ua5O7I9/YoE97PpO6i73DTGLh5H9JN/SITwCKBkgSDWUt61uPK3Y11Gty7o2lWsBjhBUm2Y38CBsoGmBw=="
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/launchpad
+          chmod 600 ~/.ssh/launchpad
+          printf '%s\n' "$HOST_KEY" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<'CONFIG'
+          Host ppa.launchpad.net
+            User pillarsdotnet
+            IdentityFile ~/.ssh/launchpad
+            IdentitiesOnly yes
+          CONFIG
+          cat > ~/.dput.cf <<'CONFIG'
+          [launchpad-sftp]
+          fqdn = ppa.launchpad.net
+          method = sftp
+          login = pillarsdotnet
+          incoming = ~pillarsdotnet/ppa/ubuntu/
+          CONFIG
+
+      - name: Build, sign and upload
+        env:
+          DEBSIGN_KEYID: ${{ vars.LAUNCHPAD_SIGNING_KEY_ID }}
+          DPUT_TARGET: launchpad-sftp
+        run: .github/ppa-upload

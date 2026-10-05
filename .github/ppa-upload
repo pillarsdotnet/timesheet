@@ -1,0 +1,161 @@
+#!/bin/bash
+# Copyright (c) 2026 Robert August Vincent II <pillarsdotnet@gmail.com>
+# Co-author: Claude Code.
+#
+# Build signed source packages of HEAD for every supported Ubuntu series and
+# upload them to the PPA, where Launchpad builds them.
+#
+# Usage: .github/ppa-upload [--dry-run]
+#
+# A push that changes anything outside debian/ is a new upstream snapshot.
+# Its upstream version is the Cargo.toml version plus the UTC time and hash
+# of the newest such commit, so every snapshot sorts above the one before
+# it, and debian/make-orig-tarballs.sh builds both orig tarballs afresh.
+#
+# A push that changes only debian/ keeps the upstream version already in the
+# PPA and raises the ~ppaN revision instead. Its orig tarballs are fetched
+# back from Launchpad, which refuses a second, different file of the same
+# name, rather than rebuilt.
+#
+# Either way the top debian/changelog entry, kept UNRELEASED in git, is given
+# the version and series in the build tree only, with the commits since the
+# last upload listed first, as README.source describes.
+#
+# Needs the full git history, cargo, dpkg-dev, devscripts and dput, network
+# access, and, unless --dry-run, DEBSIGN_KEYID naming a secret key in gpg
+# that Launchpad knows. --dry-run builds the unsigned source packages and
+# uploads nothing. DPUT_TARGET names the dput host to upload to; it defaults
+# to the PPA by FTP.
+set -euo pipefail
+
+PPA_OWNER=pillarsdotnet
+PPA_NAME=ppa
+SERIES="noble:24.04 resolute:26.04 stonking:26.10"
+
+dry_run=false
+[ "${1:-}" = --dry-run ] && dry_run=true
+
+repo="$(git rev-parse --show-toplevel)"
+cd "$repo"
+
+head_sha="$(git rev-parse --short=7 HEAD)"
+# The same commit make-orig-tarballs.sh takes as upstream.
+upstream_ref="$(git log -1 --format=%H -- . ':(exclude)debian')"
+up_sha="$(git rev-parse --short=7 "$upstream_ref")"
+stamp="$(TZ=UTC git show -s --format=%cd --date=format-local:%Y%m%d%H%M%S "$upstream_ref")"
+base="$(git show "$upstream_ref:Cargo.toml" | sed -n 's/^version = "\(.*\)"$/\1/p' | head -n 1)"
+upstream="$base+git$stamp.$up_sha"
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+# Every timesheet in the PPA, newest first, as "version self_link" lines.
+curl -fsS "https://api.launchpad.net/devel/~$PPA_OWNER/+archive/ubuntu/$PPA_NAME?ws.op=getPublishedSources&source_name=timesheet&exact_match=true&order_by_date=true&ws.size=300" |
+  python3 -c 'import json, sys
+for e in json.load(sys.stdin)["entries"]:
+    print(e["source_package_version"], e["self_link"])' >"$work/published"
+last="$(awk 'NR == 1 { print $1 }' "$work/published")"
+last_sha="$(sed -n 's/^.*+git[0-9]*\.\([0-9a-f]\{7,\}\)-.*$/\1/p' <<<"$last")"
+echo "newest in the PPA: ${last:-nothing}; this commit: $head_sha, upstream $upstream" >&2
+
+if [ -n "$last_sha" ] && git cat-file -e "$last_sha^{commit}" 2>/dev/null; then
+  if git merge-base --is-ancestor HEAD "$last_sha"; then
+    echo "$head_sha is already in the PPA, or older than what is; nothing to upload" >&2
+    exit 0
+  fi
+  range="$last_sha..HEAD"
+else
+  range="HEAD^!"
+fi
+subjects="$work/subjects"
+git log --no-merges --format=%s "$range" >"$subjects"
+
+# The highest ~ppaN already uploaded for this upstream version, if any.
+ppa="$(awk -v p="$upstream-1~ppa" 'index($1, p) == 1 {
+    n = substr($1, length(p) + 1); sub(/~.*/, "", n); print n }' "$work/published" |
+  sort -n | tail -n 1)"
+src="$work/src"
+git clone -q --no-checkout "$repo" "$src"
+git -C "$src" checkout -q --detach "$(git rev-parse HEAD)"
+
+if [ -z "$ppa" ]; then
+  ppa=1
+  orig_opt=-sa
+  # It writes the tarballs next to the tree and regenerates debian/copyright
+  # inside it, so it runs in a clone, never in the caller's checkout.
+  made="$(cd "$src" && sh debian/make-orig-tarballs.sh "$upstream_ref" | tail -n 1)"
+  for component in orig orig-vendor; do
+    mv "$work/timesheet_$made.$component.tar.xz" "$work/timesheet_$upstream.$component.tar.xz"
+  done
+  note="New upstream snapshot, from git $up_sha"
+else
+  ppa=$((ppa + 1))
+  orig_opt=-sd
+  link="$(awk -v v="$upstream" 'index($1, v "-1~ppa") == 1 { print $2; exit }' "$work/published")"
+  curl -fsS "$link?ws.op=sourceFileUrls" |
+    python3 -c 'import json, sys; print("\n".join(json.load(sys.stdin)))' |
+    grep -E '\.orig(-vendor)?\.tar\.xz$' |
+    while read -r url; do curl -fsSL -o "$work/${url##*/}" "$url"; done
+  note="Packaging update, from git $head_sha"
+fi
+echo "upstream $upstream, revision 1~ppa$ppa ($orig_opt)" >&2
+
+tree="$work/timesheet-$upstream"
+mkdir "$tree"
+tar -xJf "$work/timesheet_$upstream.orig.tar.xz" -C "$tree" --strip-components=1
+tar -xJf "$work/timesheet_$upstream.orig-vendor.tar.xz" -C "$tree"
+cp -a "$src/debian" "$tree/"
+cp "$tree/debian/changelog" "$work/changelog.committed"
+
+maintainer="$(sed -n 's/^Maintainer: //p' debian/control)"
+date="$(date -R)"
+failed=""
+
+for entry in $SERIES; do
+  series="${entry%%:*}"
+  version="$upstream-1~ppa$ppa~ubuntu${entry#*:}.1"
+  python3 - "$tree/debian/changelog" "$work/changelog.committed" "$subjects" \
+    "$version" "$series" "$note" "$stamp" "$maintainer" "$date" <<'EOF'
+import re
+import sys
+import textwrap
+
+path, committed, subjects, version, series, note, stamp, maintainer, date = sys.argv[1:]
+lines = open(committed).read().split("\n")
+m = re.match(r"^(\S+) \(.+\) UNRELEASED;(.*)$", lines[0])
+if not m:
+    sys.exit(f"top changelog entry is not UNRELEASED: {lines[0]}")
+lines[0] = f"{m[1]} ({version}) {series};{m[2]}"
+day = f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]}"
+new = [f"  * {note} ({day})." if note.startswith("New") else f"  * {note}."]
+for subject in open(subjects).read().splitlines():
+    # "fix: keep the reminder" reads as "Keep the reminder".
+    _, colon, text = subject.partition(": ")
+    text = text if colon else subject
+    text = text[:1].upper() + text[1:]
+    new += textwrap.wrap(text, 74, initial_indent="    - ", subsequent_indent="      ")
+# The entry's own notes follow the snapshot's, and its trailer is restamped.
+lines[2:2] = new
+end = next(i for i, line in enumerate(lines) if line.startswith(" -- "))
+lines[end] = f" -- {maintainer}  {date}"
+open(path, "w").write("\n".join(lines))
+EOF
+  (cd "$tree" && dpkg-buildpackage -S "$orig_opt" -d -nc -us -uc >"$work/$version.log" 2>&1) || {
+    cat "$work/$version.log" >&2
+    exit 1
+  }
+  changes="$work/timesheet_${version}_source.changes"
+  if $dry_run; then
+    echo "built $changes (dry run: not signed or uploaded)" >&2
+    head -12 "$tree/debian/changelog" >&2
+    continue
+  fi
+  debsign -k"$DEBSIGN_KEYID" --no-re-sign "$changes"
+  # One series failing to upload should not hold back the others.
+  dput "${DPUT_TARGET:-ppa:$PPA_OWNER/$PPA_NAME}" "$changes" || failed="$failed $series"
+done
+
+if [ -n "$failed" ]; then
+  echo "upload failed for:$failed" >&2
+  exit 1
+fi
