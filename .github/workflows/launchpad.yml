@@ -16,6 +16,12 @@ name: Launchpad
 on:
   push:
     branches: [main]
+    # A push that changes nothing but documentation or CI uploads nothing; its
+    # commits still reach the changelog with the next push that does.
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".github/**"
   workflow_dispatch:
 
 # One upload at a time; a push made while one runs waits, and only the newest
