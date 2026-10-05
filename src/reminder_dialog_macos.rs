@@ -17,10 +17,12 @@ use objc2_app_kit::{
     NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes,
+    NSSize, NSString, NSTimer,
 };
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::ptr::NonNull;
 
 // NSUserInterfaceLayoutOrientationVertical = 1
 const NS_USER_INTERFACE_LAYOUT_ORIENTATION_VERTICAL: NSUserInterfaceLayoutOrientation =
@@ -546,6 +548,43 @@ define_class!(
             };
             show_all();
 
+            // Another window brought forward hides the prompt without answering it, and it is easy
+            // to go back to work without noticing. Every reminder interval (passed down by the
+            // daemon), put it back in front. Scheduled in the common run loop modes so it also
+            // fires inside the modal session below. An open "Enter activity" box is raised above
+            // the panels rather than being covered by them.
+            let resurface = std::env::var("TS_CHOOSER_RESURFACE_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&ms| ms > 0)
+                .map(|ms| {
+                    let panels = panels.clone();
+                    let block = block2::RcBlock::new(move |_timer: NonNull<NSTimer>| {
+                        let app = NSApplication::sharedApplication(mtm);
+                        #[allow(deprecated)]
+                        app.activateIgnoringOtherApps(true);
+                        for panel in &panels {
+                            if panel.isVisible() {
+                                panel.orderFrontRegardless();
+                            }
+                        }
+                        if let Some(modal) = app.modalWindow() {
+                            modal.orderFrontRegardless();
+                        }
+                    });
+                    let timer = unsafe {
+                        NSTimer::timerWithTimeInterval_repeats_block(
+                            ms as f64 / 1000.0,
+                            true,
+                            &block,
+                        )
+                    };
+                    unsafe {
+                        NSRunLoop::currentRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes)
+                    };
+                    timer
+                });
+
             // Re-show if dismissed without a button choice (e.g. process killed).
             loop {
                 DIALOG_RESULT.with(|r| *r.borrow_mut() = None);
@@ -562,6 +601,9 @@ define_class!(
                     Some(_) => break,
                     None => show_all(),
                 }
+            }
+            if let Some(timer) = &resurface {
+                timer.invalidate();
             }
             // A choice on any display dismisses the prompt on all of them.
             hide_all();

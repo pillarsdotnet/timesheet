@@ -6580,6 +6580,11 @@ fn show_reminder_prompt_macos(activities: &[String], timesheet: Option<&Path>) -
             c.args(&args_ref);
             c
         };
+        // Every reminder interval the chooser puts itself back in front of whatever has covered it.
+        cmd.env(
+            "TS_CHOOSER_RESURFACE_MS",
+            (get_reminder_interval_secs() * 1000).to_string(),
+        );
         let mut child = match cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
