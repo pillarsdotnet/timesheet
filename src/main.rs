@@ -2362,6 +2362,21 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
         if restart_daemon {
             kill_reminder_daemon_if_running();
         }
+        // The session daemon also runs from this binary and cannot be stopped here: its unit's
+        // ExecStop records a STOP, which systemd runs even if the process is merely killed. So
+        // on Unix the new binary is copied beside the old one and renamed over it, which works
+        // while the old one runs -- that process keeps its unlinked image until it exits.
+        #[cfg(unix)]
+        {
+            let tmp = dest.join(".timesheet.install.tmp");
+            fs::copy(src_to_use, &tmp)
+                .and_then(|_| fs::rename(&tmp, &dest_file))
+                .map_err(|e| {
+                    let _ = fs::remove_file(&tmp);
+                    format!("timesheet install: copy failed: {}", e)
+                })?;
+        }
+        #[cfg(not(unix))]
         fs::copy(src_to_use, &dest_file)
             .map_err(|e| format!("timesheet install: copy failed: {}", e))?;
         if restart_daemon {
@@ -5239,6 +5254,14 @@ fn cmd_interval(args: &[String], timesheet: &Path, restart_running: bool) -> Res
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn spawn_start_on_unlock() {
     if let Ok(exe) = env::current_exe() {
+        // `timesheet install` renames a new binary over this one while the daemon runs, after
+        // which Linux reports the old, unlinked image as "<path> (deleted)". The path itself now
+        // names the new binary, which is the one to run.
+        #[cfg(target_os = "linux")]
+        let exe = match exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+            Some(live) => PathBuf::from(live),
+            None => exe,
+        };
         ts_debug("spawn_start_on_unlock: session unlocked, spawning \"timesheet start\"");
         let _ = Command::new(exe).arg("start").spawn();
     }
