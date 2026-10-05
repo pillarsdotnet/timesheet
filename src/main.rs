@@ -42,7 +42,7 @@
 //! |------------|-------------|
 //! | `alias`    | Interactively replace activity text in this week's START entries (regex). |
 //! | `autostart` | Register `timesheet start` on login and on session unlock, and `timesheet stop` on logout/shutdown (macOS/Linux: LaunchAgents/systemd units plus an admin-installed logout hook, with the unlock trigger via a distributed notification on macOS and a logind D-Bus watch on Linux; Windows: a per-user Scheduled Task with login and workstation-unlock triggers, plus the daemon's best-effort console control handler for STOP, no admin required or available). |
-//! | `edit`     | Open the timesheet log in `$EDITOR` (then `$VISUAL`, else `vi`; the `.txt`-associated program on Windows). |
+//! | `edit`     | Open the timesheet log in `$EDITOR` (then `$VISUAL`, run by the shell so arguments work, else `vi`; the `.txt`-associated program on Windows). |
 //! | `email`    | Fill the timesheet PDF as `pdf` does and mail it as an attachment. |
 //! | `help`     | Show the man page in a pager (groff -man -Tascii \| less; plain text via `more` on Windows). |
 //! | `install`  | Copy binary and icon to a directory on PATH (icon embedded on macOS). |
@@ -1690,7 +1690,8 @@ fn cmd_tail(tail_arg: Option<&str>, timesheet: &Path) -> Result<(), String> {
 }
 
 /// Prints report: % per activity and hours per weekday; optional arg selects file (e.g. `log`, `0220`, `-1`, path).
-/// Opens the timesheet log in the user's editor (`$EDITOR`, falling back to `$VISUAL`), but only
+/// Opens the timesheet log in the user's editor (`$EDITOR`, falling back to `$VISUAL`, run through
+/// `sh` -- `cmd` on Windows -- so the value may carry arguments, e.g. `emacs -nw`), but only
 /// when running interactively (stdin and stdout are both a real tty). A GUI launcher (e.g. an
 /// application-menu entry) typically won't have sourced the shell profile that sets those
 /// variables anyway, and even if it somehow did, exec'ing a terminal editor with no tty attached
@@ -1709,9 +1710,31 @@ fn cmd_edit(timesheet: &Path) -> Result<(), String> {
         None
     };
     let (mut cmd, label) = match editor {
+        // The variable is a shell command, not a program name: `EDITOR="emacs -nw"` or
+        // `EDITOR="code --wait"` must work, as they do for git and crontab. So the shell parses
+        // it, with the log path passed as a positional parameter rather than spliced into the
+        // command text, where its spaces and quotes would need escaping.
+        #[cfg(unix)]
         Some(editor) => {
-            let mut c = Command::new(&editor);
-            c.arg(timesheet);
+            let mut script = editor.clone();
+            script.push(" \"$@\"");
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(script).arg(&editor).arg(timesheet);
+            (c, format!("{:?}", editor))
+        }
+        // cmd.exe has no positional parameters, so the path is quoted into the command line. /S
+        // strips exactly the outer pair of quotes and runs the rest verbatim, which keeps any
+        // quotes inside the variable (e.g. around a path under "Program Files") intact. raw_arg
+        // stops Rust from re-escaping those quotes for the C runtime, which cmd.exe never uses.
+        #[cfg(windows)]
+        Some(editor) => {
+            let mut line = std::ffi::OsString::from("/S /C \"");
+            line.push(&editor);
+            line.push(" \"");
+            line.push(timesheet);
+            line.push("\"\"");
+            let mut c = Command::new("cmd");
+            c.raw_arg(line);
             (c, format!("{:?}", editor))
         }
         None if cfg!(windows) => {
@@ -3315,6 +3338,12 @@ in your editor, taken from
 .B $EDITOR
 (then
 .BR $VISUAL ),
+which is run through the shell
+.RB ( sh ,
+or
+.B cmd
+on Windows) and so may include arguments, e.g.
+.BR "EDITOR=\(dqemacs -nw\(dq" ;
 but only when run interactively, i.e. stdin and stdout are both a real terminal.
 Otherwise \(em e.g. launched from a GUI menu entry, where those variables usually
 aren't set anyway \(em it opens via the OS default instead:
