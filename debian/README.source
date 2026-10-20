@@ -18,4 +18,11 @@ entry to <ver>-1~ppa1~ubuntu<YY.MM>.1 and the series name, for example:
 
   dch -b -v <ver>-1~ppa1~ubuntu24.04.1 -D noble "Build for noble."
 
+Two CI pipelines publish from this source, one per forge. A push to GitHub
+runs .github/ppa-upload, which uploads source packages for Launchpad to
+build. A push to Forgejo runs .forgejo/registry-upload, which builds the
+binary package itself in a container of each series and uploads the debs to
+the Debian registry at forgejo.bobbalisa.org; both use the same version
+scheme, so the same snapshot carries the same version in both archives.
+
  -- Robert August Vincent II (Bob) <pillarsdotnet@gmail.com>  Fri, 02 Oct 2026 22:30:00 -0400

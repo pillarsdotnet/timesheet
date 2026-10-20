@@ -22,6 +22,7 @@ on:
       - "**.md"
       - "docs/**"
       - ".github/**"
+      - ".forgejo/**"
   workflow_dispatch:
 
 # One upload at a time; a push made while one runs waits, and only the newest
@@ -35,6 +36,10 @@ permissions:
 
 jobs:
   upload:
+    # Only from GitHub: Forgejo reads .github/workflows too, but its publish
+    # path is .forgejo/workflows/registry.yml, which uploads to the Forgejo
+    # Debian registry instead of Launchpad.
+    if: github.server_url == 'https://github.com'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
