@@ -5,7 +5,8 @@ Two upstream tarballs, both built by debian/make-orig-tarballs.sh:
 
  * timesheet_<ver>.orig.tar.xz: the repository, without debian/.
  * timesheet_<ver>.orig-vendor.tar.xz: every crate in Cargo.lock, unpacked to
-   vendor/. Launchpad's builders have no network. Crates that only build for
+   vendor/. The source carries its own crates so the package builds without
+   fetching anything. Crates that only build for
    Windows, macOS or WebAssembly are reduced to their Cargo.toml and an
    empty lib.rs.
 
@@ -18,11 +19,11 @@ entry to <ver>-1~ppa1~ubuntu<YY.MM>.1 and the series name, for example:
 
   dch -b -v <ver>-1~ppa1~ubuntu24.04.1 -D noble "Build for noble."
 
-Two CI pipelines publish from this source, one per forge. A push to GitHub
-runs .github/ppa-upload, which uploads source packages for Launchpad to
-build. A push to Forgejo runs .forgejo/registry-upload, which builds the
-binary package itself in a container of each series and uploads the debs to
-the Debian registry at forgejo.bobbalisa.org; both use the same version
-scheme, so the same snapshot carries the same version in both archives.
+One CI pipeline publishes from this source: a push to Forgejo runs
+.forgejo/registry-upload, which builds the binary package itself in a
+container of each series and uploads the debs to the Debian registry at
+forgejo.bobbalisa.org. The Launchpad uploads from GitHub are retired; the
+version scheme is unchanged, so newer registry snapshots sort above the
+PPA's older ones.
 
  -- Robert August Vincent II (Bob) <pillarsdotnet@gmail.com>  Fri, 02 Oct 2026 22:30:00 -0400

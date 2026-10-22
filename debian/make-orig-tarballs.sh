@@ -8,7 +8,7 @@
 #   ../timesheet_<ver>.orig.tar.xz         the repository, without debian/
 #   ../timesheet_<ver>.orig-vendor.tar.xz  every crate in Cargo.lock
 #
-# Launchpad's builders have no network, so the crates travel with the source.
+# The crates travel with the source, so the package builds without the network.
 # Crates that only build on Windows, macOS or WebAssembly are reduced to their
 # Cargo.toml and an empty lib.rs: cargo still needs their manifests to resolve
 # Cargo.lock, but nothing on Linux compiles them. They are half the vendor
