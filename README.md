@@ -236,14 +236,20 @@ without a year means the current year.
 
 ## Install
 
-### From the Ubuntu PPA
+### From the Debian registry
 
 On Ubuntu 24.04 (`noble`), 26.04 (`resolute`) or 26.10 (`stonking`), install
-the Debian package from
-[`ppa:pillarsdotnet/ppa`](https://launchpad.net/~pillarsdotnet/+archive/ubuntu/ppa):
+the Debian package from the
+[package registry](https://forgejo.bobbalisa.org/pillarsdotnet/-/packages) on
+`forgejo.bobbalisa.org`:
 
 ```sh
-sudo add-apt-repository ppa:pillarsdotnet/ppa
+sudo install -d /etc/apt/keyrings
+curl -fsS https://forgejo.bobbalisa.org/api/packages/pillarsdotnet/debian/repository.key |
+  sudo tee /etc/apt/keyrings/forgejo-bobbalisa.asc > /dev/null
+echo "deb [signed-by=/etc/apt/keyrings/forgejo-bobbalisa.asc] https://forgejo.bobbalisa.org/api/packages/pillarsdotnet/debian $(lsb_release -cs) main" |
+  sudo tee /etc/apt/sources.list.d/forgejo-bobbalisa.list > /dev/null
+sudo apt update
 sudo apt install timesheet
 ```
 
