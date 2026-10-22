@@ -1,7 +1,7 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: timesheet
 Upstream-Contact: Robert August Vincent II <pillarsdotnet@gmail.com>
-Source: https://github.com/pillarsdotnet/timesheet
+Source: https://forgejo.bobbalisa.org/pillarsdotnet/timesheet
 Comment: The vendor/ directory comes from the orig-vendor component tarball,
  which debian/make-orig-tarballs.sh builds from Cargo.lock. Crates that only
  build for Windows, macOS or WebAssembly are stubbed there to their

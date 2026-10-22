@@ -6,7 +6,7 @@ Build-Depends: debhelper-compat (= 13),
                cargo (>= 1.88) | cargo-1.91,
                rustc (>= 1.88) | rustc-1.91,
 Standards-Version: 4.7.0
-Homepage: https://github.com/pillarsdotnet/timesheet
+Homepage: https://forgejo.bobbalisa.org/pillarsdotnet/timesheet
 Rules-Requires-Root: no
 
 Package: timesheet
