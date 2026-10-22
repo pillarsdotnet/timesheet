@@ -1,0 +1,12 @@
+# yamllint checks correctness and consistency; prettier owns formatting where
+# it runs, so only the rules the two disagree on are adjusted. document-start
+# is disabled because workflow files open with a comment block rather than
+# "---", truthy's key check because workflow files key on "on:", and the
+# length limit matches the comment-heavy style of the workflow files.
+extends: default
+rules:
+  document-start: disable
+  line-length:
+    max: 120
+  truthy:
+    check-keys: false

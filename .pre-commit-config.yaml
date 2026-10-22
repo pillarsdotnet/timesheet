@@ -34,8 +34,24 @@ repos:
       - id: markdownlint
         args: ["--fix"]
 
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.35.1
+    hooks:
+      - id: yamllint
+
   - repo: local
     hooks:
+      - id: vale
+        name: vale
+        # The PyPI "vale" package wraps the official binary, so pre-commit
+        # installs it into the hook's own environment - nothing to install by
+        # hand, locally or in CI. CLAUDE.md and .claude/ are instructions for
+        # an agent, not prose for people, so they stay out of the prose check.
+        entry: vale
+        language: python
+        additional_dependencies: ["vale==3.19.0.0"]
+        types: [markdown]
+        exclude: ^(CLAUDE\.md|\.claude/)
       - id: cargo-fmt
         name: cargo fmt
         entry: cargo fmt --all -- --check
