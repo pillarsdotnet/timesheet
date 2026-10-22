@@ -3,11 +3,11 @@
 Copyright (c) 2025 Robert August Vincent II <pillarsdotnet@gmail.com>
 Co-author: Cursor-AI.
 
-This document describes how to build and install the **timesheet** CLI from the repository.
+This document describes how to build and install the **`timesheet`** CLI from the repository.
 
 ## Prerequisites
 
-- **Rust** toolchain (install from [rustup.rs](https://rustup.rs))
+- **Rust** `toolchain` (install from [rustup.rs](https://rustup.rs))
 - A directory on your `PATH` (e.g. `~/bin`)
 
 ## Getting the source
@@ -31,11 +31,11 @@ The binary is written to `target/release/timesheet` (or `target/debug/timesheet`
 
 The first build fetches crates from crates.io, so it needs network access; later builds do not. `timesheet pdf` and `timesheet email` bring in PDF filling and message building (`lopdf` and `lettre`), which is most of the binary's size and of the build time. Nothing links against system OpenSSL or reads a certificate store, on Linux, macOS, or Windows: `timesheet email` pipes the finished message to a `sendmail(8)` binary and leaves the network to it.
 
-On Windows, `cargo build --release` produces `target\release\timesheet.exe`. Core commands (`start`, `stop`, `list`, `sprint`, `tail`, `alias`/`rename`/`prefix`, `rotate`, `migrate`, `timeoff`, `edit`, `pdf`, `email`) work the same as on Linux/macOS. The reminder daemon and reminder dialog are not implemented on Windows yet, so `timesheet start` with no activity always defaults to misc/unspecified rather than prompting. `timesheet autostart` is supported on Windows (see [Autostart](#autostart-optional) below). `timesheet email` pipes the message to `sendmail.exe` on `PATH`, which Windows does not supply; see [Supplying `sendmail.exe` on Windows](README.md#supplying-sendmailexe-on-windows) in the README for installing msmtp under that name.
+On Windows, `cargo build --release` produces `target\release\timesheet.exe`. Core commands (`start`, `stop`, `list`, `sprint`, `tail`, `alias`/`rename`/`prefix`, `rotate`, `migrate`, `timeoff`, `edit`, `pdf`, `email`) work the same as on Linux/macOS. The reminder daemon and reminder dialog are not implemented on Windows yet, so `timesheet start` with no activity always defaults to misc/unspecified rather than prompting. `timesheet autostart` is supported on Windows (see [`Autostart`](#autostart-optional) below). `timesheet email` pipes the message to `sendmail.exe` on `PATH`, which Windows does not supply; see [Supplying `sendmail.exe` on Windows](README.md#supplying-sendmailexe-on-windows) in the README for installing `msmtp` under that name.
 
 ### 2. Install the binary
 
-**Using the binary's install subcommand** (run from the repo so it can find itself):
+**Using the binary's `install` command** (run from the repository so it can find itself):
 
 ```sh
 ./target/release/timesheet install
@@ -52,12 +52,12 @@ chmod +x ~/bin/timesheet
 
 Ensure `~/bin` (or your chosen directory) is on your `PATH`.
 
-The `install` subcommand (not the manual copy) also registers a point-and-click way to start work:
-on Linux a "Timesheet" application-menu entry (`~/.local/share/applications/timesheet.desktop`) that
-runs `timesheet start`, and on Windows a "Start Timesheet" Start Menu shortcut. Re-running `install`
+The `install` command (not the manual copy) also registers a point-and-click way to start work:
+on Linux a `Timesheet` application-menu entry (`~/.local/share/applications/timesheet.desktop`) that
+runs `timesheet start`, and on Windows a `Start Timesheet` Start Menu shortcut. Re-running `install`
 after moving the binary rewrites them to the new location.
 
-## Autostart (optional)
+## `Autostart` (optional)
 
 To run **`timesheet start`** at login, **again at session unlock**, and **`timesheet stop`** at logout/shutdown:
 
@@ -67,9 +67,9 @@ timesheet autostart
 
 You can pass an interval (e.g. **`timesheet autostart 5s`**) to set the reminder interval and start the daemon in this session. Startup skips a new START if the last log entry is a STOP less than 60 seconds old, and if it finds a non-STOP event more than 5 minutes old it backfills a STOP 5 minutes after that event before recording the new START.
 
-- **macOS:** uses LaunchAgents and a logout hook; the session LaunchAgent also watches for macOS's `com.apple.screenIsUnlocked` distributed notification to trigger the unlock START. If the installer prints a `sudo defaults write com.apple.loginwindow LogoutHook ...` command, run it once (it requires your password) so that STOP is recorded when you log out or shut down.
-- **Linux:** uses systemd user units; the session unit watches logind's `LockedHint` session property over the system D-Bus to trigger the unlock START (works with desktop environments that integrate with logind, e.g. GNOME, KDE). If logind or the system bus is unavailable, the unlock trigger is simply skipped.
-- **Windows:** registers a single per-user Scheduled Task ("Timesheet Autostart") with two triggers — at login, and at workstation unlock — no admin rights needed. On managed machines where Group Policy blocks per-user Scheduled Task creation, falls back to a Startup-folder shortcut (login only, no unlock trigger).
+- **macOS:** uses LaunchAgents and a logout hook; the session LaunchAgent also watches for the macOS `com.apple.screenIsUnlocked` distributed notification to trigger the unlock START. If the installer prints a `sudo defaults write com.apple.loginwindow LogoutHook ...` command, run it once (it requires your password) so that STOP is recorded when you log out or shut down.
+- **Linux:** uses `systemd` user units; the session unit watches the `LockedHint` session property of `logind` over the system D-Bus to trigger the unlock START (works with desktop environments that integrate with `logind`, e.g. GNOME, KDE). If `logind` or the system bus is unavailable, the unlock trigger is simply skipped.
+- **Windows:** registers a single per-user Scheduled Task (`Timesheet Autostart`) with two triggers — at login, and at workstation unlock — no admin rights needed. On managed machines where Group Policy blocks per-user Scheduled Task creation, falls back to a Startup-folder shortcut (login only, no unlock trigger).
 
 To remove: **`timesheet autostart uninstall`**.
 
@@ -85,7 +85,7 @@ rotate:
   time: "00:00"
 ```
 
-Everything else in that file supplies defaults for `timesheet pdf` and `timesheet email` — the contractor name, the PDF template, the recipients, and the relay to send through — and may be written per job under `prefixes:`. Those two subcommands are the only ones that need any configuration at all: `template:` has no default, so name it there or pass `--template`.
+Everything else in that file supplies defaults for `timesheet pdf` and `timesheet email` — the contractor name, the PDF template, the recipients, and the relay to send through — and may be written per job under `prefixes:`. Those two commands are the only ones that need any configuration at all: `template:` has no default, so name it there or pass `--template`.
 
 See the **Configuration** section of `README.md`, or `timesheet help`, for the full description.
 
@@ -141,7 +141,7 @@ Hooks are defined in a single file, `.pre-commit-config.yaml`, which is the one 
 
 Run the hooks with either tool:
 
-- [prek](https://prek.j178.dev/) (a Rust-based pre-commit alternative; reads `.pre-commit-config.yaml` natively):
+- [`prek`](https://prek.j178.dev/) (a Rust-based pre-commit alternative; reads `.pre-commit-config.yaml` natively):
 
   ```sh
   cargo install prek   # or see the prek docs for prebuilt binaries
@@ -155,4 +155,4 @@ Run the hooks with either tool:
   pre-commit install
   ```
 
-Either command installs both the `pre-commit` and `commit-msg` hooks (so commitlint catches non-Conventional Commit messages locally before CI does). Run all hooks manually with `prek run --all-files` / `pre-commit run --all-files`, or a single hook with `prek run <hook-id>` / `pre-commit run <hook-id>`.
+Either command installs both the `pre-commit` and `commit-msg` hooks (so `commitlint` catches non-Conventional Commit messages locally before CI does). Run all hooks manually with `prek run --all-files` / `pre-commit run --all-files`, or a single hook with `prek run <hook-id>` / `pre-commit run <hook-id>`.
