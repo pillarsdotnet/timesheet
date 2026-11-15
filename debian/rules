@@ -4,11 +4,24 @@
 
 include /usr/share/dpkg/buildopts.mk
 
-# Every crate comes from vendor/ (the orig-vendor tarball); the builders have
-# no network. A private CARGO_HOME keeps the builder's own cargo configuration,
-# such as an sccache rustc-wrapper, out of the build.
+# Every crate comes from vendor/ (the orig-vendor tarball), so the build needs
+# no network to FETCH anything. A private CARGO_HOME still keeps the builder's
+# own cargo configuration out of the build.
 export CARGO_HOME = $(CURDIR)/debian/cargo-home
-unexport RUSTC_WRAPPER
+
+# RUSTC_WRAPPER is deliberately NOT unexported any more. It used to be, to stop
+# a builder's ambient sccache configuration reaching the build; the CI job now
+# sets it on purpose, pointed at a shared cache, because compiling 228 crates
+# for three Ubuntu series from cold is what makes this build slow enough to
+# time out.
+#
+# What that costs: a build with RUSTC_WRAPPER set reaches the cache over the
+# network, so it is no longer hermetic in the way the comment above once
+# claimed. sccache is content-addressed -- a hit requires identical compiler,
+# flags and sources -- so the OUTPUT is unchanged either way, and an
+# unreachable cache degrades to a miss rather than a failure. But a Launchpad
+# or local build that happens to have sccache configured will now use it,
+# which is exactly what the old line prevented.
 
 # Keep the build directory out of the binary's panic locations.
 export RUSTFLAGS += --remap-path-prefix=$(CURDIR)=.
