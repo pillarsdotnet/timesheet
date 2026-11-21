@@ -11,10 +11,10 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 chrono = "0.4"
-dirs = "5"
+dirs = "7"
 lettre = { version = "0.11.23", default-features = false, features = ["builder"] }
 libc = "0.2"
-lopdf = { version = "0.44.0", default-features = false }
+lopdf = { version = "0.47.0", default-features = false }
 regex = "1.10"
 
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -49,7 +49,7 @@ repos:
         # an agent, not prose for people, so they stay out of the prose check.
         entry: vale
         language: python
-        additional_dependencies: ["vale==3.19.0.0"]
+        additional_dependencies: ["vale==3.27.0.0"]
         types: [markdown]
         exclude: ^(CLAUDE\.md|\.claude/)
       - id: cargo-fmt
