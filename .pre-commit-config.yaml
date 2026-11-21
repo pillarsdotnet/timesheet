@@ -45,11 +45,19 @@ repos:
         name: vale
         # The PyPI "vale" package wraps the official binary, so pre-commit
         # installs it into the hook's own environment - nothing to install by
-        # hand, locally or in CI. CLAUDE.md and .claude/ are instructions for
+        # hand, locally or in CI. It does not carry the binary: the wrapper
+        # downloads it on first run and copies it into its own site-packages,
+        # which is why require_serial is below. Without it pre-commit can run
+        # two copies of the hook at once over different batches of files, both
+        # see no binary, both download, and the second copy fails with
+        # "OSError: [Errno 26] Text file busy" on a file the first is
+        # executing. That broke the Lint workflow on a cold cache; locally,
+        # where the binary is already there, it never showed. CLAUDE.md and .claude/ are instructions for
         # an agent, not prose for people, so they stay out of the prose check.
         entry: vale
         language: python
         additional_dependencies: ["vale==3.27.0.0"]
+        require_serial: true
         types: [markdown]
         exclude: ^(CLAUDE\.md|\.claude/)
       - id: cargo-fmt
