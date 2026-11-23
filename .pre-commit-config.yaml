@@ -42,12 +42,17 @@ repos:
   - repo: local
     hooks:
       - id: "shellcheck"
-        name: "shellcheck"
-        # From apt, like pre-commit itself: the upstream mirror stops at
-        # v0.9.0 and runs in Docker, which the runner does not have. The
-        # Lint workflow installs the same package so CI and a local run
-        # agree on the version.
-        entry: "shellcheck"
+        name:
+          "shellcheck"
+          # --severity=warning, because the version is NOT pinned and cannot
+        # be: apt gives whatever the base image's Ubuntu release carries.
+        # This workstation had 0.11.0 and the runner image 0.9.0, and the
+        # difference broke a build -- 0.9.0 reports SC2015 on an `A && B || C`
+        # that 0.11.0 passes. Info and style findings drift between versions;
+        # warnings and errors do not, and they are where the real bugs were:
+        # the apostrophe that made a script unparseable under bash, and a
+        # glob left literal in an assignment, were both warnings.
+        entry: "shellcheck --severity=warning"
         language: "system"
         types: ["shell"]
 
