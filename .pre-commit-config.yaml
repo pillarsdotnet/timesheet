@@ -41,6 +41,16 @@ repos:
 
   - repo: local
     hooks:
+      - id: "shellcheck"
+        name: "shellcheck"
+        # From apt, like pre-commit itself: the upstream mirror stops at
+        # v0.9.0 and runs in Docker, which the runner does not have. The
+        # Lint workflow installs the same package so CI and a local run
+        # agree on the version.
+        entry: "shellcheck"
+        language: "system"
+        types: ["shell"]
+
       - id: vale
         name: vale
         # The PyPI "vale" package wraps the official binary, so pre-commit
